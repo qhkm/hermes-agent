@@ -56,11 +56,16 @@ def _stream_through_relay(tmp_path, monkeypatch, response_body: bytes, *, finali
     relay_finalizer_started = threading.Event()
     allow_relay_finalizer = threading.Event()
     relay_finalizer_finished = threading.Event()
+    # Cross-thread handshake bound. Relay's finalizer fires only once its runtime thread has drained
+    # the provider stream; on a loaded CI runner that can trail the consumer by well over 5 s (two
+    # unrelated PRs went red here on the same day). The bound only limits how long a genuine hang
+    # takes to fail — the passing path never waits it out.
+    sync_timeout = 60
     run_relay_finalizer = relay_llm.ManagedLlmStream._relay_finalizer
 
     def run_synchronized_relay_finalizer(managed_stream, attempt):
         relay_finalizer_started.set()
-        assert allow_relay_finalizer.wait(5), "consumer did not release Relay's finalizer"
+        assert allow_relay_finalizer.wait(sync_timeout), "consumer did not release Relay's finalizer"
         try:
             return run_relay_finalizer(managed_stream, attempt)
         finally:
@@ -73,9 +78,9 @@ def _stream_through_relay(tmp_path, monkeypatch, response_body: bytes, *, finali
     def count_chunk_after_relay_finalizes(self, diag, chunk):
         # ``_count_chunk`` is the first thing the consumer does with every chunk.
         if finalize_before(chunk):
-            assert relay_finalizer_started.wait(5), "Relay's finalizer did not start"
+            assert relay_finalizer_started.wait(sync_timeout), "Relay's finalizer did not start"
             allow_relay_finalizer.set()
-            assert relay_finalizer_finished.wait(5), "Relay's finalizer did not finish"
+            assert relay_finalizer_finished.wait(sync_timeout), "Relay's finalizer did not finish"
         return count_chunk(self, diag, chunk)
 
     monkeypatch.setattr(chat_completion_helpers._StreamingCall, "_count_chunk", count_chunk_after_relay_finalizes)
