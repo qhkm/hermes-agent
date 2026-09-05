@@ -40,7 +40,8 @@
   },
   "overrides": {
     "lodash": "4.18.1",
-    "yauzl": "^3.3.1"
+    "yauzl": "^3.3.1",
+    "nanoid@^3": "3.3.18"
   },
   "engines": {
     "node": ">=20.0.0"
