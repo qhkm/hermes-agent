@@ -3962,6 +3962,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 _enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
 
         async def _run_and_signal() -> None:
+            usage: Optional[Dict[str, Any]] = None
             try:
                 await queue.put(_event_payload("run.started", {
                     "user_message": {"role": "user", "content": user_message},
@@ -4040,7 +4041,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     **({"pending_steer": pending_steer} if pending_steer else {}),
                 )
             except asyncio.CancelledError:
-                self._set_run_status(run_id, "cancelled", last_event="run.cancelled")
+                self._set_run_status(
+                    run_id,
+                    "cancelled",
+                    last_event="run.cancelled",
+                    **({"usage": usage} if usage is not None else {}),
+                )
                 raise
             except Exception as exc:
                 logger.exception("[api_server] session chat stream failed")
@@ -6817,6 +6823,7 @@ class APIServerAdapter(BasePlatformAdapter):
         request_profile = _api_request_profile.get()
 
         async def _run_and_close():
+            usage: Optional[Dict[str, Any]] = None
             try:
                 self._set_run_status(run_id, "running")
                 if run_id in self._stopping_run_ids:
@@ -6962,11 +6969,13 @@ class APIServerAdapter(BasePlatformAdapter):
                         "event": "run.cancelled",
                         "run_id": run_id,
                         "timestamp": time.time(),
+                        **({"usage": usage} if usage is not None else {}),
                     })
                     self._set_run_status(
                         run_id,
                         "cancelled",
                         last_event="run.cancelled",
+                        **({"usage": usage} if usage is not None else {}),
                     )
                 # Check for structured failure (non-retryable client errors like
                 # 401/400 return failed=True instead of raising, so the except
@@ -7014,12 +7023,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     run_id,
                     "cancelled",
                     last_event="run.cancelled",
+                    **({"usage": usage} if usage is not None else {}),
                 )
                 try:
                     _put_event_if_active({
                         "event": "run.cancelled",
                         "run_id": run_id,
                         "timestamp": time.time(),
+                        **({"usage": usage} if usage is not None else {}),
                     })
                 except Exception:
                     pass
