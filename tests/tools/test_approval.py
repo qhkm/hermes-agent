@@ -1129,6 +1129,7 @@ class TestApprovalTimeoutIsNotConsent:
         from tools import approval as mod
         mod._gateway_queues.clear()
         mod._gateway_notify_cbs.clear()
+        mod._gateway_resolved_request_ids.clear()
         mod._session_approved.clear()
         mod._permanent_approved.clear()
         mod._pending.clear()
@@ -1152,6 +1153,7 @@ class TestApprovalTimeoutIsNotConsent:
         from tools import approval as mod
         mod._gateway_queues.clear()
         mod._gateway_notify_cbs.clear()
+        mod._gateway_resolved_request_ids.clear()
         for k, v in self._saved_env.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -1193,6 +1195,8 @@ class TestApprovalTimeoutIsNotConsent:
         assert result.get("outcome") == "timeout"
         # The notify_cb DID fire — we did try to ask the user.
         assert len(notified) == 1
+        assert isinstance(notified[0].get("request_id"), str)
+        assert notified[0]["request_id"]
 
         # The BLOCKED message must explicitly tell the agent not to rephrase;
         # without it the agent treats "Do NOT retry this command" as permission
@@ -1368,6 +1372,121 @@ class TestApprovalTimeoutIsNotConsent:
         ) == 1
         thread.join(timeout=5)
         assert result_holder["result"]["approved"] is False
+
+    def test_request_id_targets_exact_entry_and_retry_is_noop(self):
+        from tools import approval as mod
+
+        first = mod._ApprovalEntry({"command": "first", "pattern_keys": ["dangerous"]})
+        second = mod._ApprovalEntry({"command": "second", "pattern_keys": ["dangerous"]})
+        with mod._lock:
+            mod._gateway_queues[self.SESSION_KEY] = [first, second]
+
+        second_id = second.data["request_id"]
+        assert mod.resolve_gateway_approval(
+            self.SESSION_KEY, "once", request_id=second_id
+        ) == 1
+        assert second.result == "once"
+        assert second.event.is_set()
+        assert second.acknowledged is True
+        assert first.result is None
+        assert not first.event.is_set()
+
+        # A lost-response retry acknowledges the already-resolved request and
+        # must not fall back to the FIFO head (which is now ``first``).
+        assert mod.resolve_gateway_approval(
+            self.SESSION_KEY, "deny", request_id=second_id
+        ) == 1
+        assert first.result is None
+        assert not first.event.is_set()
+        assert mod.list_gateway_approvals(self.SESSION_KEY) == [first.data]
+
+    def test_resolved_request_id_survives_simulated_restart(self):
+        from tools import approval as mod
+
+        resolved_entry = mod._ApprovalEntry({
+            "command": "resolved", "pattern_keys": ["dangerous"]
+        })
+        replacement = mod._ApprovalEntry({
+            "command": "replacement", "pattern_keys": ["dangerous"]
+        })
+        with mod._lock:
+            mod._gateway_queues[self.SESSION_KEY] = [resolved_entry, replacement]
+
+        request_id = resolved_entry.data["request_id"]
+        assert mod.resolve_gateway_approval(
+            self.SESSION_KEY, "once", request_id=request_id
+        ) == 1
+        _, journal_path = mod._gateway_resolution_state(self.SESSION_KEY)
+        assert journal_path.is_file()
+
+        # Simulate a fresh process cache.  The retry must re-seed from disk and
+        # remain a no-op even though another request is pending.
+        mod._gateway_resolved_request_ids.clear()
+        assert mod.resolve_gateway_approval(
+            self.SESSION_KEY, "deny", request_id=request_id
+        ) == 1
+        assert replacement.result is None
+        assert not replacement.event.is_set()
+
+        mod.unregister_gateway_notify(self.SESSION_KEY)
+        assert not journal_path.exists()
+
+    def test_timed_out_request_id_cannot_resolve_replacement(self, monkeypatch):
+        from tools import approval as mod
+
+        timeout = [0.02]
+        monkeypatch.setattr(mod, "_get_approval_timeout", lambda: timeout[0])
+        notified = []
+        first_result = mod._await_gateway_decision(
+            self.SESSION_KEY,
+            notified.append,
+            {
+                "command": "first-timeout",
+                "description": "desc",
+                "pattern_key": "dangerous",
+                "pattern_keys": ["dangerous"],
+            },
+        )
+        assert first_result["resolved"] is False
+        expired_request_id = notified[0]["request_id"]
+        assert mod.list_gateway_approvals(self.SESSION_KEY) == []
+
+        timeout[0] = 30
+        replacement_result = {}
+        thread = threading.Thread(
+            target=lambda: replacement_result.setdefault(
+                "value",
+                mod._await_gateway_decision(
+                    self.SESSION_KEY,
+                    notified.append,
+                    {
+                        "command": "replacement",
+                        "description": "desc",
+                        "pattern_key": "dangerous",
+                        "pattern_keys": ["dangerous"],
+                    },
+                ),
+            )
+        )
+        thread.start()
+        for _ in range(200):
+            if len(notified) == 2:
+                break
+            time.sleep(0.005)
+
+        replacement_request_id = notified[1]["request_id"]
+        assert replacement_request_id != expired_request_id
+        assert mod.resolve_gateway_approval(
+            self.SESSION_KEY, "once", request_id=expired_request_id
+        ) == 0
+        pending = mod.list_gateway_approvals(self.SESSION_KEY)
+        assert [item["request_id"] for item in pending] == [replacement_request_id]
+
+        assert mod.resolve_gateway_approval(
+            self.SESSION_KEY, "deny", request_id=replacement_request_id
+        ) == 1
+        thread.join(timeout=5)
+        assert replacement_result["value"]["choice"] == "deny"
 
 
 # =========================================================================

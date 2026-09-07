@@ -13,6 +13,7 @@ import contextvars
 import fnmatch
 import functools
 import hashlib
+import json
 import logging
 import os
 import re
@@ -2604,15 +2605,106 @@ class _ApprovalEntry:
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+# Targeted decisions are retried by reconnecting API clients.  Keep a small,
+# per-session tombstone set so replaying a decision for request A cannot fall
+# through to request B at the head of the queue.  The JSONL journal under the
+# active profile's state directory makes those tombstones survive client and
+# backend process restarts; normal session teardown removes it.
+_gateway_resolved_request_ids: dict[tuple[str, str], set[str]] = {}
+
+
+def _gateway_resolution_state(session_key: str):
+    """Return ``(cache_key, journal_path)`` for one approval session."""
+    from hermes_constants import get_hermes_home
+
+    home = get_hermes_home().expanduser().resolve(strict=False)
+    session_digest = hashlib.sha256(session_key.encode("utf-8")).hexdigest()
+    cache_key = (os.path.normcase(str(home)), session_key)
+    path = home / "state" / "approval-resolutions" / f"{session_digest}.jsonl"
+    return cache_key, path
+
+
+def _resolved_request_ids_locked(session_key: str) -> set[str]:
+    """Load the durable resolved-ID set.  Caller must hold ``_lock``."""
+    cache_key, path = _gateway_resolution_state(session_key)
+    cached = _gateway_resolved_request_ids.get(cache_key)
+    if cached is not None:
+        return cached
+
+    resolved: set[str] = set()
+    try:
+        with path.open("r", encoding="utf-8") as journal:
+            for line in journal:
+                try:
+                    record = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                request_id = record.get("request_id") if isinstance(record, dict) else None
+                if isinstance(request_id, str) and request_id:
+                    resolved.add(request_id)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        logger.warning(
+            "Failed to load approval resolution journal for session %s: %s",
+            session_key,
+            exc,
+        )
+    _gateway_resolved_request_ids[cache_key] = resolved
+    return resolved
+
+
+def _record_resolved_request_locked(session_key: str, request_id: str) -> None:
+    """Durably tombstone a targeted decision.  Caller must hold ``_lock``."""
+    resolved = _resolved_request_ids_locked(session_key)
+    if request_id in resolved:
+        return
+    resolved.add(request_id)
+
+    _, path = _gateway_resolution_state(session_key)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as journal:
+            journal.write(json.dumps({
+                "request_id": request_id,
+                "resolved_at": time.time(),
+            }, separators=(",", ":")) + "\n")
+            journal.flush()
+            os.fsync(journal.fileno())
+    except OSError as exc:
+        # Preserve in-process idempotency if the state directory is temporarily
+        # unwritable.  The approval itself must still unblock rather than strand
+        # the agent after the user has explicitly decided.
+        logger.warning(
+            "Failed to persist approval resolution for session %s: %s",
+            session_key,
+            exc,
+        )
+
+
+def _clear_resolved_requests_locked(session_key: str) -> None:
+    """Remove resolution tombstones at approval-session expiry."""
+    cache_key, path = _gateway_resolution_state(session_key)
+    _gateway_resolved_request_ids.pop(cache_key, None)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        logger.warning(
+            "Failed to remove approval resolution journal for session %s: %s",
+            session_key,
+            exc,
+        )
 
 
 def register_gateway_notify(session_key: str, cb) -> None:
     """Register a per-session callback for sending approval requests to the user.
 
     The callback signature is ``cb(approval_data: dict) -> None`` where
-    *approval_data* contains ``command``, ``description``, and
-    ``pattern_keys``.  The callback bridges sync→async (runs in the agent
-    thread, must schedule the actual send on the event loop).
+    *approval_data* contains ``request_id``, ``command``, ``description``,
+    and ``pattern_keys``.  The callback bridges sync→async (runs in the
+    agent thread, must schedule the actual send on the event loop).
     """
     with _lock:
         _gateway_notify_cbs[session_key] = cb
@@ -2627,6 +2719,15 @@ def unregister_gateway_notify(session_key: str) -> None:
     with _lock:
         _gateway_notify_cbs.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
+        try:
+            _clear_resolved_requests_locked(session_key)
+        except Exception as exc:
+            # Cleanup must never prevent pending waiters from being released.
+            logger.warning(
+                "Failed to clear approval resolutions for session %s: %s",
+                session_key,
+                exc,
+            )
     for entry in entries:
         entry.event.set()
 
@@ -2638,24 +2739,41 @@ def resolve_gateway_approval(session_key: str, choice: str,
     """Called by the gateway's /approve or /deny handler to unblock
     waiting agent thread(s).
 
-    When *resolve_all* is True every pending approval in the session is
-    resolved at once (``/approve all``).  Otherwise only the oldest one
-    is resolved (FIFO).
+    When *request_id* is supplied, only that exact request can be resolved.
+    Replaying a targeted decision that was already accepted is a successful
+    no-op.  When *request_id* is absent, *resolve_all* resolves every pending
+    approval and the default remains oldest-first FIFO (``/approve``).
 
     *reason* is an optional free-text explanation attached to an explicit
     deny (``/deny <reason>``).  It is relayed back to the agent in the
     BLOCKED message so it can adapt instead of only hearing "denied".
 
-    Returns the number of approvals resolved (0 means nothing was pending).
+    Returns the number of approvals resolved.  An idempotent targeted replay
+    returns 1 so API callers can acknowledge a lost-response retry as success;
+    0 means the ID is unknown or nothing was pending.
     """
+    # A decision also proves that the client received this exact prompt.  Keep
+    # the existing receipt acknowledgement meaningful for reconnectable
+    # clients before the entry is removed from the pending queue.
+    if request_id:
+        ack_gateway_approval(session_key, request_id)
+
     with _lock:
         queue = _gateway_queues.get(session_key)
         if not queue:
+            if request_id and request_id in _resolved_request_ids_locked(session_key):
+                return 1
             return 0
         if request_id:
             targets = [entry for entry in queue if entry.data.get("request_id") == request_id]
             if not targets:
+                if request_id in _resolved_request_ids_locked(session_key):
+                    return 1
                 return 0
+            # Journal before removing the queue entry.  If state-path
+            # resolution itself unexpectedly fails, the prompt remains pending
+            # and can be retried instead of being lost without a tombstone.
+            _record_resolved_request_locked(session_key, request_id)
             queue[:] = [entry for entry in queue if entry not in targets]
         elif resolve_all:
             targets = list(queue)
@@ -2770,6 +2888,14 @@ def clear_session(session_key: str) -> None:
         _session_yolo.discard(session_key)
         _pending.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
+        try:
+            _clear_resolved_requests_locked(session_key)
+        except Exception as exc:
+            logger.warning(
+                "Failed to clear approval resolutions for session %s: %s",
+                session_key,
+                exc,
+            )
     for entry in entries:
         # Session-boundary cleanup should cancel any blocked approval waits
         # immediately so the old run can unwind instead of idling until timeout.

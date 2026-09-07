@@ -6847,6 +6847,19 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
                     event = dict(approval_data or {})
+                    request_id = event.get("request_id")
+                    if not isinstance(request_id, str) or not request_id.strip():
+                        # _ApprovalEntry always assigns this before invoking a
+                        # notifier.  Fail closed at the API boundary if a future
+                        # caller violates that contract: runner clients discard
+                        # uncorrelated approvals and could never answer safely.
+                        logger.error(
+                            "[api_server] refusing uncorrelated approval event "
+                            "for run %s",
+                            run_id,
+                        )
+                        raise ValueError("approval event missing request_id")
+                    event["request_id"] = request_id.strip()
                     # Redact credentials from the command before it enters the
                     # SSE/API event stream — same egress bug as #48456, second
                     # transport: API/desktop clients would otherwise receive the
@@ -7175,10 +7188,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=404,
             )
 
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
 
         raw_choice = str(body.get("choice", "")).strip().lower()
         aliases = {"approve": "once", "approved": "once", "allow": "once"}
@@ -7207,13 +7219,43 @@ class APIServerAdapter(BasePlatformAdapter):
             _coerce_request_bool(body.get("all"), default=False)
             or _coerce_request_bool(body.get("resolve_all"), default=False)
         )
+        raw_request_id = body.get("request_id")
+        request_id = None
+        if raw_request_id is not None:
+            if not isinstance(raw_request_id, str) or not raw_request_id.strip():
+                return web.json_response(
+                    _openai_error(
+                        "Invalid request_id; expected a non-empty string",
+                        code="invalid_approval_request_id",
+                    ),
+                    status=400,
+                )
+            request_id = raw_request_id.strip()
+
+        raw_reason = body.get("reason")
+        if raw_reason is not None and not isinstance(raw_reason, str):
+            return web.json_response(
+                _openai_error(
+                    "Invalid approval reason; expected a string",
+                    code="invalid_approval_reason",
+                ),
+                status=400,
+            )
+        reason = raw_reason.strip() if isinstance(raw_reason, str) else None
+        if choice != "deny":
+            reason = None
         try:
-            from tools.approval import resolve_gateway_approval
+            from tools.approval import (
+                has_blocking_approval,
+                resolve_gateway_approval,
+            )
 
             resolved = resolve_gateway_approval(
                 approval_session_key,
                 choice,
                 resolve_all=resolve_all,
+                reason=reason or None,
+                request_id=request_id,
             )
         except Exception as exc:
             logger.exception("[api_server] approval resolution failed for run %s", run_id)
@@ -7228,17 +7270,28 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=409,
             )
 
-        self._set_run_status(run_id, "running", last_event="approval.responded")
+        # Parallel tool calls can leave sibling approvals pending, and a
+        # request-id retry is an idempotent no-op.  In either case the run must
+        # remain visibly waiting instead of being mislabeled as running.
+        still_waiting = has_blocking_approval(approval_session_key)
+        self._set_run_status(
+            run_id,
+            "waiting_for_approval" if still_waiting else "running",
+            last_event="approval.responded",
+        )
         q = self._run_streams.get(run_id)
         if q is not None:
             try:
-                q.put_nowait({
+                responded_event = {
                     "event": "approval.responded",
                     "run_id": run_id,
                     "timestamp": time.time(),
                     "choice": choice,
                     "resolved": resolved,
-                })
+                }
+                if request_id:
+                    responded_event["request_id"] = request_id
+                q.put_nowait(responded_event)
             except Exception:
                 pass
 
