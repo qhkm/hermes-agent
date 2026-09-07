@@ -73,6 +73,7 @@ SKIP_BROWSER=false
 NO_SKILLS=false
 BRANCH="main"
 INSTALL_COMMIT=""
+FORCE_COMMIT=false
 ENSURE_DEPS=""
 
 MANIFEST_MODE=false
@@ -116,6 +117,10 @@ while [[ $# -gt 0 ]]; do
         --commit|-Commit)
             INSTALL_COMMIT="$2"
             shift 2
+            ;;
+        --force-commit|-ForceCommit)
+            FORCE_COMMIT=true
+            shift
             ;;
         --manifest|-Manifest)
             MANIFEST_MODE=true
@@ -165,6 +170,7 @@ while [[ $# -gt 0 ]]; do
             echo "                   'hermes update' runs never inject bundled skills either"
             echo "  --branch NAME  Git branch to install (default: main)"
             echo "  --commit SHA   Pin checkout to a specific commit after clone/update"
+            echo "  --force-commit Allow --commit to roll an existing checkout backwards"
             echo "  --manifest     Print desktop bootstrap stage manifest as JSON"
             echo "  --stage NAME   Run one desktop bootstrap stage"
             echo "  --json         Print a JSON result frame for --stage"
@@ -1309,11 +1315,49 @@ EOF
     cd "$INSTALL_DIR"
 
     if [ -n "$INSTALL_COMMIT" ]; then
-        log_info "Pinning checkout to commit $INSTALL_COMMIT..."
-        if ! git cat-file -e "$INSTALL_COMMIT^{commit}" 2>/dev/null; then
-            git fetch origin "$INSTALL_COMMIT" || true
+        # Validate the commit argument: must look like a hex SHA (full 40-char
+        # or abbreviated 7-39 char). Reject anything else early so the user
+        # gets a clear error instead of a misleading git message (#87268).
+        if ! printf '%s' "$INSTALL_COMMIT" | grep -qE '^[0-9a-fA-F]{7,40}$'; then
+            log_error "--commit expects a hex SHA (7-40 chars), got: $INSTALL_COMMIT"
+            return 1
         fi
-        git checkout --detach "$INSTALL_COMMIT"
+        # A commit pin must never move an existing install BACKWARDS. The
+        # bootstrap installer bakes its build-time commit into the binary
+        # (BUILD_PIN_COMMIT) and passes it as --commit on every install-mode
+        # run -- including the one the desktop's failure screen retries. An
+        # installer built months ago would otherwise rewind a current checkout
+        # to its build commit, stranding the user on ancient code with a
+        # current venv. Only pin when the target is not already an ancestor of
+        # HEAD; a fresh clone has no such ancestry and pins normally.
+        if ! git cat-file -e "$INSTALL_COMMIT^{commit}" 2>/dev/null; then
+            if ! git fetch origin "$INSTALL_COMMIT"; then
+                log_error "Could not fetch commit $INSTALL_COMMIT from origin."
+                log_error "Abbreviated SHAs are not supported — use the full 40-char hash."
+                log_error "Find it with: git ls-remote origin | grep <short-sha>"
+                return 1
+            fi
+        fi
+        if git rev-parse --verify --quiet HEAD >/dev/null 2>&1 \
+           && git merge-base --is-ancestor "$INSTALL_COMMIT" HEAD 2>/dev/null \
+           && [ "$(git rev-parse "$INSTALL_COMMIT^{commit}" 2>/dev/null)" != "$(git rev-parse HEAD)" ]; then
+            if [ "$FORCE_COMMIT" = true ]; then
+                log_warn "--force-commit: rolling this install back to $INSTALL_COMMIT."
+                if ! git checkout --detach "$INSTALL_COMMIT"; then
+                    log_error "Failed to detach at $INSTALL_COMMIT"
+                    return 1
+                fi
+            else
+                log_warn "Ignoring --commit $INSTALL_COMMIT: the checkout is already newer."
+                log_warn "Pinning to it would roll this install back. Pass --force-commit to override."
+            fi
+        else
+            log_info "Pinning checkout to commit $INSTALL_COMMIT..."
+            if ! git checkout --detach "$INSTALL_COMMIT"; then
+                log_error "Failed to detach at $INSTALL_COMMIT"
+                return 1
+            fi
+        fi
     fi
 
     log_success "Repository ready"
