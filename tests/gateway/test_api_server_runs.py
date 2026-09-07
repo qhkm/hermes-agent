@@ -516,6 +516,8 @@ class TestRunEvents:
             "session-123",
             "once",
             resolve_all=False,
+            reason=None,
+            request_id=None,
         )
 
     @pytest.mark.asyncio
@@ -602,6 +604,125 @@ class TestRunEvents:
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.get("/v1/runs/run_any/events")
         assert resp.status == 401
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/runs/{run_id}/approval — correlated, retry-safe decisions
+# ---------------------------------------------------------------------------
+
+
+class TestRunApproval:
+    @pytest.mark.asyncio
+    async def test_request_event_and_deny_reason_are_correlated(self, adapter):
+        app = _create_runs_app(adapter)
+        decision_holder = {}
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+
+                def _run_with_approval(**_kwargs):
+                    session_key = approval_mod.get_current_session_key()
+                    with approval_mod._lock:
+                        notify = approval_mod._gateway_notify_cbs[session_key]
+                    decision_holder["decision"] = approval_mod._await_gateway_decision(
+                        session_key,
+                        notify,
+                        {
+                            "command": "bash -c dangerous",
+                            "description": "dangerous shell",
+                            "pattern_key": "shell-c",
+                            "pattern_keys": ["shell-c"],
+                        },
+                    )
+                    return {"final_response": "blocked"}
+
+                mock_agent.run_conversation.side_effect = _run_with_approval
+                mock_create.return_value = mock_agent
+
+                start_resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert start_resp.status == 202
+                run_id = (await start_resp.json())["run_id"]
+                run_task = adapter._active_run_tasks[run_id]
+
+                request_event = await asyncio.wait_for(
+                    adapter._run_streams[run_id].get(), timeout=3
+                )
+                assert request_event["event"] == "approval.request"
+                request_id = request_event["request_id"]
+                assert isinstance(request_id, str)
+                assert request_id
+
+                deny_resp = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={
+                        "choice": "deny",
+                        "request_id": request_id,
+                        "reason": "production policy forbids this action",
+                    },
+                )
+                assert deny_resp.status == 200
+                assert (await deny_resp.json())["resolved"] == 1
+
+                await asyncio.wait_for(run_task, timeout=3)
+                assert decision_holder["decision"] == {
+                    "resolved": True,
+                    "choice": "deny",
+                    "reason": "production policy forbids this action",
+                }
+
+    @pytest.mark.asyncio
+    async def test_targeted_retry_returns_success_without_resolving_fifo_head(
+        self, adapter
+    ):
+        app = _create_runs_app(adapter)
+        adapter._set_run_status("run_retry", "waiting_for_approval")
+        adapter._run_approval_sessions["run_retry"] = "run_retry"
+        first = approval_mod._ApprovalEntry({"command": "first"})
+        second = approval_mod._ApprovalEntry({"command": "second"})
+        with approval_mod._lock:
+            approval_mod._gateway_queues["run_retry"] = [first, second]
+
+        async with TestClient(TestServer(app)) as cli:
+            first_resp = await cli.post(
+                "/v1/runs/run_retry/approval",
+                json={"choice": "once", "request_id": second.data["request_id"]},
+            )
+            retry_resp = await cli.post(
+                "/v1/runs/run_retry/approval",
+                json={"choice": "deny", "request_id": second.data["request_id"]},
+            )
+            retry_payload = await retry_resp.json()
+
+        assert first_resp.status == 200
+        assert retry_resp.status == 200
+        assert retry_payload["resolved"] == 1
+        assert first.result is None
+        assert not first.event.is_set()
+        assert second.result == "once"
+        assert adapter._run_statuses["run_retry"]["status"] == "waiting_for_approval"
+
+        approval_mod.unregister_gateway_notify("run_retry")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("request_id", ["", 123, {}, []])
+    async def test_invalid_request_id_is_rejected(self, adapter, request_id):
+        app = _create_runs_app(adapter)
+        adapter._set_run_status("run_invalid", "waiting_for_approval")
+        adapter._run_approval_sessions["run_invalid"] = "run_invalid"
+
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/runs/run_invalid/approval",
+                json={"choice": "once", "request_id": request_id},
+            )
+            payload = await response.json()
+
+        assert response.status == 400
+        assert payload["error"]["code"] == "invalid_approval_request_id"
 
 
 # ---------------------------------------------------------------------------
