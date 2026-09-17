@@ -74,6 +74,17 @@ if TYPE_CHECKING:
 _FIRECRAWL_CLS_CACHE: Optional[type] = None
 
 
+# A single-page app that has not finished painting returns success with
+# almost no markdown, which is indistinguishable from a genuinely short
+# page to everything downstream. One retry with a wait recovers it:
+# developers.bukku.my measured 2 words on the default call and 574 with
+# an eight-second wait (2026-09-17). The retry is per-page on purpose —
+# a global wait_for would add that cost to every read, and 39 of 41
+# pages sampled that day needed nothing.
+THIN_RENDER_WORDS = 50
+THIN_RENDER_WAIT_MS = 8000
+
+
 def _load_firecrawl_cls() -> type:
     """Import and cache ``firecrawl.Firecrawl``."""
     global _FIRECRAWL_CLS_CACHE
@@ -367,6 +378,18 @@ def _extract_scrape_payload(scrape_result: Any) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _markdown_words(scrape_result: Any) -> int:
+    """How much readable text an attempt actually produced."""
+    payload = _extract_scrape_payload(scrape_result)
+    markdown = payload.get("markdown") or ""
+    return len(str(markdown).split())
+
+
+def _is_thin_render(scrape_result: Any) -> bool:
+    """A successful scrape that returned too little to be a real page."""
+    return _markdown_words(scrape_result) < THIN_RENDER_WORDS
+
+
 class FirecrawlWebSearchProvider(WebSearchProvider):
     """Firecrawl search + extract provider with dual auth paths."""
 
@@ -494,6 +517,25 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                         ),
                         timeout=60,
                     )
+                    if _is_thin_render(scrape_result):
+                        logger.info(
+                            "Firecrawl returned a thin page for %s; retrying with a render wait",
+                            url,
+                        )
+                        retried = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                _get_firecrawl_client().scrape,
+                                url=url,
+                                formats=formats,
+                                wait_for=THIN_RENDER_WAIT_MS,
+                            ),
+                            timeout=60,
+                        )
+                        # Keep whichever attempt actually carries content: a
+                        # genuinely short page must not be replaced by an
+                        # emptier retry.
+                        if _markdown_words(retried) > _markdown_words(scrape_result):
+                            scrape_result = retried
                 except asyncio.TimeoutError:
                     logger.warning("Firecrawl scrape timed out for %s", url)
                     results.append(
