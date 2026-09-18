@@ -115,3 +115,53 @@ def test_api_base_comes_from_the_model_channel(monkeypatch):
     # A plaintext or malformed base is refused rather than used.
     monkeypatch.setenv("OPENROUTER_BASE_URL", "http://api.jentera.ai/v1/model")
     assert tools._api_base() == ""
+
+
+# ---- connect_service ---------------------------------------------------
+# The owner chooses how their own systems are connected, so the tool's job
+# is to carry the choice, not to make one.
+
+
+def test_asks_what_is_available_before_choosing(control_plane):
+    control_plane.reply = (200, {"ok": True, "service": "Bukku", "choose": [
+        {"method": "api_token", "summary": "Paste a token…"},
+        {"method": "browser", "summary": "Sign in…", "caution": "your session stays…"},
+    ]})
+    out = json.loads(tools.handle_connect_service({"service": "my bukku"}))
+    assert [c["method"] for c in out["choose"]] == ["api_token", "browser"]
+    # What each way grants reaches the owner with the offer.
+    assert "caution" in out["choose"][1]
+    sent = control_plane.received[0]
+    assert sent["path"] == "/v1/runtime/connect"
+    assert sent["body"] == {"service": "my bukku"}
+
+
+def test_carries_the_choice_and_the_account(control_plane):
+    control_plane.reply = (200, {"ok": True, "action": "open_browser", "url": "https://aisar.bukku.my/"})
+    tools.handle_connect_service({"service": "Bukku", "method": "browser", "account": "aisar"})
+    assert control_plane.received[0]["body"] == {
+        "service": "Bukku", "method": "browser", "account": "aisar",
+    }
+
+
+def test_finish_is_only_ever_the_owner_confirming(control_plane):
+    control_plane.reply = (200, {"ok": True, "connected": "Aisar AI"})
+    out = json.loads(tools.handle_connect_service(
+        {"service": "Bukku", "method": "browser", "step": "finish"}))
+    assert out["connected"] == "Aisar AI"
+    assert control_plane.received[0]["body"]["step"] == "finish"
+
+
+def test_a_refusal_that_needs_the_company_says_so(control_plane):
+    control_plane.reply = (400, {"ok": False, "need": "account", "err": "Ask the owner for their Bukku address"})
+    out = json.loads(tools.handle_connect_service({"service": "Bukku", "method": "browser"}))
+    assert out["need"] == "account"
+    assert "address" in out["error"]
+
+
+def test_no_service_named_is_a_question_not_a_request(control_plane):
+    out = json.loads(tools.handle_connect_service({"service": "   "}))
+    assert "error" in out
+    # Nothing was sent: an empty service is the model's gap to fill with the
+    # owner, not the control plane's to guess at.
+    assert control_plane.received == []
