@@ -614,23 +614,30 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
         return r, {key: getattr(agent, attr, 0) or 0 for key, attr in _USAGE_FIELDS}
 
 
+def _approval_event(run_id: str, approval_data: Dict[str, Any], *, _api_server) -> Dict[str, Any]:
+    """Client-facing ``approval.request`` envelope for one pending approval.
+
+    Clients must never receive the raw flagged command: redact before it hits the stream.
+    Same egress bug as #48456, second transport: API/desktop clients would otherwise receive
+    the raw command Tirith flagged. Reuse the gateway seam.
+    """
+    event = dict(approval_data or {})
+    if "command" in event:
+        from gateway.run import _redact_approval_command
+        event["command"] = _redact_approval_command(event.get("command"))
+    event.update(_run_event(run_id, "approval.request", choices=_api_server._approval_event_choices(
+        smart_denied=bool(event.get("smart_denied")),
+        allow_session=event.get("allow_session") is not False,
+        allow_permanent=event.get("allow_permanent") is not False)))
+    return event
+
+
 def _make_approval_notify(self, run: _RunLaunch, *, _api_server) -> Callable[[Dict[str, Any]], None]:
     """Approval-request bridge: redact, stamp the event envelope, park the run status, enqueue."""
     run_id, q, loop = run.run_id, run.queue, asyncio.get_running_loop()
 
     def _approval_notify(approval_data: Dict[str, Any]) -> None:
-        event = dict(approval_data or {})
-        # Clients must never receive the raw flagged command: redact before it hits the stream.
-        # Redact credentials from the command before it enters the SSE/API event stream — same egress bug as
-        # #48456, second transport: API/desktop clients would otherwise receive the raw command Tirith
-        # flagged. Reuse the gateway seam.
-        if "command" in event:
-            from gateway.run import _redact_approval_command
-            event["command"] = _redact_approval_command(event.get("command"))
-        event.update(_run_event(run_id, "approval.request", choices=_api_server._approval_event_choices(
-            smart_denied=bool(event.get("smart_denied")),
-            allow_session=event.get("allow_session") is not False,
-            allow_permanent=event.get("allow_permanent") is not False)))
+        event = _approval_event(run_id, approval_data, _api_server=_api_server)
         self._set_run_status(run_id, "waiting_for_approval", last_event="approval.request", approval=event)
         with suppress(Exception):
             loop.call_soon_threadsafe(q.put_nowait, event)
@@ -848,7 +855,10 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
             return _json_error(_openai_error, message, code=code, status=status)
     try:
         from tools.approval import resolve_gateway_approval
-        resolved = resolve_gateway_approval(
+        # Takes the approval lock and appends a durable journal. Off-thread so one
+        # decision cannot stall every other request and SSE stream on this server.
+        resolved = await asyncio.to_thread(
+            resolve_gateway_approval,
             approval_session_key, choice, resolve_all=resolve_all, request_id=request_id or None)
     except Exception as exc:
         logger.exception("[api_server] approval resolution failed for run %s", run_id)
@@ -860,8 +870,16 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
     # Parallel tool calls leave sibling approvals pending, and a request-id retry is an
     # idempotent no-op that resolves nothing new. In both cases the run is still waiting
     # on a human and must not be mislabeled as running.
-    from tools.approval import has_blocking_approval
+    from tools.approval import get_pending_gateway_approval, has_blocking_approval
     still_waiting = has_blocking_approval(approval_session_key)
+    if still_waiting:
+        # ``approval`` holds whichever prompt notified LAST, which may be the one just
+        # resolved. Re-point it at the surviving request so a polling client does not
+        # keep re-submitting a dead request_id and reading the replay as fresh.
+        surviving = get_pending_gateway_approval(approval_session_key)
+        if surviving is not None:
+            self._set_run_status(run_id, "waiting_for_approval",
+                                 approval=_approval_event(run_id, surviving, _api_server=_api_server))
     _mark_run_event(
         self, run_id, "approval.responded",
         status="waiting_for_approval" if still_waiting else "running",

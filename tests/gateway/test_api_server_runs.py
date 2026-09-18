@@ -2310,3 +2310,81 @@ class TestTargetedApprovalRetry:
         finally:
             approval_mod.unregister_gateway_notify(run_id)
             approval_mod._gateway_resolved_request_ids.clear()
+
+    @pytest.mark.asyncio
+    async def test_the_surviving_prompt_replaces_the_resolved_one_in_run_status(
+        self, auth_adapter, tmp_path, monkeypatch
+    ):
+        """`approval` holds the LATEST notified prompt. Resolving that one while a
+        sibling is still pending must not leave clients polling a dead request_id."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        approval_mod._gateway_resolved_request_ids.clear()
+        run_id = "run-stale-approval"
+        first = approval_gateway_wait._ApprovalEntry({"request_id": "approval-1", "command": "rm -rf one"})
+        second = approval_gateway_wait._ApprovalEntry({"request_id": "approval-2", "command": "rm -rf two"})
+        auth_adapter._run_approval_sessions[run_id] = run_id
+        auth_adapter._run_statuses[run_id] = {
+            "run_id": run_id,
+            "status": "waiting_for_approval",
+            # The second prompt notified last, so this is what a client is showing.
+            "approval": dict(second.data),
+        }
+        with approval_mod._lock:
+            approval_mod._gateway_queues[run_id] = [first, second]
+        app = _create_runs_app(auth_adapter)
+        try:
+            with (
+                patch.object(auth_adapter, "_check_run_auth", return_value=None),
+                patch.object(auth_adapter, "_request_owns_run", return_value=True),
+            ):
+                async with TestClient(TestServer(app)) as cli:
+                    resp = await cli.post(
+                        f"/v1/runs/{run_id}/approval",
+                        json={"choice": "once", "request_id": "approval-2"},
+                    )
+            assert resp.status == 200
+            status = auth_adapter._run_statuses[run_id]
+            assert status["status"] == "waiting_for_approval"
+            assert status["approval"]["request_id"] == "approval-1", (
+                "the run must advertise the prompt that is still pending"
+            )
+        finally:
+            approval_mod.unregister_gateway_notify(run_id)
+            approval_mod._gateway_resolved_request_ids.clear()
+
+    @pytest.mark.asyncio
+    async def test_a_slow_resolve_does_not_block_the_event_loop(self, auth_adapter, monkeypatch):
+        """resolve_gateway_approval takes a lock and writes a journal. Called inline it
+        stalls every other request and SSE stream on this server."""
+        run_id = "run-slow-resolve"
+        auth_adapter._run_approval_sessions[run_id] = run_id
+        auth_adapter._run_statuses[run_id] = {"run_id": run_id, "status": "waiting_for_approval"}
+        monkeypatch.setattr(approval_mod, "resolve_gateway_approval",
+                            lambda *a, **k: (time.sleep(0.3), 1)[1])
+        monkeypatch.setattr(approval_mod, "has_blocking_approval", lambda key: False)
+        app = _create_runs_app(auth_adapter)
+
+        ticks = 0
+
+        async def _ticker():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        with (
+            patch.object(auth_adapter, "_check_run_auth", return_value=None),
+            patch.object(auth_adapter, "_request_owns_run", return_value=True),
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                beat = asyncio.ensure_future(_ticker())
+                try:
+                    resp = await cli.post(
+                        f"/v1/runs/{run_id}/approval",
+                        json={"choice": "once", "request_id": "approval-1"},
+                    )
+                finally:
+                    beat.cancel()
+
+        assert resp.status == 200
+        assert ticks >= 5, f"loop was stalled through the resolve (only {ticks} ticks in 300ms)"
