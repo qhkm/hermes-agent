@@ -1,0 +1,7 @@
+name: jentera
+version: 1.0.0
+description: "Reads the business's connected records — invoices, contacts — through Jentera's control plane, which holds the credentials. The agent never sees an accounting or messaging token."
+author: Kitakod Ventures
+kind: backend
+provides_tools:
+  - business_records
