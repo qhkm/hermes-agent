@@ -74,3 +74,42 @@ def test_keeps_the_first_result_when_the_retry_is_no_better(monkeypatch: pytest.
 
     assert len(client.calls) == 2
     assert results[0]["content"] == "a list of links"
+
+
+class _KeylessTransport:
+    """Stands in for the Firecrawl REST endpoint behind ``_KeylessFirecrawlClient``."""
+
+    def __init__(self, pages: List[str]) -> None:
+        self._pages = pages
+        self.payloads: List[Dict[str, Any]] = []
+
+    def __call__(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        self.payloads.append(payload)
+        markdown = self._pages[min(len(self.payloads) - 1, len(self._pages) - 1)]
+        return {"markdown": markdown, "metadata": {"title": "Docs", "sourceURL": payload["url"]}}
+
+
+def test_keyless_client_sends_the_render_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keyless cloud mode has no SDK, so the wait has to reach the REST body."""
+    transport = _KeylessTransport(["Docs"])
+    client = fc._KeylessFirecrawlClient()
+    monkeypatch.setattr(client, "_post", transport)
+
+    client.scrape(url="https://example.com/", formats=["markdown"])
+    assert "waitFor" not in transport.payloads[0], "the fast first attempt sends no wait"
+
+    client.scrape(url="https://example.com/", formats=["markdown"], wait_for=fc.THIN_RENDER_WAIT_MS)
+    assert transport.payloads[1]["waitFor"] == fc.THIN_RENDER_WAIT_MS
+
+
+def test_a_thin_page_on_the_keyless_client_is_not_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The retry must not turn a short-but-valid keyless scrape into a failure."""
+    transport = _KeylessTransport(["Docs", " ".join(["word"] * 574)])
+    client = fc._KeylessFirecrawlClient()
+    monkeypatch.setattr(client, "_post", transport)
+    monkeypatch.setattr(fc, "_get_firecrawl_client", lambda: client)
+
+    results = _extract("https://developers.bukku.my/")
+
+    assert "error" not in results[0], results[0].get("error")
+    assert len(results[0]["content"].split()) == 574
