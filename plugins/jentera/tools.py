@@ -23,6 +23,12 @@ from urllib.parse import urlparse
 from tools.registry import tool_error, tool_result
 
 CONNECTOR_PATH = "/v1/runtime/connector"
+# Cloudflare sits in front of the control plane and bans urllib's default
+# signature outright — error 1010, a 403 with no body of ours in it, which
+# reads to the agent as "the ledger refused me" and to a reader as a
+# permissions problem. Verified on a sprite 2026-09-18: Python-urllib/3.11
+# is refused where any other agent string is served.
+USER_AGENT = "Jentera-Agent/1.0"
 REQUEST_TIMEOUT_SECONDS = 20
 # Jentera answers in a sentence, not a dataset. A cap here stops an
 # unexpected body from becoming the bulk of the model's context.
@@ -98,6 +104,7 @@ def _post(payload: dict) -> tuple[int, dict]:
             "Authorization": f"Bearer {_credential()}",
             "Content-Type": "application/json",
             "Accept": "application/json",
+            "User-Agent": USER_AGENT,
         },
         method="POST",
     )

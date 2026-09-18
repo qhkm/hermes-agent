@@ -23,6 +23,7 @@ class _Recorder(BaseHTTPRequestHandler):
         type(self).received.append({
             "path": self.path,
             "auth": self.headers.get("Authorization"),
+            "agent": self.headers.get("User-Agent"),
             "body": body,
         })
         status, payload = type(self).reply
@@ -64,6 +65,16 @@ def test_reads_overdue_invoices(control_plane):
     # No run id: a sprite's gateway has none to give, and a stale one
     # would tie every reading to whichever run happened to start Hermes.
     assert "runId" not in sent["body"]
+
+
+def test_names_itself_because_urllib_is_banned_at_the_edge(control_plane):
+    """Cloudflare answers urllib's default signature with 1010 — a 403
+    carrying none of our own fields, which the agent reports as the ledger
+    refusing it. Any other agent string is served."""
+    tools.handle_business_records({"resource": "invoices"})
+    agent = control_plane.received[0]["agent"] or ""
+    assert agent.startswith("Jentera-Agent/")
+    assert "urllib" not in agent.lower()
 
 
 def test_does_not_let_the_model_choose_the_operation(control_plane):
