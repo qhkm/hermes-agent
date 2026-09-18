@@ -2190,3 +2190,86 @@ class TestLifecycleGuardLaunchctlParity:
             "launchctl print system/com.apple.WindowServer",
         ):
             assert contains_gateway_lifecycle_command(cmd) is False, cmd
+
+
+# =========================================================================
+# A reconnecting API client retries the decision whose response it lost.
+# The retry must acknowledge as success without resolving whichever request
+# has meanwhile reached the head of the queue, and must stay a no-op across
+# a backend restart. Ported by hand from the fork release lineage
+# (806a4c0876) onto the current gateway queue.
+# =========================================================================
+
+
+class TestTargetedApprovalReplayIsIdempotent:
+    SESSION_KEY = "test-targeted-replay-session"
+
+    @pytest.fixture(autouse=True)
+    def _isolate(self, tmp_path, monkeypatch):
+        from tools import approval as mod
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        mod._gateway_queues.clear()
+        mod._gateway_notify_cbs.clear()
+        mod._gateway_resolved_request_ids.clear()
+        yield
+        mod._gateway_queues.clear()
+        mod._gateway_notify_cbs.clear()
+        mod._gateway_resolved_request_ids.clear()
+
+    def test_replayed_decision_does_not_resolve_the_next_request(self):
+        from tools import approval as mod
+        from tools.approval_gateway_wait import _ApprovalEntry
+
+        first = _ApprovalEntry({"command": "first", "pattern_keys": ["dangerous"]})
+        second = _ApprovalEntry({"command": "second", "pattern_keys": ["dangerous"]})
+        with mod._lock:
+            mod._gateway_queues[self.SESSION_KEY] = [first, second]
+
+        second_id = second.data["request_id"]
+        assert mod.resolve_gateway_approval(self.SESSION_KEY, "once", request_id=second_id) == 1
+        assert second.result == "once"
+        assert second.event.is_set()
+        assert second.acknowledged is True, "a decision proves the client saw that prompt"
+        assert first.result is None
+
+        # The lost-response retry: success to the caller, no effect on ``first``,
+        # which is now the FIFO head.
+        assert mod.resolve_gateway_approval(self.SESSION_KEY, "deny", request_id=second_id) == 1
+        assert first.result is None
+        assert not first.event.is_set()
+        assert mod.list_gateway_approvals(self.SESSION_KEY) == [first.data]
+
+    def test_resolved_request_id_survives_a_backend_restart(self):
+        """The tombstone is on disk, so a fresh process still refuses the replay."""
+        from tools import approval as mod
+        from tools.approval_gateway_wait import _ApprovalEntry
+
+        resolved = _ApprovalEntry({"command": "resolved", "pattern_keys": ["dangerous"]})
+        replacement = _ApprovalEntry({"command": "replacement", "pattern_keys": ["dangerous"]})
+        with mod._lock:
+            mod._gateway_queues[self.SESSION_KEY] = [resolved, replacement]
+
+        request_id = resolved.data["request_id"]
+        assert mod.resolve_gateway_approval(self.SESSION_KEY, "once", request_id=request_id) == 1
+        _, journal_path = mod._gateway_resolution_state(self.SESSION_KEY)
+        assert journal_path.is_file(), "the decision must be journalled"
+
+        # A fresh process has an empty cache and must re-seed from the journal.
+        mod._gateway_resolved_request_ids.clear()
+        assert mod.resolve_gateway_approval(self.SESSION_KEY, "deny", request_id=request_id) == 1
+        assert replacement.result is None
+        assert not replacement.event.is_set()
+
+    def test_session_teardown_removes_the_journal(self):
+        from tools import approval as mod
+        from tools.approval_gateway_wait import _ApprovalEntry
+
+        entry = _ApprovalEntry({"command": "only", "pattern_keys": ["dangerous"]})
+        with mod._lock:
+            mod._gateway_queues[self.SESSION_KEY] = [entry]
+        mod.resolve_gateway_approval(self.SESSION_KEY, "once", request_id=entry.data["request_id"])
+
+        _, journal_path = mod._gateway_resolution_state(self.SESSION_KEY)
+        assert journal_path.is_file()
+        mod.unregister_gateway_notify(self.SESSION_KEY)
+        assert not journal_path.exists(), "teardown must not leave tombstones behind"

@@ -14,9 +14,11 @@ call time; sibling-defined names are imported from their defining module.
 from dataclasses import dataclass
 import hashlib
 import importlib
+import json
 import logging
 import os
 import threading
+import time
 from typing import Optional
 
 from utils import env_var_enabled, is_truthy_value
@@ -119,6 +121,81 @@ _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, 
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
 
 
+# Targeted decisions get retried by reconnecting API clients. Keep a small
+# per-session tombstone set so replaying the decision for request A cannot fall
+# through to request B, which by then sits at the head of the queue. The JSONL
+# journal under the active profile's state directory makes those tombstones
+# survive client and backend restarts; normal session teardown removes it.
+_gateway_resolved_request_ids: dict[tuple[str, str], set[str]] = {}
+
+
+def _gateway_resolution_state(session_key: str):
+    """Return ``(cache_key, journal_path)`` for one approval session."""
+    from hermes_constants import get_hermes_home
+
+    home = get_hermes_home().expanduser().resolve(strict=False)
+    session_digest = hashlib.sha256(session_key.encode("utf-8")).hexdigest()
+    cache_key = (os.path.normcase(str(home)), session_key)
+    return cache_key, home / "state" / "approval-resolutions" / f"{session_digest}.jsonl"
+
+
+def _resolved_request_ids_locked(session_key: str) -> set[str]:
+    """Load the durable resolved-ID set. Caller must hold ``_lock``."""
+    cache_key, path = _gateway_resolution_state(session_key)
+    cached = _gateway_resolved_request_ids.get(cache_key)
+    if cached is not None:
+        return cached
+    resolved: set[str] = set()
+    try:
+        with path.open("r", encoding="utf-8") as journal:
+            for line in journal:
+                try:
+                    record = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                request_id = record.get("request_id") if isinstance(record, dict) else None
+                if isinstance(request_id, str) and request_id:
+                    resolved.add(request_id)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        logger.warning("Failed to load approval resolution journal for session %s: %s", session_key, exc)
+    _gateway_resolved_request_ids[cache_key] = resolved
+    return resolved
+
+
+def _record_resolved_request_locked(session_key: str, request_id: str) -> None:
+    """Durably tombstone a targeted decision. Caller must hold ``_lock``."""
+    resolved = _resolved_request_ids_locked(session_key)
+    if request_id in resolved:
+        return
+    resolved.add(request_id)
+    _, path = _gateway_resolution_state(session_key)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as journal:
+            journal.write(json.dumps({"request_id": request_id, "resolved_at": time.time()}, separators=(",", ":")) + "\n")
+            journal.flush()
+            os.fsync(journal.fileno())
+    except OSError as exc:
+        # Keep in-process idempotency when the state directory is briefly unwritable:
+        # the approval itself must still unblock rather than strand the agent after
+        # the user has explicitly decided.
+        logger.warning("Failed to persist approval resolution for session %s: %s", session_key, exc)
+
+
+def _clear_resolved_requests_locked(session_key: str) -> None:
+    """Remove resolution tombstones at approval-session expiry."""
+    cache_key, path = _gateway_resolution_state(session_key)
+    _gateway_resolved_request_ids.pop(cache_key, None)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        logger.warning("Failed to remove approval resolution journal for session %s: %s", session_key, exc)
+
+
 def register_gateway_notify(session_key: str, cb) -> None:
     """Register ``cb(approval_data: dict) -> None`` for sending approval requests. The callback
     bridges sync→async: it runs in the agent thread and must schedule the send on the loop."""
@@ -133,6 +210,10 @@ def unregister_gateway_notify(session_key: str) -> None:
         _gateway_notify_cbs.pop(session_key, None)
         for entry in _gateway_queues.pop(session_key, []):
             entry.event.set()
+        try:
+            _clear_resolved_requests_locked(session_key)
+        except Exception as exc:  # noqa: BLE001 — cleanup must never strand a waiter
+            logger.warning("Failed to clear approval resolutions for session %s: %s", session_key, exc)
 
 
 def resolve_gateway_approval(session_key: str, choice: str,
@@ -145,14 +226,26 @@ def resolve_gateway_approval(session_key: str, choice: str,
     (FIFO) or the one matching *request_id*. *reason* is the ``/deny <reason>`` free text,
     relayed to the agent in the BLOCKED message. Returns the number resolved.
     """
+    # A decision also proves the client received this exact prompt; keep the receipt
+    # acknowledgement meaningful for reconnectable clients before the entry is removed.
+    if request_id:
+        ack_gateway_approval(session_key, request_id)
     with _lock:
         queue = _gateway_queues.get(session_key)
         if not queue:
+            if request_id and request_id in _resolved_request_ids_locked(session_key):
+                return 1
             return 0
         if request_id:
             targets = [entry for entry in queue if entry.data.get("request_id") == request_id]
             if not targets:
+                if request_id in _resolved_request_ids_locked(session_key):
+                    return 1
                 return 0
+            # Journal before removing the queue entry: if the state path cannot be
+            # resolved, the prompt stays pending and retryable rather than being lost
+            # with no tombstone behind it.
+            _record_resolved_request_locked(session_key, request_id)
             queue[:] = [entry for entry in queue if entry not in targets]
         elif resolve_all:
             targets = list(queue)

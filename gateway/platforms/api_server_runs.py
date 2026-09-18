@@ -800,9 +800,9 @@ async def _handle_run_events(self, request: "web.Request", *, _api_server) -> "w
     return response
 
 
-def _mark_run_event(self, run_id: str, name: str, **fields: Any) -> None:
+def _mark_run_event(self, run_id: str, name: str, *, status: str = "running", **fields: Any) -> None:
     """Record a control-plane event on the run status and (best effort) its SSE stream."""
-    self._set_run_status(run_id, "running", last_event=name)
+    self._set_run_status(run_id, status, last_event=name)
     q = self._run_streams.get(run_id)
     if q is not None:
         with suppress(Exception):
@@ -857,7 +857,15 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
         return _json_error(
             _openai_error, f"Run has no pending approval: {run_id}", code="approval_not_pending", status=409)
     request_id_field = {"request_id": request_id} if request_id else {}
-    _mark_run_event(self, run_id, "approval.responded", choice=choice, **request_id_field, resolved=resolved)
+    # Parallel tool calls leave sibling approvals pending, and a request-id retry is an
+    # idempotent no-op that resolves nothing new. In both cases the run is still waiting
+    # on a human and must not be mislabeled as running.
+    from tools.approval import has_blocking_approval
+    still_waiting = has_blocking_approval(approval_session_key)
+    _mark_run_event(
+        self, run_id, "approval.responded",
+        status="waiting_for_approval" if still_waiting else "running",
+        choice=choice, **request_id_field, resolved=resolved)
     return web.json_response({
         "object": "hermes.run.approval_response", "run_id": run_id, "choice": choice, **request_id_field,
         "resolved": resolved})

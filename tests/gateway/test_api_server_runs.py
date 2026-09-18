@@ -2256,3 +2256,57 @@ class TestHostedRoomRuns:
                 )
             assert rejected.status == 403
             create.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# A reconnecting client retries the decision whose response it lost. The retry
+# must read as success, must not resolve whichever sibling now heads the queue,
+# and must leave the run visibly waiting while siblings are still pending.
+# ---------------------------------------------------------------------------
+
+
+class TestTargetedApprovalRetry:
+    @pytest.mark.asyncio
+    async def test_targeted_retry_succeeds_and_the_run_stays_waiting(self, auth_adapter, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        approval_mod._gateway_resolved_request_ids.clear()
+        run_id = "run-retry-approval"
+        first = approval_gateway_wait._ApprovalEntry({"request_id": "approval-1", "command": "first"})
+        second = approval_gateway_wait._ApprovalEntry({"request_id": "approval-2", "command": "second"})
+        auth_adapter._run_approval_sessions[run_id] = run_id
+        auth_adapter._run_statuses[run_id] = {
+            "run_id": run_id,
+            "status": "waiting_for_approval",
+            "approval": dict(first.data),
+        }
+        with approval_mod._lock:
+            approval_mod._gateway_queues[run_id] = [first, second]
+        app = _create_runs_app(auth_adapter)
+        try:
+            with (
+                patch.object(auth_adapter, "_check_run_auth", return_value=None),
+                patch.object(auth_adapter, "_request_owns_run", return_value=True),
+            ):
+                async with TestClient(TestServer(app)) as cli:
+                    answered = await cli.post(
+                        f"/v1/runs/{run_id}/approval",
+                        json={"choice": "once", "request_id": "approval-2"},
+                    )
+                    retried = await cli.post(
+                        f"/v1/runs/{run_id}/approval",
+                        json={"choice": "deny", "request_id": "approval-2"},
+                    )
+                    retried_body = await retried.json()
+
+            assert answered.status == 200
+            assert retried.status == 200, "a lost-response retry is not a client error"
+            assert retried_body["resolved"] == 1
+            assert second.result == "once"
+            assert first.result is None, "the retry must not fall through to the FIFO head"
+            assert not first.event.is_set()
+            assert auth_adapter._run_statuses[run_id]["status"] == "waiting_for_approval", (
+                "a sibling approval is still pending, so the run is not running"
+            )
+        finally:
+            approval_mod.unregister_gateway_notify(run_id)
+            approval_mod._gateway_resolved_request_ids.clear()
