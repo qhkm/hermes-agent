@@ -10,8 +10,10 @@ from __future__ import annotations
 
 from plugins.jentera.tools import (
     BUSINESS_RECORDS_SCHEMA,
+    CONNECT_SERVICE_SCHEMA,
     check_available,
     handle_business_records,
+    handle_connect_service,
 )
 
 
@@ -24,4 +26,12 @@ def register(ctx) -> None:
         handler=handle_business_records,
         check_fn=check_available,
         emoji="📒",
+    )
+    ctx.register_tool(
+        name="connect_service",
+        toolset="jentera",
+        schema=CONNECT_SERVICE_SCHEMA,
+        handler=handle_connect_service,
+        check_fn=check_available,
+        emoji="🔌",
     )

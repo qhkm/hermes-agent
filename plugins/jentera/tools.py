@@ -23,6 +23,7 @@ from urllib.parse import urlparse
 from tools.registry import tool_error, tool_result
 
 CONNECTOR_PATH = "/v1/runtime/connector"
+CONNECT_PATH = "/v1/runtime/connect"
 # Cloudflare sits in front of the control plane and bans urllib's default
 # signature outright — error 1010, a 403 with no body of ours in it, which
 # reads to the agent as "the ledger refused me" and to a reader as a
@@ -96,9 +97,9 @@ BUSINESS_RECORDS_SCHEMA = {
 }
 
 
-def _post(payload: dict) -> tuple[int, dict]:
+def _post(payload: dict, path: str = CONNECTOR_PATH) -> tuple[int, dict]:
     request = urllib.request.Request(
-        f"{_api_base()}{CONNECTOR_PATH}",
+        f"{_api_base()}{path}",
         data=json.dumps(payload).encode("utf-8"),
         headers={
             "Authorization": f"Bearer {_credential()}",
@@ -164,4 +165,75 @@ def handle_business_records(args: dict, **_kw) -> str:
     message = str(body.get("err") or f"Jentera refused that reading ({status}).")
     if body.get("code") == "needs_approval":
         return tool_error(message, needs_owner_approval=True)
+    return tool_error(message)
+
+
+CONNECT_SERVICE_SCHEMA = {
+    "name": "connect_service",
+    "description": (
+        "Help the owner connect one of their business systems to Jentera, when they ask you to. "
+        "Call it with just `service` first: it returns the ways that service can be connected and "
+        "what each one means. Read those back and let the owner choose — do not choose for them, "
+        "because the ways differ in what they give Jentera access to. Then call it again with their "
+        "choice.\n"
+        "Never ask the owner to paste a token or a password into this chat. Never type their password "
+        "for them. For a browser sign-in you will be told to open the service and wait; when the owner "
+        "says they have signed in, call again with step 'finish'."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "service": {"type": "string", "description": "What the owner called it, e.g. 'Bukku'."},
+            "method": {
+                "type": "string",
+                "description": "The way the owner chose, exactly as it was offered. Omit to ask what is available.",
+            },
+            "account": {
+                "type": "string",
+                "description": (
+                    "For a browser sign-in, the owner's address at that service — for Bukku, the name "
+                    "in front of .bukku.my. Ask them for it; do not guess."
+                ),
+            },
+            "step": {
+                "type": "string",
+                "enum": ["finish"],
+                "description": "Use 'finish' only after the owner confirms they have signed in.",
+            },
+        },
+        "required": ["service"],
+    },
+}
+
+
+def handle_connect_service(args: dict, **_kw) -> str:
+    if not check_available():
+        return tool_error("Jentera's control plane is not reachable from here.")
+    service = str(args.get("service") or "").strip()
+    if not service:
+        return tool_error("Ask the owner which service they want to connect.")
+
+    payload: dict = {"service": service[:100]}
+    for key in ("method", "account", "step"):
+        value = args.get(key)
+        if isinstance(value, str) and value.strip():
+            payload[key] = value.strip()[:100]
+
+    try:
+        status, body = _post(payload, CONNECT_PATH)
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return tool_error("Jentera did not respond. Tell the owner you could not set it up just now.")
+    except ValueError:
+        return tool_error("Jentera returned something unreadable.")
+
+    if status == 200 and body.get("ok"):
+        # Passed through as-is: these are already written for the owner to
+        # hear. Nothing here is ever a credential — the control plane keeps
+        # those and returns only what was connected.
+        return tool_result({k: v for k, v in body.items() if k != "ok"})
+    message = str(body.get("err") or f"Jentera could not set that up ({status}).")
+    if body.get("choose"):
+        return tool_error(message, choose=body["choose"])
+    if body.get("need") == "account":
+        return tool_error(message, need="account")
     return tool_error(message)

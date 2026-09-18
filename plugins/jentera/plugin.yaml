@@ -5,3 +5,4 @@ author: Kitakod Ventures
 kind: backend
 provides_tools:
   - business_records
+  - connect_service
