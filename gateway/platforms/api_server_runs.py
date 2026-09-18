@@ -878,8 +878,10 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
         # keep re-submitting a dead request_id and reading the replay as fresh.
         surviving = get_pending_gateway_approval(approval_session_key)
         if surviving is not None:
-            self._set_run_status(run_id, "waiting_for_approval",
-                                 approval=_approval_event(run_id, surviving, _api_server=_api_server))
+            # Assign, never inline: the raw command must be visibly reassigned from the
+            # redacting builder before it reaches the run status (#48456).
+            surviving_event = _approval_event(run_id, surviving, _api_server=_api_server)
+            self._set_run_status(run_id, "waiting_for_approval", approval=surviving_event)
     _mark_run_event(
         self, run_id, "approval.responded",
         status="waiting_for_approval" if still_waiting else "running",

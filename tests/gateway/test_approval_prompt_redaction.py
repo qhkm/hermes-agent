@@ -71,7 +71,8 @@ class TestApprovalCommandWiring:
     benign refactor doesn't cause a false failure, and so a discarded-result
     call (`_redact(cmd); send(cmd)`) does NOT pass."""
 
-    def _assert_redacts_then_uses(self, module, func_name: str, sink_substr: str):
+    def _assert_redacts_then_uses(self, module, func_name: str, sink_substr: str,
+                                  callee: str = "_redact_approval_command"):
         """Parse `module`'s full AST, locate the (possibly nested) function
         `func_name`, and assert it contains an assignment
         `<x> = _redact_approval_command(...)` whose result is then used by a
@@ -94,10 +95,10 @@ class TestApprovalCommandWiring:
         for node in ast.walk(target_fn):
             if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
                 fn = node.value.func
-                if isinstance(fn, ast.Name) and fn.id == "_redact_approval_command":
+                if isinstance(fn, ast.Name) and fn.id == callee:
                     redact_line = node.lineno
         assert redact_line is not None, (
-            f"{func_name} must assign the result of _redact_approval_command(...) "
+            f"{func_name} must assign the result of {callee}(...) "
             "(a discarded-result call would still leak the raw command)"
         )
 
@@ -117,10 +118,26 @@ class TestApprovalCommandWiring:
         self._assert_redacts_then_uses(run, "_approval_notify_sync", "send_exec_approval")
 
     def test_sse_api_path_redacts_before_enqueue(self):
+        """The SSE/API path builds its envelope in ``_approval_event`` (shared with the
+        approval-response path, which must redact identically). Pin both halves: the
+        builder redacts before returning, and the transport enqueues the builder's
+        result -- never anything it assembled itself."""
         from gateway.platforms import api_server_runs
 
         self._assert_redacts_then_uses(
-            api_server_runs, "_approval_notify", "put_nowait"
+            api_server_runs, "_approval_event", "return event"
+        )
+        self._assert_redacts_then_uses(
+            api_server_runs, "_approval_notify", "put_nowait", callee="_approval_event"
+        )
+
+    def test_approval_response_path_reuses_the_redacting_builder(self):
+        """Resolving an approval while a sibling is pending re-advertises the surviving
+        prompt. That prompt must go through the same redaction seam."""
+        from gateway.platforms import api_server_runs
+
+        self._assert_redacts_then_uses(
+            api_server_runs, "_handle_run_approval", "_set_run_status", callee="_approval_event"
         )
 
 
