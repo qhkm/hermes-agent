@@ -164,6 +164,12 @@ def _resolved_request_ids_locked(session_key: str) -> set[str]:
     return resolved
 
 
+def _is_resolved_request_locked(session_key: str, request_id) -> bool:
+    """Tombstone lookup that tolerates the unvalidated ids surfaces relay (the tui
+    passes ``params.get("request_id")`` straight through, so it can be unhashable)."""
+    return isinstance(request_id, str) and request_id in _resolved_request_ids_locked(session_key)
+
+
 def _record_resolved_request_locked(session_key: str, request_id: str) -> None:
     """Durably tombstone a targeted decision. Caller must hold ``_lock``."""
     resolved = _resolved_request_ids_locked(session_key)
@@ -233,13 +239,13 @@ def resolve_gateway_approval(session_key: str, choice: str,
     with _lock:
         queue = _gateway_queues.get(session_key)
         if not queue:
-            if request_id and request_id in _resolved_request_ids_locked(session_key):
+            if request_id and _is_resolved_request_locked(session_key, request_id):
                 return 1
             return 0
         if request_id:
             targets = [entry for entry in queue if entry.data.get("request_id") == request_id]
             if not targets:
-                if request_id in _resolved_request_ids_locked(session_key):
+                if _is_resolved_request_locked(session_key, request_id):
                     return 1
                 return 0
             # Journal before removing the queue entry: if the state path cannot be

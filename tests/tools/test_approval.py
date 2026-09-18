@@ -2273,3 +2273,11 @@ class TestTargetedApprovalReplayIsIdempotent:
         assert journal_path.is_file()
         mod.unregister_gateway_notify(self.SESSION_KEY)
         assert not journal_path.exists(), "teardown must not leave tombstones behind"
+
+    def test_a_non_string_request_id_is_refused_not_raised(self):
+        """The tui relays ``params.get("request_id")`` unvalidated; an unhashable
+        value must not reach the tombstone set as an exception."""
+        from tools import approval as mod
+
+        assert mod.resolve_gateway_approval("ghost-session", "once", request_id=["x"]) == 0
+        assert mod.resolve_gateway_approval("ghost-session", "once", request_id={"a": 1}) == 0
