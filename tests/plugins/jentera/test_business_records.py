@@ -61,6 +61,9 @@ def test_reads_overdue_invoices(control_plane):
     assert sent["auth"] == "Bearer sk-jentera-v1.test-credential"
     assert sent["body"]["op"] == "list"
     assert sent["body"]["args"] == {"resource": "invoices", "paymentStatus": "OVERDUE"}
+    # No run id: a sprite's gateway has none to give, and a stale one
+    # would tie every reading to whichever run happened to start Hermes.
+    assert "runId" not in sent["body"]
 
 
 def test_does_not_let_the_model_choose_the_operation(control_plane):
