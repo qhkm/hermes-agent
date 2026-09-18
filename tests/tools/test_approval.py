@@ -2281,3 +2281,28 @@ class TestTargetedApprovalReplayIsIdempotent:
 
         assert mod.resolve_gateway_approval("ghost-session", "once", request_id=["x"]) == 0
         assert mod.resolve_gateway_approval("ghost-session", "once", request_id={"a": 1}) == 0
+
+    def test_the_journal_write_does_not_hold_the_approval_lock(self, monkeypatch):
+        """fsync can take hundreds of ms on a networked filesystem. Holding ``_lock``
+        across it stalls every other approval in the process."""
+        from tools import approval as mod
+        from tools.approval_gateway_wait import _ApprovalEntry
+
+        entry = _ApprovalEntry({"command": "only", "pattern_keys": ["dangerous"]})
+        with mod._lock:
+            mod._gateway_queues[self.SESSION_KEY] = [entry]
+
+        seen = {}
+        real_append = mod._append_resolution_journal
+
+        def _spy(path, request_id):
+            seen["locked_during_write"] = mod._lock.locked()
+            return real_append(path, request_id)
+
+        monkeypatch.setattr(mod, "_append_resolution_journal", _spy)
+        assert mod.resolve_gateway_approval(
+            self.SESSION_KEY, "once", request_id=entry.data["request_id"]) == 1
+
+        assert seen["locked_during_write"] is False, "the lock must be released before disk I/O"
+        _, journal_path = mod._gateway_resolution_state(self.SESSION_KEY)
+        assert journal_path.is_file(), "the tombstone is still written durably"

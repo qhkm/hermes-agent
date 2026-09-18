@@ -131,11 +131,12 @@ _gateway_resolved_request_ids: dict[tuple[str, str], set[str]] = {}
 
 def _gateway_resolution_state(session_key: str):
     """Return ``(cache_key, journal_path)`` for one approval session."""
-    from hermes_constants import get_hermes_home
+    from hermes_constants import get_hermes_home, hermes_home_key
 
-    home = get_hermes_home().expanduser().resolve(strict=False)
+    home = get_hermes_home()
     session_digest = hashlib.sha256(session_key.encode("utf-8")).hexdigest()
-    cache_key = (os.path.normcase(str(home)), session_key)
+    # ``hermes_home_key`` caches the resolve(); this runs under ``_lock`` on every decision.
+    cache_key = (os.path.normcase(hermes_home_key(home)), session_key)
     return cache_key, home / "state" / "approval-resolutions" / f"{session_digest}.jsonl"
 
 
@@ -170,13 +171,25 @@ def _is_resolved_request_locked(session_key: str, request_id) -> bool:
     return isinstance(request_id, str) and request_id in _resolved_request_ids_locked(session_key)
 
 
-def _record_resolved_request_locked(session_key: str, request_id: str) -> None:
-    """Durably tombstone a targeted decision. Caller must hold ``_lock``."""
+def _record_resolved_request_locked(session_key: str, request_id: str):
+    """Tombstone a targeted decision in memory. Caller must hold ``_lock``.
+
+    Returns the ``(path, request_id)`` the caller must hand to
+    ``_append_resolution_journal`` AFTER releasing the lock, or None when this id was
+    already recorded. The disk write is deliberately not done here: an fsync under
+    ``_lock`` stalls every other approval in the process.
+    """
     resolved = _resolved_request_ids_locked(session_key)
     if request_id in resolved:
-        return
+        return None
     resolved.add(request_id)
     _, path = _gateway_resolution_state(session_key)
+    return path, request_id
+
+
+def _append_resolution_journal(path, request_id: str) -> None:
+    """Durably record a tombstone. Runs OUTSIDE ``_lock`` — fsync is slow enough on a
+    networked filesystem to be worth never serialising the approval queue behind it."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as journal:
@@ -187,7 +200,7 @@ def _record_resolved_request_locked(session_key: str, request_id: str) -> None:
         # Keep in-process idempotency when the state directory is briefly unwritable:
         # the approval itself must still unblock rather than strand the agent after
         # the user has explicitly decided.
-        logger.warning("Failed to persist approval resolution for session %s: %s", session_key, exc)
+        logger.warning("Failed to persist approval resolution for %s: %s", path, exc)
 
 
 def _clear_resolved_requests_locked(session_key: str) -> None:
@@ -236,6 +249,7 @@ def resolve_gateway_approval(session_key: str, choice: str,
     # acknowledgement meaningful for reconnectable clients before the entry is removed.
     if request_id:
         ack_gateway_approval(session_key, request_id)
+    journal_append = None
     with _lock:
         queue = _gateway_queues.get(session_key)
         if not queue:
@@ -251,7 +265,7 @@ def resolve_gateway_approval(session_key: str, choice: str,
             # Journal before removing the queue entry: if the state path cannot be
             # resolved, the prompt stays pending and retryable rather than being lost
             # with no tombstone behind it.
-            _record_resolved_request_locked(session_key, request_id)
+            journal_append = _record_resolved_request_locked(session_key, request_id)
             queue[:] = [entry for entry in queue if entry not in targets]
         elif resolve_all:
             targets = list(queue)
@@ -268,6 +282,10 @@ def resolve_gateway_approval(session_key: str, choice: str,
             if reason:
                 entry.reason = reason
             entry.event.set()
+    # Outside the lock on purpose: the waiters are already released, and the tombstone
+    # only has to be durable before the NEXT retry, not before this one returns.
+    if journal_append is not None:
+        _append_resolution_journal(*journal_append)
     return len(targets)
 
 
