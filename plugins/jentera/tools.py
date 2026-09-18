@@ -127,7 +127,13 @@ def handle_business_records(args: dict, **_kw) -> str:
     if isinstance(args.get("limit"), int):
         call_args["limit"] = args["limit"]
 
-    task_id = os.environ.get("JENTERA_RUN_ID", "").strip()
+    # No run id is sent, because none is available to be sent. Hermes
+    # passes tool handlers `parent_agent` in CLI mode and nothing in
+    # gateway mode, which is what a sprite runs, and no environment
+    # variable carries one — a process-level variable would be worse than
+    # none, since this gateway outlives every task and would stamp each
+    # reading with the same stale run. The control plane accepts `runId`
+    # for a caller that genuinely knows it; this one does not pretend to.
     payload = {
         # The connector is Jentera's business, not the model's: it knows
         # which accounting system this owner connected, and telling the
@@ -136,8 +142,6 @@ def handle_business_records(args: dict, **_kw) -> str:
         "op": "list",
         "args": call_args,
     }
-    if task_id:
-        payload["runId"] = task_id
 
     try:
         status, body = _post(payload)
