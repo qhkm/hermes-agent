@@ -307,6 +307,47 @@ def _get_open_command_timeout(*, first_open: bool = False) -> int:
     return max(base, floor)
 
 
+# A browser can be shared with the person who owns it: a support session, a
+# kiosk, an operator taking the keyboard back. ``browser.hold_file`` names a
+# JSON file that host writes, and ``{"paused": true}`` in it means the human
+# has the browser right now. Absent, unset, unreadable or malformed, nothing
+# changes — the hold is an extra refusal, never a new requirement.
+BROWSER_HELD_ERROR = (
+    "The owner is using this browser right now, so browser tools are unavailable. "
+    "Do not retry them: finish with what you already have, or tell the owner you need "
+    "the browser back."
+)
+
+
+def _browser_hold_error() -> Optional[str]:
+    """``BROWSER_HELD_ERROR`` while the browser's owner holds it, else ``None``.
+
+    Read on every command rather than cached: the hold is claimed and released
+    while the agent is mid-task, which is the whole case this exists for.
+    ``read_raw_config`` caches on the config file's (mtime, size), so the cost
+    here is a stat plus a small JSON read.
+    """
+    try:
+        from hermes_cli.config import read_raw_config
+        hold_file = str(cfg_get(read_raw_config(), "browser", "hold_file") or "").strip()
+    except Exception as e:
+        logger.debug("Could not read browser.hold_file from config: %s", e)
+        return None
+    if not hold_file:
+        return None
+    try:
+        with open(hold_file, encoding="utf-8") as f:
+            state = json.loads(f.read(4096))
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        # Fail open. An unreadable hold file must not cost the agent a browser
+        # the owner is not actually holding.
+        logger.debug("Could not read browser hold file %s: %s", hold_file, e)
+        return None
+    return BROWSER_HELD_ERROR if isinstance(state, dict) and state.get("paused") is True else None
+
+
 def _needs_chromium_sandbox_bypass() -> bool:
     """Return True when Chromium needs --no-sandbox to start reliably."""
     if hasattr(os, "geteuid") and os.geteuid() == 0:
@@ -2320,6 +2361,15 @@ def _run_browser_command(
     Returns:
         Parsed JSON response from agent-browser
     """
+    # Before anything is spawned or connected. A browser whose owner has taken
+    # it back does not answer the way a free one does, and the agent's own
+    # timeouts are the wrong instrument for a wait that has a person at the
+    # other end of it.
+    held = _browser_hold_error()
+    if held:
+        logger.info("browser '%s' refused: the owner holds the browser", command)
+        return {"success": False, "error": held}
+
     if timeout is None:
         timeout = _safe_command_timeout()
     args = args or []

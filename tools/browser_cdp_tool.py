@@ -424,6 +424,16 @@ def browser_cdp(
         JSON string ``{"success": True, "method": ..., "result": {...}}`` on
         success, or ``{"error": "..."}`` on failure.
     """
+    # Raw CDP reaches the same browser by its own socket, so the owner's hold
+    # has to be honoured here too rather than only in the agent-browser funnel.
+    try:
+        from tools.browser_tool import _browser_hold_error  # type: ignore[import-not-found]
+        held = _browser_hold_error()
+    except Exception:  # pragma: no cover - defensive, browser_tool always present
+        held = None
+    if held:
+        return tool_error(held)
+
     effective_task_id = task_id or "default"
 
     # --- Route iframe-scoped calls through the supervisor ---------------
