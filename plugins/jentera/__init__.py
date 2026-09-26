@@ -8,6 +8,7 @@ books.
 
 from __future__ import annotations
 
+from plugins.jentera.handoff import ASK_SPECIALIST_SCHEMA, check_handoff_available, handle_ask_specialist
 from plugins.jentera.tools import (
     BUSINESS_RECORDS_SCHEMA,
     CONNECT_SERVICE_SCHEMA,
@@ -34,4 +35,12 @@ def register(ctx) -> None:
         handler=handle_connect_service,
         check_fn=check_available,
         emoji="🔌",
+    )
+    ctx.register_tool(
+        name="ask_specialist",
+        toolset="jentera",
+        schema=ASK_SPECIALIST_SCHEMA,
+        handler=handle_ask_specialist,
+        check_fn=check_handoff_available,
+        emoji="🤝",
     )

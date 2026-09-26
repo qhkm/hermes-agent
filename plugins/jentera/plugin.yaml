@@ -6,3 +6,4 @@ kind: backend
 provides_tools:
   - business_records
   - connect_service
+  - ask_specialist
