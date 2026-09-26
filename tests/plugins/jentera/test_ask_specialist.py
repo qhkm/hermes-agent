@@ -38,8 +38,7 @@ class _Runner(BaseHTTPRequestHandler):
         self._send(*_Runner.reply)
 
 
-@pytest.fixture()
-def runner(monkeypatch):
+def _start_runner_server(monkeypatch):
     _Runner.received = []
     _Runner.available = True
     _Runner.reply = (200, {"ok": True, "specialist": "records", "name": "Finance and records",
@@ -48,7 +47,22 @@ def runner(monkeypatch):
     threading.Thread(target=server.serve_forever, daemon=True).start()
     monkeypatch.setenv("JENTERA_RUNNER_URL", f"http://127.0.0.1:{server.server_port}")
     monkeypatch.setenv("API_SERVER_KEY", "hermes-key-for-tests")
+    return server
+
+
+@pytest.fixture()
+def runner(monkeypatch):
+    server = _start_runner_server(monkeypatch)
     monkeypatch.setattr(handoff, "_calling_run_id", lambda: RUN_ID)
+    yield _Runner
+    server.shutdown()
+
+
+@pytest.fixture()
+def runner_without_run_patch(monkeypatch):
+    # Same live fake runner as `runner`, but leaves the real _calling_run_id
+    # in place so it can be exercised directly (unbound / bound cases).
+    server = _start_runner_server(monkeypatch)
     yield _Runner
     server.shutdown()
 
@@ -75,9 +89,37 @@ def test_an_unreachable_runner_is_a_failure_not_an_exception(runner, monkeypatch
 
 
 def test_a_long_or_empty_brief_is_refused_before_anything_is_sent(runner):
-    assert json.loads(handoff.handle_ask_specialist({"specialist": "records", "brief": "x" * 2_001}))["code"] == "invalid"
-    assert json.loads(handoff.handle_ask_specialist({"specialist": "records", "brief": "  "}))["code"] == "invalid"
+    overlong = json.loads(handoff.handle_ask_specialist({"specialist": "records", "brief": "x" * 2_001}))
+    assert overlong["code"] == "invalid"
+    assert "which part is missing" in overlong["error"]
+    empty = json.loads(handoff.handle_ask_specialist({"specialist": "records", "brief": "  "}))
+    assert empty["code"] == "invalid"
+    assert "which part is missing" in empty["error"]
     assert runner.received == []
+
+
+def test_refuses_without_a_bound_run_id(runner_without_run_patch):
+    # `_calling_run_id` is left un-monkeypatched here, so this exercises the
+    # real no-run guard: outside a bound API-server run, it must come back
+    # empty rather than the literal "default" get_current_session_key would
+    # otherwise hand back, which would be truthy and defeat the guard.
+    out = json.loads(handoff.handle_ask_specialist({"specialist": "records", "brief": "Which invoices are unpaid?"}))
+    assert out["code"] == "unavailable"
+    assert "which part is missing" in out["error"]
+    assert runner_without_run_patch.received == []
+
+
+def test_calling_run_id_returns_the_bound_session_key():
+    import contextvars
+
+    from tools.approval import set_current_session_key
+
+    def _read_inside_a_bound_run():
+        set_current_session_key(RUN_ID)
+        return handoff._calling_run_id()
+
+    # Runs in a copied context so the binding cannot leak into other tests.
+    assert contextvars.copy_context().run(_read_inside_a_bound_run) == RUN_ID
 
 
 def test_offered_only_when_the_runner_says_hand_offs_are_on(runner, monkeypatch):

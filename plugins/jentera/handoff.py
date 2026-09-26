@@ -90,22 +90,36 @@ def check_handoff_available() -> bool:
 def _calling_run_id() -> str:
     # The API server binds the run id as the approval session key of the
     # thread running this turn (gateway/platforms/api_server.py). The runner
-    # started that run, so the id identifies the caller exactly.
+    # started that run, so the id identifies the caller exactly. Outside a
+    # bound run, get_current_session_key's own default is the literal string
+    # "default" — truthy, so it must be overridden here or the no-run guard
+    # below never fires and a call with no run would POST runId "default".
     from tools.approval import get_current_session_key
 
-    return str(get_current_session_key() or "")
+    return str(get_current_session_key(default="") or "")
 
 
 def handle_ask_specialist(args: dict, **_kw) -> str:
     specialist = str(args.get("specialist") or "").strip()
     brief = str(args.get("brief") or "").strip()
     if not specialist or not brief:
-        return tool_error("Name the specialist and say what you need from them.", code="invalid")
+        return tool_error(
+            "Name the specialist and say what you need from them, then try again. "
+            "If you cannot, say in your answer which part is missing.",
+            code="invalid",
+        )
     if len(brief) > BRIEF_MAX_CHARS:
-        return tool_error(f"Keep the brief under {BRIEF_MAX_CHARS} characters.", code="invalid")
+        return tool_error(
+            f"Keep the brief under {BRIEF_MAX_CHARS} characters and try again. "
+            "If you cannot, say in your answer which part is missing.",
+            code="invalid",
+        )
     run_id = _calling_run_id()
     if not run_id or not _runner_key():
-        return tool_error("Hand-offs are not available here.", code="unavailable")
+        return tool_error(
+            "Hand-offs are not available here. Say in your answer which part is missing.",
+            code="unavailable",
+        )
     try:
         status, body = _request(
             "POST", HANDOFF_PATH, {"runId": run_id, "specialist": specialist, "brief": brief},
