@@ -22,18 +22,26 @@ _RULES = (
     "until they tap Publish there, so never say it is live. Reply in the owner's language, briefly, saying what changed."
 )
 
+_IMAGES = (
+    "When the owner says they added a photo, it is in `images` (source 'owner_upload'): put its `id` in a "
+    "section's `image_id` field; don't ask them for a link."
+)
 SITE_DRAFT_SCHEMA = {
     "name": "site_draft",
     "description": (
         "Start the owner's business website when they ask for one. Makes a first draft from what Jentera knows "
         "(name, confirmed facts, booking page, enquiry form) or returns the existing draft, plus the list of "
-        "sections and fields you may use. Call it before site_apply the first time. Follow the rules in site_apply."
+        "sections and fields you may use and the business's `images`. Call it before site_apply the first time. "
+        "Follow the rules in site_apply. " + _IMAGES
     ),
     "parameters": {"type": "object", "properties": {}},
 }
 SITE_GET_SCHEMA = {
     "name": "site_get",
-    "description": "Read the current website draft and the sections and fields you may use.",
+    "description": (
+        "Read the current website draft, the sections and fields you may use, and `images`: the photos the "
+        "business has added, newest first (`id`, `source`, `licence`). " + _IMAGES
+    ),
     "parameters": {"type": "object", "properties": {}},
 }
 SITE_APPLY_SCHEMA = {
@@ -60,7 +68,8 @@ SITE_IMAGE_SCHEMA = {
     "description": (
         "Add a photo to the website from an https link to a PNG, JPEG or WebP image (up to 5 MB). The result's "
         "`imageId` is what goes into a section's `image_id` field (and `image_id` in set_seo). Only use images the business may use: the owner's own photos, or free "
-        "licences such as Unsplash or Pexels. Say which in `licence`."
+        "licences such as Unsplash or Pexels. Say which in `licence`. Not for a photo the owner added in Jentera: "
+        "that one is already in `images` from site_get."
     ),
     "parameters": {
         "type": "object",
