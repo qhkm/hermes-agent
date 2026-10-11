@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import socket
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
@@ -115,3 +117,58 @@ def test_draft_refusal_is_worded_as_a_failed_first_draft(control_plane):
     control_plane.reply = (422, {"ok": False, "problems": ["no name"]})
     out = json.dumps(json.loads(site.handle_site_draft({})))
     assert "first draft" in out and "no name" in out
+
+
+@pytest.fixture()
+def hanging_control_plane(monkeypatch):
+    """Accepts connections and never answers, like a wedged upstream."""
+    site._available_cache = None
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(16)
+    accepted: list[socket.socket] = []
+
+    def accept():
+        while True:
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                return
+            accepted.append(conn)
+
+    threading.Thread(target=accept, daemon=True).start()
+    monkeypatch.setenv("JENTERA_API_BASE", f"http://127.0.0.1:{listener.getsockname()[1]}")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-jentera-v1.test-credential")
+    yield accepted
+    listener.close()
+    for conn in accepted:
+        conn.close()
+
+
+def test_the_availability_probe_is_short_like_the_hand_off_probe():
+    assert site.AVAILABLE_TIMEOUT_SECONDS <= 3
+
+
+def test_a_hanging_control_plane_hides_the_tools_quickly_and_is_not_asked_again(hanging_control_plane, monkeypatch):
+    monkeypatch.setattr(site, "AVAILABLE_TIMEOUT_SECONDS", 0.3)
+    started = time.monotonic()
+    assert site.site_available() is False
+    assert time.monotonic() - started < 2
+    assert site.site_available() is False
+    assert len(hanging_control_plane) == 1
+
+
+def test_an_unreachable_control_plane_is_not_asked_again_within_the_minute(control_plane, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(site.time, "monotonic", lambda: clock[0])
+    calls = []
+    real_post = site._post
+    monkeypatch.setattr(site, "_post", lambda *a, **kw: calls.append(1) or real_post(*a, **kw))
+    monkeypatch.setenv("JENTERA_API_BASE", "http://127.0.0.1:9")
+    assert site.site_available() is False
+    clock[0] += 30
+    assert site.site_available() is False
+    assert len(calls) == 1
+    clock[0] += 31
+    assert site.site_available() is False
+    assert len(calls) == 2

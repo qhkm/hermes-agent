@@ -74,11 +74,20 @@ SITE_IMAGE_SCHEMA = {
 
 
 _AVAILABLE_TTL_SECONDS = 60
+# Hermes runs check_fns while it builds a turn's tool list, so a slow probe
+# delays the turn itself. Short, like handoff.py's AVAILABLE_TIMEOUT_SECONDS;
+# the 20 s REQUEST_TIMEOUT_SECONDS is for the tool calls, not this question.
+AVAILABLE_TIMEOUT_SECONDS = 3
 _available_cache: tuple[float, bool] | None = None
 
 
 def site_available() -> bool:
-    """Offered only on a business whose websites are switched on (cached 60 s)."""
+    """Offered only on a business whose websites are switched on (cached 60 s).
+
+    A failed probe is cached for the same minute as an answer: the last answer
+    if there was one, otherwise hidden. Retrying on every call would make each
+    turn wait out the timeout again while the control plane is down.
+    """
     global _available_cache
     if not check_available():
         return False
@@ -86,9 +95,10 @@ def site_available() -> bool:
     if _available_cache and now - _available_cache[0] < _AVAILABLE_TTL_SECONDS:
         return _available_cache[1]
     try:
-        status, body = _post({"op": "available"}, SITE_PATH)
+        status, body = _post({"op": "available"}, SITE_PATH, timeout=AVAILABLE_TIMEOUT_SECONDS)
     except (urllib.error.URLError, TimeoutError, OSError, ValueError):
-        return _available_cache[1] if _available_cache else False
+        _available_cache = (now, _available_cache[1] if _available_cache else False)
+        return _available_cache[1]
     value = status == 200 and body.get("available") is True
     _available_cache = (now, value)
     return value

@@ -97,7 +97,7 @@ BUSINESS_RECORDS_SCHEMA = {
 }
 
 
-def _post(payload: dict, path: str = CONNECTOR_PATH) -> tuple[int, dict]:
+def _post(payload: dict, path: str = CONNECTOR_PATH, timeout: float = REQUEST_TIMEOUT_SECONDS) -> tuple[int, dict]:
     request = urllib.request.Request(
         f"{_api_base()}{path}",
         data=json.dumps(payload).encode("utf-8"),
@@ -110,7 +110,7 @@ def _post(payload: dict, path: str = CONNECTOR_PATH) -> tuple[int, dict]:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             return response.status, json.loads(response.read().decode("utf-8") or "{}")
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace") or "{}"
