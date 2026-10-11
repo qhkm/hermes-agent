@@ -32,6 +32,7 @@ class _Recorder(BaseHTTPRequestHandler):
 
 @pytest.fixture()
 def control_plane(monkeypatch):
+    site._available_cache = None
     _Recorder.received = []
     server = HTTPServer(("127.0.0.1", 0), _Recorder)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -73,3 +74,44 @@ def test_unavailable_is_passed_on_in_words(control_plane):
     control_plane.reply = (404, {"ok": False, "code": "unavailable", "err": "Websites are not turned on for this business."})
     out = json.loads(site.handle_site_get({}))
     assert "not turned on" in json.dumps(out)
+
+
+def test_offered_only_where_the_control_plane_says_websites_are_on(control_plane):
+    control_plane.reply = (200, {"ok": True, "available": True})
+    assert site.site_available() is True
+    assert control_plane.received[0]["body"] == {"op": "available"}
+    site._available_cache = None
+    control_plane.reply = (200, {"ok": True, "available": False})
+    assert site.site_available() is False
+
+
+def test_availability_is_cached_for_a_minute(control_plane, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(site.time, "monotonic", lambda: clock[0])
+    control_plane.reply = (200, {"ok": True, "available": True})
+    assert site.site_available() is True
+    clock[0] += 30
+    assert site.site_available() is True
+    assert len(control_plane.received) == 1
+    clock[0] += 31
+    control_plane.reply = (200, {"ok": True, "available": False})
+    assert site.site_available() is False
+    assert len(control_plane.received) == 2
+
+
+def test_availability_keeps_the_last_answer_when_unreachable(control_plane, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(site.time, "monotonic", lambda: clock[0])
+    control_plane.reply = (200, {"ok": True, "available": True})
+    assert site.site_available() is True
+    monkeypatch.setenv("JENTERA_API_BASE", "http://127.0.0.1:9")
+    clock[0] += 120
+    assert site.site_available() is True
+    site._available_cache = None
+    assert site.site_available() is False
+
+
+def test_draft_refusal_is_worded_as_a_failed_first_draft(control_plane):
+    control_plane.reply = (422, {"ok": False, "problems": ["no name"]})
+    out = json.dumps(json.loads(site.handle_site_draft({})))
+    assert "first draft" in out and "no name" in out

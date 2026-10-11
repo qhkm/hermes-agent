@@ -18,6 +18,7 @@ from plugins.jentera.site import (
     handle_site_draft,
     handle_site_get,
     handle_site_image,
+    site_available,
 )
 from plugins.jentera.tools import (
     BUSINESS_RECORDS_SCHEMA,
@@ -65,6 +66,6 @@ def register(ctx) -> None:
             toolset="jentera",
             schema=schema,
             handler=handler,
-            check_fn=check_available,
+            check_fn=site_available,
             emoji=emoji,
         )

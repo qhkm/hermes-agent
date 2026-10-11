@@ -8,6 +8,7 @@ comes back as plain reasons the agent can fix and try again.
 
 from __future__ import annotations
 
+import time
 import urllib.error
 
 from tools.registry import tool_error, tool_result
@@ -26,13 +27,13 @@ SITE_DRAFT_SCHEMA = {
     "description": (
         "Start the owner's business website when they ask for one. Makes a first draft from what Jentera knows "
         "(name, confirmed facts, booking page, enquiry form) or returns the existing draft, plus the list of "
-        "sections and fields you may use. Call it before site_apply the first time. " + _RULES
+        "sections and fields you may use. Call it before site_apply the first time. Follow the rules in site_apply."
     ),
     "parameters": {"type": "object", "properties": {}},
 }
 SITE_GET_SCHEMA = {
     "name": "site_get",
-    "description": "Read the current website draft and the sections and fields you may use. " + _RULES,
+    "description": "Read the current website draft and the sections and fields you may use.",
     "parameters": {"type": "object", "properties": {}},
 }
 SITE_APPLY_SCHEMA = {
@@ -72,6 +73,27 @@ SITE_IMAGE_SCHEMA = {
 }
 
 
+_AVAILABLE_TTL_SECONDS = 60
+_available_cache: tuple[float, bool] | None = None
+
+
+def site_available() -> bool:
+    """Offered only on a business whose websites are switched on (cached 60 s)."""
+    global _available_cache
+    if not check_available():
+        return False
+    now = time.monotonic()
+    if _available_cache and now - _available_cache[0] < _AVAILABLE_TTL_SECONDS:
+        return _available_cache[1]
+    try:
+        status, body = _post({"op": "available"}, SITE_PATH)
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        return _available_cache[1] if _available_cache else False
+    value = status == 200 and body.get("available") is True
+    _available_cache = (now, value)
+    return value
+
+
 def _call(payload: dict) -> str:
     if not check_available():
         return tool_error("Jentera's control plane is not reachable from here.")
@@ -84,6 +106,8 @@ def _call(payload: dict) -> str:
     if status == 200 and body.get("ok"):
         return tool_result({k: v for k, v in body.items() if k != "ok"})
     if body.get("problems"):
+        if payload.get("op") == "draft":
+            return tool_error("Jentera could not make the first draft:", problems=body["problems"])
         return tool_error("Jentera did not save that. Fix these and try again.", problems=body["problems"])
     return tool_error(str(body.get("err") or f"Jentera refused that ({status})."))
 
