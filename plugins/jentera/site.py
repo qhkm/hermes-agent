@@ -58,8 +58,8 @@ SITE_APPLY_SCHEMA = {
 SITE_IMAGE_SCHEMA = {
     "name": "site_image",
     "description": (
-        "Add a photo to the website from an https link to a PNG, JPEG or WebP image (up to 5 MB). Returns an "
-        "image_id to use in a section. Only use images the business may use: the owner's own photos, or free "
+        "Add a photo to the website from an https link to a PNG, JPEG or WebP image (up to 5 MB). The result's "
+        "`imageId` is what goes into a section's `image_id` field (and `image_id` in set_seo). Only use images the business may use: the owner's own photos, or free "
         "licences such as Unsplash or Pexels. Say which in `licence`."
     ),
     "parameters": {
