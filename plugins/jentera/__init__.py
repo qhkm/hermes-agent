@@ -9,6 +9,16 @@ books.
 from __future__ import annotations
 
 from plugins.jentera.handoff import ASK_SPECIALIST_SCHEMA, check_handoff_available, handle_ask_specialist
+from plugins.jentera.site import (
+    SITE_APPLY_SCHEMA,
+    SITE_DRAFT_SCHEMA,
+    SITE_GET_SCHEMA,
+    SITE_IMAGE_SCHEMA,
+    handle_site_apply,
+    handle_site_draft,
+    handle_site_get,
+    handle_site_image,
+)
 from plugins.jentera.tools import (
     BUSINESS_RECORDS_SCHEMA,
     CONNECT_SERVICE_SCHEMA,
@@ -44,3 +54,17 @@ def register(ctx) -> None:
         check_fn=check_handoff_available,
         emoji="🤝",
     )
+    for name, schema, handler, emoji in (
+        ("site_draft", SITE_DRAFT_SCHEMA, handle_site_draft, "🌐"),
+        ("site_get", SITE_GET_SCHEMA, handle_site_get, "🌐"),
+        ("site_apply", SITE_APPLY_SCHEMA, handle_site_apply, "🌐"),
+        ("site_image", SITE_IMAGE_SCHEMA, handle_site_image, "🖼️"),
+    ):
+        ctx.register_tool(
+            name=name,
+            toolset="jentera",
+            schema=schema,
+            handler=handler,
+            check_fn=check_available,
+            emoji=emoji,
+        )

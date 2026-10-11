@@ -7,3 +7,7 @@ provides_tools:
   - business_records
   - connect_service
   - ask_specialist
+  - site_draft
+  - site_get
+  - site_apply
+  - site_image

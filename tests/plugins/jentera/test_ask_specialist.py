@@ -140,4 +140,12 @@ def test_registered_beside_business_records():
             registered.append(kwargs["name"])
 
     plugin.register(Ctx())
-    assert registered == ["business_records", "connect_service", "ask_specialist"]
+    assert registered == [
+        "business_records",
+        "connect_service",
+        "ask_specialist",
+        "site_draft",
+        "site_get",
+        "site_apply",
+        "site_image",
+    ]
