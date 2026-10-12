@@ -8,11 +8,15 @@ comes back as plain reasons the agent can fix and try again.
 
 from __future__ import annotations
 
+import json
 import time
 import urllib.error
+import urllib.request
 
+from tools.approval import get_current_session_key
 from tools.registry import tool_error, tool_result
 
+from plugins.jentera.handoff import _runner_key, _runner_url
 from plugins.jentera.tools import _post, check_available
 
 SITE_PATH = "/v1/runtime/site"
@@ -87,7 +91,7 @@ _AVAILABLE_TTL_SECONDS = 60
 # delays the turn itself. Short, like handoff.py's AVAILABLE_TIMEOUT_SECONDS;
 # the 20 s REQUEST_TIMEOUT_SECONDS is for the tool calls, not this question.
 AVAILABLE_TIMEOUT_SECONDS = 3
-_available_cache: tuple[float, bool] | None = None
+_available_cache: tuple[float, bool, bool] | None = None
 
 
 def site_available() -> bool:
@@ -106,11 +110,21 @@ def site_available() -> bool:
     try:
         status, body = _post({"op": "available"}, SITE_PATH, timeout=AVAILABLE_TIMEOUT_SECONDS)
     except (urllib.error.URLError, TimeoutError, OSError, ValueError):
-        _available_cache = (now, _available_cache[1] if _available_cache else False)
+        _available_cache = (now, _available_cache[1] if _available_cache else False, _available_cache[2] if _available_cache else False)
         return _available_cache[1]
     value = status == 200 and body.get("available") is True
-    _available_cache = (now, value)
+    _available_cache = (now, value, value and body.get("code") is True)
     return value
+
+
+def site_code_available() -> bool:
+    """Websites are on and the owner's site is edited by Jentera's code builder."""
+    return site_available() and bool(_available_cache and _available_cache[2])
+
+
+def site_block_available() -> bool:
+    """Websites are on and code mode is off, so edits go through site_apply."""
+    return site_available() and not bool(_available_cache and _available_cache[2])
 
 
 def _call(payload: dict) -> str:
@@ -158,3 +172,58 @@ def handle_site_image(args: dict, **_kw) -> str:
     if not url.startswith("https://"):
         return tool_error("url must be an https link straight to the image.")
     return _call({"op": "image", "url": url[:500], "licence": licence[:200]})
+
+
+SITE_CODE_TIMEOUT_SECONDS = 140
+
+SITE_CODE_SCHEMA = {
+    "name": "site_code",
+    "description": (
+        "Change the owner's website. Describe the change in plain words, with the owner's own wording and any facts "
+        "they gave (names, prices, hours). Jentera's website builder edits the real page and the owner sees it beside "
+        "this chat. It writes HTML and CSS only (no scripts or forms). Where details are missing it leaves a marked gap "
+        "like [Your price here]; then ask the owner for them. Photos the owner added are used automatically. "
+        + _RULES
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "request": {"type": "string", "description": "The change to make, in plain words, with every fact needed. Up to 2000 characters."},
+            "reference_image": {"type": "string", "description": "Optional: the file path of a picture the owner sent in this chat that shows the look they want (for example a site they like)."},
+        },
+        "required": ["request"],
+    },
+}
+
+
+def handle_site_code(args: dict, **_kw) -> str:
+    request_text = str(args.get("request") or "").strip()
+    if not request_text or len(request_text) > 2000:
+        return tool_error("request must say the change in 1 to 2000 characters.")
+    payload = {"runId": get_current_session_key(default=""), "request": request_text}
+    image = str(args.get("reference_image") or "").strip()
+    if image:
+        payload["image"] = image
+    req = urllib.request.Request(
+        _runner_url() + "/v1/site/code",
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {_runner_key()}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=SITE_CODE_TIMEOUT_SECONDS) as resp:
+            body = json.loads(resp.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        try:
+            body = json.loads(exc.read() or b"{}")
+        except ValueError:
+            body = {}
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        return tool_error("The website could not be changed just now. Tell the owner and offer to try again.")
+    if body.get("ok"):
+        return tool_result({"note": body.get("note", ""), "changed": bool(body.get("changed"))})
+    return tool_error(str(body.get("error") or "The website could not be changed just now."))

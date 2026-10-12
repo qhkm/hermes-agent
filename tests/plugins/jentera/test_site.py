@@ -16,11 +16,14 @@ from plugins.jentera import site
 class _Recorder(BaseHTTPRequestHandler):
     received: list[dict] = []
     reply: tuple[int, dict] = (200, {"ok": True})
+    reply_available: dict | None = None
 
     def do_POST(self):  # noqa: N802
         length = int(self.headers.get("Content-Length", "0"))
         type(self).received.append({"path": self.path, "auth": self.headers.get("Authorization"), "body": json.loads(self.rfile.read(length) or b"{}")})
         status, payload = type(self).reply
+        if type(self).reply_available is not None and self.path == "/v1/runtime/site" and json.loads(json.dumps(type(self).received[-1]["body"])).get("op") == "available":
+            status, payload = 200, type(self).reply_available
         raw = json.dumps(payload).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -36,6 +39,7 @@ class _Recorder(BaseHTTPRequestHandler):
 def control_plane(monkeypatch):
     site._available_cache = None
     _Recorder.received = []
+    _Recorder.reply_available = None
     server = HTTPServer(("127.0.0.1", 0), _Recorder)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     monkeypatch.setenv("JENTERA_API_BASE", f"http://127.0.0.1:{server.server_port}")
@@ -172,3 +176,70 @@ def test_an_unreachable_control_plane_is_not_asked_again_within_the_minute(contr
     clock[0] += 31
     assert site.site_available() is False
     assert len(calls) == 2
+
+
+class _RunnerHandler(BaseHTTPRequestHandler):
+    received: list = []
+    reply: tuple[int, dict] = (200, {})
+
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):  # noqa: N802
+        length = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(length) or b"{}")
+        type(self).received.append(("POST", self.path, self.headers.get("Authorization"), body))
+        status, payload = type(self).reply
+        raw = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+
+def _start_runner(monkeypatch, reply):
+    _RunnerHandler.received = []
+    _RunnerHandler.reply = reply
+    server = HTTPServer(("127.0.0.1", 0), _RunnerHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setenv("JENTERA_RUNNER_URL", f"http://127.0.0.1:{server.server_port}")
+    monkeypatch.setenv("API_SERVER_KEY", "k" * 16)
+    return _RunnerHandler
+
+
+def test_site_code_is_offered_only_in_code_mode(control_plane, monkeypatch):
+    control_plane.reply_available = {"ok": True, "available": True, "code": True}
+    site._available_cache = None
+    assert site.site_code_available() is True
+    assert site.site_block_available() is False
+    control_plane.reply_available = {"ok": True, "available": True, "code": False}
+    site._available_cache = None
+    assert site.site_code_available() is False
+    assert site.site_block_available() is True
+
+
+def test_site_code_sends_the_request_to_the_runner_and_relays_the_answer(control_plane, monkeypatch):
+    runner = _start_runner(monkeypatch, reply=(200, {"ok": True, "note": "Made it purple.", "changed": True}))
+    monkeypatch.setattr(site, "get_current_session_key", lambda default="": "run_" + "a" * 32)
+    out = json.loads(site.handle_site_code({"request": "make it purple"}))
+    assert out["note"] == "Made it purple."
+    method, path, auth, body = runner.received[-1]
+    assert (method, path) == ("POST", "/v1/site/code")
+    assert auth == "Bearer " + "k" * 16
+    assert body == {"runId": "run_" + "a" * 32, "request": "make it purple"}
+
+
+def test_site_code_passes_the_owners_picture(control_plane, monkeypatch):
+    runner = _start_runner(monkeypatch, reply=(200, {"ok": True, "note": "Matched the look.", "changed": True}))
+    monkeypatch.setattr(site, "get_current_session_key", lambda default="": "run_x")
+    site.handle_site_code({"request": "like this", "reference_image": "/home/sprite/.hermes/image_cache/a.png"})
+    assert runner.received[-1][3]["image"] == "/home/sprite/.hermes/image_cache/a.png"
+
+
+def test_site_code_turns_a_refusal_into_plain_words(control_plane, monkeypatch):
+    _start_runner(monkeypatch, reply=(200, {"ok": False, "error": "I couldn't make that change just now."}))
+    monkeypatch.setattr(site, "get_current_session_key", lambda default="": "run_x")
+    out = json.loads(site.handle_site_code({"request": "x"}))
+    assert "couldn't make that change" in out["error"]
+    assert json.loads(site.handle_site_code({"request": ""}))["error"]

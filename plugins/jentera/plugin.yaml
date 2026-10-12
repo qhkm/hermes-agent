@@ -10,4 +10,5 @@ provides_tools:
   - site_draft
   - site_get
   - site_apply
+  - site_code
   - site_image
