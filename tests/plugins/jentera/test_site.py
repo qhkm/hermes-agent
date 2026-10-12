@@ -263,3 +263,8 @@ def test_site_code_says_not_to_open_the_site_in_the_browser():
     description = site.SITE_CODE_SCHEMA["description"]
     assert "do not open the website in the browser" in description
     assert "preview until the owner presses Publish" in description
+
+
+def test_site_code_tells_the_agent_to_split_a_long_request():
+    out = json.loads(site.handle_site_code({"request": "x" * (site.SITE_REQUEST_MAX + 1)}))
+    assert "Split it into two or three smaller site_code calls and make them now" in json.dumps(out)

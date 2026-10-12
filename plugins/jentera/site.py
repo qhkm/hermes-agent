@@ -175,6 +175,8 @@ def handle_site_image(args: dict, **_kw) -> str:
 
 
 SITE_CODE_TIMEOUT_SECONDS = 300
+# Kept equal to runner/src/site-code.mjs SITE_REQUEST_MAX in aisar-site.
+SITE_REQUEST_MAX = 6000
 
 SITE_CODE_SCHEMA = {
     "name": "site_code",
@@ -191,7 +193,7 @@ SITE_CODE_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "request": {"type": "string", "description": "The change to make, in plain words, with every fact needed. Up to 2000 characters."},
+            "request": {"type": "string", "description": "The change to make, in plain words, with every fact needed. Up to 6000 characters; a bigger change goes as several calls, one after another."},
             "reference_image": {"type": "string", "description": "Optional: the file path of a picture the owner sent in this chat that shows the look they want (for example a site they like)."},
         },
         "required": ["request"],
@@ -201,8 +203,16 @@ SITE_CODE_SCHEMA = {
 
 def handle_site_code(args: dict, **_kw) -> str:
     request_text = str(args.get("request") or "").strip()
-    if not request_text or len(request_text) > 2000:
-        return tool_error("request must say the change in 1 to 2000 characters.")
+    if not request_text:
+        return tool_error("request must say the change.")
+    if len(request_text) > SITE_REQUEST_MAX:
+        # 12 Oct live: a 2000 cap refused a long brief twice and the agent
+        # ended its turn. Say what to do, so it carries on in the same turn.
+        return tool_error(
+            f"That request is {len(request_text)} characters; the limit is {SITE_REQUEST_MAX}. "
+            "Split it into two or three smaller site_code calls and make them now, one after another, "
+            "before you reply to the owner."
+        )
     run_id = handoff._calling_run_id()
     if not run_id or not _runner_key():
         return tool_error(
