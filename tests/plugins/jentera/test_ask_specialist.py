@@ -147,5 +147,6 @@ def test_registered_beside_business_records():
         "site_draft",
         "site_get",
         "site_apply",
+        "site_code",
         "site_image",
     ]

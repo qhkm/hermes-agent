@@ -221,7 +221,7 @@ def test_site_code_is_offered_only_in_code_mode(control_plane, monkeypatch):
 
 def test_site_code_sends_the_request_to_the_runner_and_relays_the_answer(control_plane, monkeypatch):
     runner = _start_runner(monkeypatch, reply=(200, {"ok": True, "note": "Made it purple.", "changed": True}))
-    monkeypatch.setattr(site, "get_current_session_key", lambda default="": "run_" + "a" * 32)
+    monkeypatch.setattr(site.handoff, "_calling_run_id", lambda: "run_" + "a" * 32)
     out = json.loads(site.handle_site_code({"request": "make it purple"}))
     assert out["note"] == "Made it purple."
     method, path, auth, body = runner.received[-1]
@@ -232,14 +232,26 @@ def test_site_code_sends_the_request_to_the_runner_and_relays_the_answer(control
 
 def test_site_code_passes_the_owners_picture(control_plane, monkeypatch):
     runner = _start_runner(monkeypatch, reply=(200, {"ok": True, "note": "Matched the look.", "changed": True}))
-    monkeypatch.setattr(site, "get_current_session_key", lambda default="": "run_x")
+    monkeypatch.setattr(site.handoff, "_calling_run_id", lambda: "run_x")
     site.handle_site_code({"request": "like this", "reference_image": "/home/sprite/.hermes/image_cache/a.png"})
     assert runner.received[-1][3]["image"] == "/home/sprite/.hermes/image_cache/a.png"
 
 
 def test_site_code_turns_a_refusal_into_plain_words(control_plane, monkeypatch):
     _start_runner(monkeypatch, reply=(200, {"ok": False, "error": "I couldn't make that change just now."}))
-    monkeypatch.setattr(site, "get_current_session_key", lambda default="": "run_x")
+    monkeypatch.setattr(site.handoff, "_calling_run_id", lambda: "run_x")
     out = json.loads(site.handle_site_code({"request": "x"}))
     assert "couldn't make that change" in out["error"]
     assert json.loads(site.handle_site_code({"request": ""}))["error"]
+
+
+def test_site_code_refuses_cleanly_outside_a_run(control_plane, monkeypatch):
+    runner = _start_runner(monkeypatch, reply=(200, {"ok": True}))
+    monkeypatch.setattr(site.handoff, "_calling_run_id", lambda: "")
+    out = json.loads(site.handle_site_code({"request": "make it purple"}))
+    assert out["code"] == "unavailable"
+    assert "not available here" in out["error"]
+    assert runner.received == []
+    monkeypatch.setattr(site.handoff, "_calling_run_id", lambda: "run_x")
+    monkeypatch.delenv("API_SERVER_KEY", raising=False)
+    assert json.loads(site.handle_site_code({"request": "make it purple"}))["code"] == "unavailable"

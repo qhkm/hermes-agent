@@ -13,9 +13,9 @@ import time
 import urllib.error
 import urllib.request
 
-from tools.approval import get_current_session_key
 from tools.registry import tool_error, tool_result
 
+from plugins.jentera import handoff
 from plugins.jentera.handoff import _runner_key, _runner_url
 from plugins.jentera.tools import _post, check_available
 
@@ -200,7 +200,13 @@ def handle_site_code(args: dict, **_kw) -> str:
     request_text = str(args.get("request") or "").strip()
     if not request_text or len(request_text) > 2000:
         return tool_error("request must say the change in 1 to 2000 characters.")
-    payload = {"runId": get_current_session_key(default=""), "request": request_text}
+    run_id = handoff._calling_run_id()
+    if not run_id or not _runner_key():
+        return tool_error(
+            "Website changes are not available here. Tell the owner to try again in a moment.",
+            code="unavailable",
+        )
+    payload = {"runId": run_id, "request": request_text}
     image = str(args.get("reference_image") or "").strip()
     if image:
         payload["image"] = image
