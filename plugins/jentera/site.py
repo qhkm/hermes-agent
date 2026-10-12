@@ -183,6 +183,9 @@ SITE_CODE_SCHEMA = {
         "they gave (names, prices, hours). Jentera's website builder edits the real page and the owner sees it beside "
         "this chat. It writes HTML and CSS only (no scripts or forms). Where details are missing it leaves a marked gap "
         "like [Your price here]; then ask the owner for them. Photos the owner added are used automatically. "
+        "Call it straight away: do not open the website in the browser first, before or after. The builder reads the "
+        "page and looks at it itself, and the live address shows only what was last published. A change is a preview "
+        "until the owner presses Publish. "
         + _RULES
     ),
     "parameters": {

@@ -255,3 +255,11 @@ def test_site_code_refuses_cleanly_outside_a_run(control_plane, monkeypatch):
     monkeypatch.setattr(site.handoff, "_calling_run_id", lambda: "run_x")
     monkeypatch.delenv("API_SERVER_KEY", raising=False)
     assert json.loads(site.handle_site_code({"request": "make it purple"}))["code"] == "unavailable"
+
+
+def test_site_code_says_not_to_open_the_site_in_the_browser():
+    # 12 Oct live: the agent browsed the live address before every change,
+    # 20 s each time, and judged unpublished changes against the old page.
+    description = site.SITE_CODE_SCHEMA["description"]
+    assert "do not open the website in the browser" in description
+    assert "preview until the owner presses Publish" in description
