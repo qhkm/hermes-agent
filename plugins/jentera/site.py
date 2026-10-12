@@ -174,7 +174,7 @@ def handle_site_image(args: dict, **_kw) -> str:
     return _call({"op": "image", "url": url[:500], "licence": licence[:200]})
 
 
-SITE_CODE_TIMEOUT_SECONDS = 140
+SITE_CODE_TIMEOUT_SECONDS = 250
 
 SITE_CODE_SCHEMA = {
     "name": "site_code",
