@@ -127,11 +127,48 @@ def site_block_available() -> bool:
     return site_available() and not bool(_available_cache and _available_cache[2])
 
 
+SITE_OP_TIMEOUT_SECONDS = 30
+_NO_RUN = "Website changes are not available here. Tell the owner to try again in a moment."
+
+
+class _NoRun(Exception):
+    pass
+
+
+def _relay(payload: dict) -> tuple[int, dict]:
+    """Every site tool but `available` goes through this computer's runner,
+    which adds the task this chat's run belongs to. Jentera reads the website
+    from that task's chat, so the agent never names a site."""
+    run_id = handoff._calling_run_id()
+    if not run_id or not _runner_key():
+        raise _NoRun()
+    req = urllib.request.Request(
+        _runner_url() + "/v1/site/op",
+        data=json.dumps({"runId": run_id, "payload": payload}).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {_runner_key()}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=SITE_OP_TIMEOUT_SECONDS) as resp:
+            return resp.status, json.loads(resp.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        try:
+            return exc.code, json.loads(exc.read() or b"{}")
+        except ValueError:
+            return exc.code, {}
+
+
 def _call(payload: dict) -> str:
     if not check_available():
         return tool_error("Jentera's control plane is not reachable from here.")
     try:
-        status, body = _post(payload, SITE_PATH)
+        status, body = _relay(payload)
+    except _NoRun:
+        return tool_error(_NO_RUN, code="unavailable")
     except (urllib.error.URLError, TimeoutError, OSError):
         return tool_error("Jentera did not respond. Tell the owner the website could not be changed just now.")
     except ValueError:

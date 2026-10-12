@@ -48,19 +48,23 @@ def control_plane(monkeypatch):
     server.shutdown()
 
 
-def test_draft_posts_the_op_with_the_runtime_credential(control_plane):
-    control_plane.reply = (200, {"ok": True, "created": True, "address": "kedai", "document": {"v": 1}, "guide": "hero — …"})
+def test_draft_goes_through_the_runner_with_the_run(control_plane, monkeypatch):
+    runner = _start_runner(monkeypatch, reply=(200, {"ok": True, "created": True, "address": "kedai", "document": {"v": 1}, "guide": "hero — …"}))
+    monkeypatch.setattr(site.handoff, "_calling_run_id", lambda: "run_" + "a" * 32)
     out = json.loads(site.handle_site_draft({}))
-    assert control_plane.received[0]["path"] == "/v1/runtime/site"
-    assert control_plane.received[0]["body"] == {"op": "draft"}
-    assert control_plane.received[0]["auth"] == "Bearer sk-jentera-v1.test-credential"
+    method, path, auth, body = runner.received[-1]
+    assert (method, path) == ("POST", "/v1/site/op")
+    assert auth == "Bearer " + "k" * 16
+    assert body == {"runId": "run_" + "a" * 32, "payload": {"op": "draft"}}
     assert out["address"] == "kedai"
+    assert control_plane.received == []
 
 
-def test_apply_sends_ops_and_returns_problems_on_refusal(control_plane):
-    control_plane.reply = (422, {"ok": False, "problems": ['section "hero" (hero) heading is empty']})
+def test_apply_sends_ops_and_returns_problems_on_refusal(control_plane, monkeypatch):
+    runner = _start_runner(monkeypatch, reply=(422, {"ok": False, "problems": ['section "hero" (hero) heading is empty']}))
+    monkeypatch.setattr(site.handoff, "_calling_run_id", lambda: "run_x")
     out = json.loads(site.handle_site_apply({"ops": [{"op": "remove_section", "id": "hero"}], "note": "x"}))
-    assert control_plane.received[0]["body"] == {"op": "apply", "ops": [{"op": "remove_section", "id": "hero"}], "note": "x"}
+    assert runner.received[-1][3] == {"runId": "run_x", "payload": {"op": "apply", "ops": [{"op": "remove_section", "id": "hero"}], "note": "x"}}
     assert "heading is empty" in json.dumps(out)
 
 
@@ -76,10 +80,11 @@ def test_image_needs_a_licence(control_plane):
     assert "licence" in json.dumps(out)
 
 
-def test_unavailable_is_passed_on_in_words(control_plane):
-    control_plane.reply = (404, {"ok": False, "code": "unavailable", "err": "Websites are not turned on for this business."})
+def test_unavailable_is_passed_on_in_words(control_plane, monkeypatch):
+    _start_runner(monkeypatch, reply=(404, {"ok": False, "code": "unavailable", "err": "Websites are not turned on for this business."}))
+    monkeypatch.setattr(site.handoff, "_calling_run_id", lambda: "run_x")
     out = json.loads(site.handle_site_get({}))
-    assert "not turned on" in json.dumps(out)
+    assert "not turned on" in out["error"]
 
 
 def test_offered_only_where_the_control_plane_says_websites_are_on(control_plane):
@@ -117,10 +122,30 @@ def test_availability_keeps_the_last_answer_when_unreachable(control_plane, monk
     assert site.site_available() is False
 
 
-def test_draft_refusal_is_worded_as_a_failed_first_draft(control_plane):
-    control_plane.reply = (422, {"ok": False, "problems": ["no name"]})
-    out = json.dumps(json.loads(site.handle_site_draft({})))
-    assert "first draft" in out and "no name" in out
+def test_draft_refusal_is_worded_as_a_failed_first_draft(control_plane, monkeypatch):
+    _start_runner(monkeypatch, reply=(422, {"ok": False, "problems": ["no free address"]}))
+    monkeypatch.setattr(site.handoff, "_calling_run_id", lambda: "run_x")
+    out = json.loads(site.handle_site_draft({}))
+    assert "could not make the first draft" in out["error"]
+
+
+def test_site_tools_send_nothing_outside_a_run(control_plane, monkeypatch):
+    runner = _start_runner(monkeypatch, reply=(200, {"ok": True}))
+    monkeypatch.setattr(site.handoff, "_calling_run_id", lambda: "")
+    for handler, args in ((site.handle_site_get, {}), (site.handle_site_draft, {}),
+                          (site.handle_site_image, {"url": "https://x.com/a.png", "licence": "Unsplash"})):
+        out = json.loads(handler(args))
+        assert out["code"] == "unavailable"
+    assert runner.received == []
+    assert control_plane.received == []
+
+
+def test_a_landing_chat_answer_is_relayed_as_it_is(control_plane, monkeypatch):
+    _start_runner(monkeypatch, reply=(200, {"ok": True, "kind": "landing", "name": "AI workshop", "note": "This chat is for one of the owner's other websites"}))
+    monkeypatch.setattr(site.handoff, "_calling_run_id", lambda: "run_x")
+    out = json.loads(site.handle_site_get({}))
+    assert out["kind"] == "landing"
+    assert out["name"] == "AI workshop"
 
 
 @pytest.fixture()
