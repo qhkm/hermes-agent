@@ -56,7 +56,8 @@ SITE_APPLY_SCHEMA = {
         "{op:'update_section', id, fields} (only the fields you name change), "
         "{op:'move_section', id, after: section id or null}, {op:'remove_section', id}, "
         "{op:'set_theme', palette?, fonts?, corners?}, {op:'set_seo', title?, description?, image_id?}. "
-        "If Jentera refuses, read its reasons, fix them and try again. " + _RULES
+        "If Jentera refuses, read its reasons, fix them and try again. If it says to use site_code, "
+        "use site_code for every change to this website. " + _RULES
     ),
     "parameters": {
         "type": "object",
@@ -117,14 +118,17 @@ def site_available() -> bool:
     return value
 
 
-def site_code_available() -> bool:
-    """Websites are on and the owner's site is edited by Jentera's code builder."""
+def site_code_mode() -> bool:
+    """Whether this business's websites are edited by Jentera's code builder.
+
+    Both edit tools are offered whenever websites are on, because Hermes keeps
+    one agent per conversation with the tools it started with: a conversation
+    open when code mode switched on kept site_apply and never saw site_code
+    (12 Oct, Kitakod needed a restart). So the tools decide at call time
+    instead: the Worker refuses site_apply under code mode, and site_code
+    refuses here without code mode, each naming the other.
+    """
     return site_available() and bool(_available_cache and _available_cache[2])
-
-
-def site_block_available() -> bool:
-    """Websites are on and code mode is off, so edits go through site_apply."""
-    return site_available() and not bool(_available_cache and _available_cache[2])
 
 
 SITE_OP_TIMEOUT_SECONDS = 30
@@ -215,6 +219,8 @@ SITE_CODE_TIMEOUT_SECONDS = 300
 # Kept equal to runner/src/site-code.mjs SITE_REQUEST_MAX in aisar-site.
 SITE_REQUEST_MAX = 6000
 
+_USE_SITE_APPLY = "This website is edited with site_apply, not site_code. Call site_get, then use site_apply."
+
 SITE_CODE_SCHEMA = {
     "name": "site_code",
     "description": (
@@ -224,7 +230,7 @@ SITE_CODE_SCHEMA = {
         "like [Your price here]; then ask the owner for them. Photos the owner added are used automatically. "
         "Call it straight away: do not open the website in the browser first, before or after. The builder reads the "
         "page and looks at it itself, and the live address shows only what was last published. A change is a preview "
-        "until the owner presses Publish. "
+        "until the owner presses Publish. If it says to use site_apply, this website is edited with site_apply. "
         + _RULES
     ),
     "parameters": {
@@ -242,6 +248,8 @@ def handle_site_code(args: dict, **_kw) -> str:
     request_text = str(args.get("request") or "").strip()
     if not request_text:
         return tool_error("request must say the change.")
+    if not site_code_mode():
+        return tool_error(_USE_SITE_APPLY)
     if len(request_text) > SITE_REQUEST_MAX:
         # 12 Oct live: a 2000 cap refused a long brief twice and the agent
         # ended its turn. Say what to do, so it carries on in the same turn.

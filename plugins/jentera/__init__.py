@@ -21,8 +21,6 @@ from plugins.jentera.site import (
     handle_site_get,
     handle_site_image,
     site_available,
-    site_block_available,
-    site_code_available,
 )
 from plugins.jentera.tools import (
     BUSINESS_RECORDS_SCHEMA,
@@ -62,8 +60,8 @@ def register(ctx) -> None:
     for name, schema, handler, emoji, check in (
         ("site_draft", SITE_DRAFT_SCHEMA, handle_site_draft, "🌐", site_available),
         ("site_get", SITE_GET_SCHEMA, handle_site_get, "🌐", site_available),
-        ("site_apply", SITE_APPLY_SCHEMA, handle_site_apply, "🌐", site_block_available),
-        ("site_code", SITE_CODE_SCHEMA, handle_site_code, "🌐", site_code_available),
+        ("site_apply", SITE_APPLY_SCHEMA, handle_site_apply, "🌐", site_available),
+        ("site_code", SITE_CODE_SCHEMA, handle_site_code, "🌐", site_available),
         ("site_image", SITE_IMAGE_SCHEMA, handle_site_image, "🖼️", site_available),
     ):
         ctx.register_tool(

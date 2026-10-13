@@ -233,18 +233,50 @@ def _start_runner(monkeypatch, reply):
     return _RunnerHandler
 
 
-def test_site_code_is_offered_only_in_code_mode(control_plane, monkeypatch):
-    control_plane.reply_available = {"ok": True, "available": True, "code": True}
-    site._available_cache = None
-    assert site.site_code_available() is True
-    assert site.site_block_available() is False
+CODE_ON = {"ok": True, "available": True, "code": True}
+
+
+def test_both_edit_tools_are_offered_whenever_websites_are_on():
+    # 12 Oct live: Hermes keeps a conversation's tool list, so a tool offered
+    # only in one mode stayed missing after the switch until a restart.
+    from plugins import jentera as plugin
+
+    checks = {}
+
+    class Ctx:
+        def register_tool(self, **kwargs):
+            checks[kwargs["name"]] = kwargs["check_fn"]
+
+        def __getattr__(self, _name):
+            return lambda *a, **k: None
+
+    plugin.register(Ctx())
+    assert checks["site_apply"] is site.site_available
+    assert checks["site_code"] is site.site_available
+
+
+def test_site_code_without_code_mode_points_at_site_apply(control_plane, monkeypatch):
+    runner = _start_runner(monkeypatch, reply=(200, {"ok": True}))
+    monkeypatch.setattr(site.handoff, "_calling_run_id", lambda: "run_x")
     control_plane.reply_available = {"ok": True, "available": True, "code": False}
-    site._available_cache = None
-    assert site.site_code_available() is False
-    assert site.site_block_available() is True
+    out = json.loads(site.handle_site_code({"request": "make it purple"}))
+    assert "use site_apply" in out["error"]
+    assert runner.received == []
+
+
+def test_site_code_sees_code_mode_switch_on_without_a_restart(control_plane, monkeypatch):
+    runner = _start_runner(monkeypatch, reply=(200, {"ok": True, "note": "Done.", "changed": True}))
+    monkeypatch.setattr(site.handoff, "_calling_run_id", lambda: "run_x")
+    control_plane.reply_available = {"ok": True, "available": True, "code": False}
+    assert "use site_apply" in json.loads(site.handle_site_code({"request": "x"}))["error"]
+    control_plane.reply_available = CODE_ON
+    site._available_cache = (site._available_cache[0] - site._AVAILABLE_TTL_SECONDS, True, False)
+    assert json.loads(site.handle_site_code({"request": "x"}))["note"] == "Done."
+    assert runner.received[-1][1] == "/v1/site/code"
 
 
 def test_site_code_sends_the_request_to_the_runner_and_relays_the_answer(control_plane, monkeypatch):
+    control_plane.reply_available = CODE_ON
     runner = _start_runner(monkeypatch, reply=(200, {"ok": True, "note": "Made it purple.", "changed": True}))
     monkeypatch.setattr(site.handoff, "_calling_run_id", lambda: "run_" + "a" * 32)
     out = json.loads(site.handle_site_code({"request": "make it purple"}))
@@ -256,6 +288,7 @@ def test_site_code_sends_the_request_to_the_runner_and_relays_the_answer(control
 
 
 def test_site_code_passes_the_owners_picture(control_plane, monkeypatch):
+    control_plane.reply_available = CODE_ON
     runner = _start_runner(monkeypatch, reply=(200, {"ok": True, "note": "Matched the look.", "changed": True}))
     monkeypatch.setattr(site.handoff, "_calling_run_id", lambda: "run_x")
     site.handle_site_code({"request": "like this", "reference_image": "/home/sprite/.hermes/image_cache/a.png"})
@@ -263,6 +296,7 @@ def test_site_code_passes_the_owners_picture(control_plane, monkeypatch):
 
 
 def test_site_code_turns_a_refusal_into_plain_words(control_plane, monkeypatch):
+    control_plane.reply_available = CODE_ON
     _start_runner(monkeypatch, reply=(200, {"ok": False, "error": "I couldn't make that change just now."}))
     monkeypatch.setattr(site.handoff, "_calling_run_id", lambda: "run_x")
     out = json.loads(site.handle_site_code({"request": "x"}))
@@ -271,6 +305,7 @@ def test_site_code_turns_a_refusal_into_plain_words(control_plane, monkeypatch):
 
 
 def test_site_code_refuses_cleanly_outside_a_run(control_plane, monkeypatch):
+    control_plane.reply_available = CODE_ON
     runner = _start_runner(monkeypatch, reply=(200, {"ok": True}))
     monkeypatch.setattr(site.handoff, "_calling_run_id", lambda: "")
     out = json.loads(site.handle_site_code({"request": "make it purple"}))
@@ -290,6 +325,7 @@ def test_site_code_says_not_to_open_the_site_in_the_browser():
     assert "preview until the owner presses Publish" in description
 
 
-def test_site_code_tells_the_agent_to_split_a_long_request():
+def test_site_code_tells_the_agent_to_split_a_long_request(control_plane):
+    control_plane.reply_available = CODE_ON
     out = json.loads(site.handle_site_code({"request": "x" * (site.SITE_REQUEST_MAX + 1)}))
     assert "Split it into two or three smaller site_code calls and make them now" in json.dumps(out)
