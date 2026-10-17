@@ -2782,6 +2782,33 @@ def _extract_relevant_content(
         return _truncate_snapshot(snapshot_text)
 
 
+def _snapshot_mode() -> str:
+    """'interactive' when JENTERA_BROWSER_SNAPSHOT=interactive, else 'default'.
+
+    Read at call time so the switch can change without restarting.
+    """
+    if os.environ.get("JENTERA_BROWSER_SNAPSHOT", "").strip().lower() == "interactive":
+        return "interactive"
+    return "default"
+
+
+def _snapshot_cap() -> int:
+    """Max snapshot characters before the over-size path runs.
+
+    JENTERA_BROWSER_SNAPSHOT_MAX (clamped 1000-15000; non-numeric ignored).
+    Default 6000 in interactive mode, SNAPSHOT_SUMMARIZE_THRESHOLD otherwise.
+    """
+    default = 6000 if _snapshot_mode() == "interactive" else SNAPSHOT_SUMMARIZE_THRESHOLD
+    raw = os.environ.get("JENTERA_BROWSER_SNAPSHOT_MAX", "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(1000, min(15000, value))
+
+
 def _truncate_snapshot(snapshot_text: str, max_chars: int = SNAPSHOT_SUMMARIZE_THRESHOLD) -> str:
     """Structure-aware truncation for snapshots.
 
@@ -3056,13 +3083,18 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         # Auto-take a compact snapshot so the model can act immediately
         # without a separate browser_snapshot call.
         try:
-            snap_result = _run_browser_command(nav_session_key, "snapshot", ["-c"])
+            _nav_interactive = _snapshot_mode() == "interactive"
+            snap_result = _run_browser_command(
+                nav_session_key, "snapshot",
+                ["-i", "-c"] if _nav_interactive else ["-c"],
+            )
             if snap_result.get("success"):
                 snap_data = snap_result.get("data", {})
                 snapshot_text = snap_data.get("snapshot", "")
                 refs = snap_data.get("refs", {})
-                if len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD:
-                    snapshot_text = _truncate_snapshot(snapshot_text)
+                _nav_cap = _snapshot_cap()
+                if len(snapshot_text) > _nav_cap:
+                    snapshot_text = _truncate_snapshot(snapshot_text, max_chars=_nav_cap)
                 response["snapshot"] = _redact_browser_output(snapshot_text)
                 response["element_count"] = len(refs) if refs else 0
                 if snap_result.get("fallback_warning") and not response.get("fallback_warning"):
@@ -3102,8 +3134,12 @@ def browser_snapshot(
 
     # Build command args based on full flag
     args = []
+    interactive = _snapshot_mode() == "interactive"
     if not full:
-        args.extend(["-c"])  # Compact mode
+        if interactive:
+            args.extend(["-i", "-c"])  # Interactive elements only, compact
+        else:
+            args.extend(["-c"])  # Compact mode
 
     result = _run_browser_command(effective_task_id, "snapshot", args)
 
@@ -3144,7 +3180,12 @@ def browser_snapshot(
                 logger.debug("browser_snapshot: URL safety check failed (%s)", _url_exc)
 
         # Check if snapshot needs summarization
-        if len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD and user_task:
+        # Interactive mode cuts instead of LLM-summarising (faster, cheaper).
+        cap = _snapshot_cap()
+        if interactive:
+            if len(snapshot_text) > cap:
+                snapshot_text = _truncate_snapshot(snapshot_text, max_chars=cap)
+        elif len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD and user_task:
             snapshot_text = _extract_relevant_content(snapshot_text, user_task)
         elif len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD:
             snapshot_text = _truncate_snapshot(snapshot_text)
