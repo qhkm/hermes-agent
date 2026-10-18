@@ -36,7 +36,8 @@ pytestmark = pytest.mark.skipif(
 
 _CLEAN_GIT_ENV = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
                   "GIT_CONFIG_NOSYSTEM": "1"}
-_SINKS = ("fsmonitor", "hook", "extdiff", "textconv", "smudge", "clean", "ssh", "gpg")
+_SINKS = ("fsmonitor", "hook", "extdiff", "textconv", "smudge", "clean", "ssh", "gpg",
+          "uploadpack", "receivepack", "proxy")
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -294,3 +295,57 @@ def test_env_pins_signing_keys():
                 "log.showSignature", "commit.gpgSign", "tag.gpgSign", "push.gpgSign"):
         assert values[key] == "false", key
     assert values["gpg.ssh.defaultKeyCommand"] == ""
+
+
+def _remote_repo(tmp: Path, *, uploadpack: bool = True) -> tuple[Path, str]:
+    """A repo with a local-path remote whose upload/receive packs and the git proxy are armed."""
+    repo, marker = _make_repo(tmp, "", armed=False)
+    peer = tmp / "peer.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(peer)], check=True, env=_CLEAN_GIT_ENV)
+    _git(repo, "remote", "add", "origin", str(peer))
+    if uploadpack:
+        _git(repo, "config", "remote.origin.uploadpack", _program(tmp / "up.sh", f"{marker}.uploadpack"))
+        _git(repo, "config", "remote.origin.receivepack", _program(tmp / "rp.sh", f"{marker}.receivepack"))
+    _git(repo, "config", "core.gitProxy", _program(tmp / "px.sh", f"{marker}.proxy"))
+    return repo, marker
+
+
+def test_control_raw_git_runs_remote_programs(tmp_path):
+    repo, marker = _remote_repo(tmp_path)
+    subprocess.run(["git", "-C", str(repo), "fetch", "origin"], capture_output=True, env=_CLEAN_GIT_ENV)
+    subprocess.run(["git", "-C", str(repo), "push", "origin", "main"], capture_output=True,
+                   env=_CLEAN_GIT_ENV)
+    subprocess.run(["git", "-C", str(repo), "ls-remote", "git://127.0.0.1:1/x"], capture_output=True,
+                   env=_CLEAN_GIT_ENV)
+    assert {"uploadpack", "receivepack", "proxy"} <= set(_fired(Path(marker)))
+
+
+@pytest.mark.parametrize("key", ["uploadpack", "receivepack"])
+def test_remote_pack_programs_refuse_discovery(tmp_path, key):
+    """git keeps the first ``uploadpack`` it reads, so the env cannot override the repo's: refuse."""
+    repo, marker = _remote_repo(tmp_path, uploadpack=False)
+    _git(repo, "config", f"remote.origin.{key}", _program(tmp_path / "p.sh", f"{marker}.{key}"))
+    assert noninteractive_repo_git_env(repo) is None
+
+
+def test_git_proxy_is_overridden(tmp_path):
+    repo, marker = _remote_repo(tmp_path, uploadpack=False)
+    env = noninteractive_repo_git_env(repo)
+    assert env is not None
+    subprocess.run(["git", "-C", str(repo), "ls-remote", "git://127.0.0.1:1/x"], env=env,
+                   capture_output=True, stdin=subprocess.DEVNULL, timeout=30)
+    assert _fired(Path(marker)) == []
+
+
+def test_remote_vcs_helper_refuses_discovery(tmp_path):
+    repo, _ = _make_repo(tmp_path, "", armed=False)
+    _git(repo, "config", "remote.evil.url", "evil::x")
+    _git(repo, "config", "remote.evil.vcs", "evil")
+    assert noninteractive_repo_git_env(repo) is None
+
+
+def test_web_git_fetch_never_runs_uploadpack(tmp_path):
+    from hermes_cli import web_git
+    repo, marker = _remote_repo(tmp_path)
+    web_git._git(str(repo), ["fetch", "origin"])
+    assert _fired(Path(marker)) == []

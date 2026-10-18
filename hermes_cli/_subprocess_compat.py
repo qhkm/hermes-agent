@@ -390,6 +390,9 @@ def noninteractive_git_env(base: "Mapping[str, str] | None" = None) -> dict[str,
     env["GIT_PAGER"] = "cat"
     env["PAGER"] = "cat"
     env["GIT_EDITOR"] = "true"
+    # core.gitProxy: git honours the first entry it reads (the repo's), so a config override cannot
+    # win; the environment variable is consulted before config, and empty means "no proxy".
+    env["GIT_PROXY_COMMAND"] = ""
     overrides = list(_GIT_CONFIG_OVERRIDES.items())
     overrides.extend(("safe.directory", value) for value in safe_directories)
     env["GIT_CONFIG_COUNT"] = str(len(overrides))
@@ -405,6 +408,14 @@ _FILTER_COMMAND_KEY = re.compile(r"^filter\..+\.(?:clean|smudge|process)$", re.I
 # so the spawned git can load filters this discovery never saw; refuse rather than half-harden.
 # Global/system config is already /dev/null, so only repo-local includes reach this.
 _INCLUDE_IF_KEY = re.compile(r"^includeif\..*\.path$", re.IGNORECASE)
+# Programs a repo's config can bind to a REMOTE it names. ``core.gitProxy`` (git:// transport) is
+# overridden to empty. ``remote.<name>.uploadpack`` / ``receivepack`` (fetch / push) and
+# ``remote.<name>.vcs`` (``git-remote-<vcs>`` helper) cannot be overridden from the command-line
+# config layer -- git keeps the FIRST ``uploadpack`` it reads ("more than one uploadpack given,
+# using the first"), which is the repo's, and ``vcs`` has no "off" value -- so the presence of any
+# of them refuses the call, like ``includeIf``.
+_REMOTE_PROGRAM_KEY = re.compile(r"^remote\..+\.(uploadpack|receivepack|vcs)$", re.IGNORECASE)
+_GIT_PROXY_KEY = re.compile(r"^core\.gitproxy$", re.IGNORECASE)
 # Each discovered key costs two env entries; a repo with tens of thousands of filters would make
 # every spawn fail with E2BIG ("Argument list too long"), so refuse past a generous cap.
 _MAX_FILTER_KEYS = 256
@@ -430,7 +441,8 @@ def noninteractive_repo_git_env(
     proc = bounded_probe_run(
         [
             "git", "-C", str(cwd), "config", "--includes", "--name-only", "-z",
-            "--get-regexp", r"^(filter\..*\.(clean|smudge|process)|includeif\..*\.path)$",
+            "--get-regexp", r"^(filter\..*\.(clean|smudge|process)|includeif\..*\.path"
+            r"|remote\..*\.(uploadpack|receivepack|vcs)|core\.gitproxy)$",
         ],
         timeout=2, env=env,
     )
@@ -439,6 +451,7 @@ def noninteractive_repo_git_env(
 
     keys: list[str] = []
     required: list[str] = []
+    program_overrides: list[tuple[str, str]] = []
     seen: set[str] = set()
     # Dedup on the exact name ``--name-only`` prints: git lowercases section and variable but keeps
     # the subsection's case, and ``[filter "Evil"]`` is a different driver from ``[filter "evil"]``.
@@ -446,6 +459,12 @@ def noninteractive_repo_git_env(
         key = raw.strip()
         if _INCLUDE_IF_KEY.fullmatch(key):
             return None
+        if _REMOTE_PROGRAM_KEY.fullmatch(key):
+            return None
+        if key and key not in seen and _GIT_PROXY_KEY.fullmatch(key):
+            seen.add(key)
+            program_overrides.append((key, ""))
+            continue
         if not key or key in seen or not _FILTER_COMMAND_KEY.fullmatch(key):
             continue
         seen.add(key)
@@ -458,7 +477,8 @@ def noninteractive_repo_git_env(
             required.append(required_key)
 
     start = int(env["GIT_CONFIG_COUNT"])  # always set by noninteractive_git_env
-    overrides = [(key, "") for key in keys] + [(key, "false") for key in required]
+    overrides = ([(key, "") for key in keys] + [(key, "false") for key in required]
+                 + program_overrides)
     for offset, (key, value) in enumerate(overrides):
         env[f"GIT_CONFIG_KEY_{start + offset}"] = key
         env[f"GIT_CONFIG_VALUE_{start + offset}"] = value
