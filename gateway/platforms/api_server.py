@@ -94,6 +94,9 @@ from gateway.readiness import collect_runtime_readiness
 
 logger = logging.getLogger(__name__)
 
+# Seconds a run may keep going after the turn liveness watchdog interrupted it.
+_TURN_LIVENESS_UNWIND_GRACE_S = 30.0
+
 
 def _hermes_version() -> str:
     """Return the canonical Hermes Agent version string.
@@ -5154,7 +5157,27 @@ class APIServerAdapter(BasePlatformAdapter):
                         }
                         return r, u
 
-                result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
+                _run_future = asyncio.get_running_loop().run_in_executor(None, _run_sync)
+                # Turn liveness watchdog (upstream #99758): its interrupt
+                # normally unwinds the turn and `result["failed"]` reports it.
+                # If the worker thread is wedged beyond interruption, give it a
+                # grace period after the abort and then fail the run anyway so
+                # the run and its session are not held forever.
+                while True:
+                    _done, _ = await asyncio.wait({_run_future}, timeout=1.0)
+                    if _done:
+                        break
+                    _aborted_at = getattr(agent, "_turn_liveness_aborted_at", None)
+                    if (
+                        getattr(agent, "_turn_liveness_aborted", None)
+                        and _aborted_at is not None
+                        and time.time() - _aborted_at > _TURN_LIVENESS_UNWIND_GRACE_S
+                    ):
+                        raise RuntimeError(
+                            "turn made no progress and could not be interrupted: "
+                            + str(agent._turn_liveness_aborted)
+                        )
+                result, usage = _run_future.result()
                 if run_id in self._stopping_run_ids:
                     _put_event_if_active({
                         "event": "run.cancelled",

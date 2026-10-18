@@ -3370,6 +3370,88 @@ class AIAgent:
         from agent.agent_runtime_helpers import apply_pending_steer_to_tool_results
         return apply_pending_steer_to_tool_results(self, messages, num_tool_msgs)
 
+    def _liveness_activity_lock(self) -> "threading.Lock":
+        """Shared lock for the activity clock and its generation counter."""
+        _lock = getattr(self, "_turn_liveness_activity_lock", None)
+        if _lock is None:
+            _lock = threading.Lock()
+            self._turn_liveness_activity_lock = _lock
+        return _lock
+
+    def _start_turn_liveness_watchdog(self):
+        """Arm the turn liveness watchdog (upstream #99758) for one turn.
+
+        Returns ``(stop_event, thread)``, or ``(None, None)`` when disabled
+        (``agent.turn_liveness.timeout_s <= 0``). Never raises.
+        """
+        try:
+            from agent import turn_liveness
+            from hermes_cli.config import load_config as _load_config
+
+            timeout_s, poll_s = turn_liveness.resolve_turn_liveness_settings(
+                _load_config() or {}
+            )
+            if timeout_s is None:
+                return None, None
+            return self._arm_turn_liveness_watchdog(timeout_s, poll_s)
+        except Exception:
+            logger.warning("Could not arm turn liveness watchdog", exc_info=True)
+            return None, None
+
+    def _arm_turn_liveness_watchdog(self, timeout_s: float, poll_s: float):
+        from agent import turn_liveness
+
+        stop_event = threading.Event()
+        lock = self._liveness_activity_lock()
+        self._turn_liveness_aborted = None
+        self._turn_liveness_turn_active = True
+
+        def _commit_abort(snapshot, message: str) -> bool:
+            # Revalidate and interrupt under the lock `_touch_activity` uses,
+            # so a turn that resumed since the sample is never aborted.
+            with lock:
+                if not self._turn_liveness_turn_active or stop_event.is_set():
+                    return False
+                if (
+                    getattr(self, "_turn_liveness_activity_generation", 0)
+                    != snapshot.generation
+                ):
+                    return False
+                self._turn_liveness_aborted = message
+                self._turn_liveness_aborted_at = time.time()
+            try:
+                self.interrupt(message)
+            except Exception:
+                self._interrupt_requested = True
+                self._interrupt_message = message
+            return True
+
+        watchdog = turn_liveness.TurnLivenessWatchdog(
+            self,
+            session_id=getattr(self, "session_id", None),
+            timeout_s=timeout_s,
+            poll_s=poll_s,
+            stop_event=stop_event,
+            activity_lock=lock,
+            is_turn_active=lambda: bool(self._turn_liveness_turn_active),
+            commit_abort=_commit_abort,
+        )
+        thread = watchdog.make_thread()
+        # A real agent keeps its activity clock across turns; stamp it at
+        # turn entry so idle time between turns is not charged to this one.
+        self._touch_activity("starting new turn")
+        thread.start()
+        return stop_event, thread
+
+    def _stop_turn_liveness_watchdog(self, stop_event, thread) -> None:
+        if stop_event is None:
+            return
+        with self._liveness_activity_lock():
+            self._turn_liveness_turn_active = False
+            stop_event.set()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
+
     def _touch_activity(self, desc: str) -> None:
         """Update the last-activity timestamp and description (thread-safe).
 
@@ -3379,8 +3461,20 @@ class AIAgent:
         worker as stale (#31752). Bridge is rate-limited (60s) and
         best-effort — it never raises into the agent loop.
         """
-        self._last_activity_ts = time.time()
-        self._last_activity_desc = desc
+        # Stamp under the lock shared with the turn liveness watchdog
+        # (agent/turn_liveness.py) and bump a generation counter so a stall
+        # observation can be revalidated at its commit point. Inline lazy
+        # lock creation keeps bare test doubles working.
+        _clock_lock = getattr(self, "_turn_liveness_activity_lock", None)
+        if _clock_lock is None:
+            _clock_lock = threading.Lock()
+            self._turn_liveness_activity_lock = _clock_lock
+        with _clock_lock:
+            self._turn_liveness_activity_generation = (
+                getattr(self, "_turn_liveness_activity_generation", 0) + 1
+            )
+            self._last_activity_ts = time.time()
+            self._last_activity_desc = desc
         if os.environ.get("HERMES_KANBAN_TASK"):
             try:
                 from tools.kanban_tools import heartbeat_current_worker_from_env
@@ -6598,8 +6692,9 @@ class AIAgent:
         # Keep the scope local instead of storing ContextVar tokens on the agent,
         # which may be observed from another thread.
         with scoped_runtime_main({}):
+            _wd_stop, _wd_thread = self._start_turn_liveness_watchdog()
             try:
-                return run_conversation(
+                result = run_conversation(
                     self,
                     user_message,
                     system_message,
@@ -6611,8 +6706,19 @@ class AIAgent:
                     moa_config=moa_config,
                 )
             finally:
+                self._stop_turn_liveness_watchdog(_wd_stop, _wd_thread)
                 reset_accounting_context(acct_token)
                 reset_conversation_context(token)
+            # A watchdog abort is a failure, not a user interrupt or a
+            # success: surface it so API/gateway callers report run.failed.
+            _aborted = getattr(self, "_turn_liveness_aborted", None)
+            if _aborted and isinstance(result, dict):
+                self._turn_liveness_aborted = None
+                result["failed"] = True
+                result["completed"] = False
+                result["error"] = _aborted
+                result["turn_liveness_aborted"] = True
+            return result
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """
