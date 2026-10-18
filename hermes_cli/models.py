@@ -1734,8 +1734,40 @@ def fetch_models_with_pricing(
     return result
 
 
+def _configured_openrouter_base_url() -> str:
+    """The OpenRouter-slot base URL this install is configured with, or ``""`` when none is.
+
+    ``OPENROUTER_BASE_URL`` wins, then ``model.base_url`` when ``model.provider`` is openrouter.
+    """
+    env_base = os.getenv("OPENROUTER_BASE_URL", "").strip()
+    if env_base:
+        return env_base
+    try:
+        from hermes_cli.config import load_config
+        model_cfg = (load_config() or {}).get("model", {})
+        if isinstance(model_cfg, dict) and str(model_cfg.get("provider", "")).strip().lower() == "openrouter":
+            return str(model_cfg.get("base_url", "") or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _is_openrouter_host(base_url: str) -> bool:
+    host = (urllib.parse.urlparse(base_url).hostname or "").lower().rstrip(".")
+    return host == "openrouter.ai" or host.endswith(".openrouter.ai")
+
+
 def _resolve_openrouter_api_key() -> str:
-    """Best-effort OpenRouter API key for pricing fetch."""
+    """Best-effort OpenRouter API key for the pricing fetch against openrouter.ai.
+
+    ``OPENROUTER_API_KEY`` is only sent there when the configured OpenRouter base URL IS
+    openrouter.ai (or unset). When it points elsewhere (a Jentera runtime routes the slot through
+    its own proxy) the key belongs to that endpoint, not to openrouter.ai, so none is sent: the
+    public ``/v1/models`` catalogue needs no key.
+    """
+    configured = _configured_openrouter_base_url()
+    if configured and not _is_openrouter_host(configured):
+        return ""
     return os.getenv("OPENROUTER_API_KEY", "").strip()
 
 
