@@ -975,6 +975,13 @@ DEFAULT_CONFIG = {
         # on flaky primaries; raise it if you prefer to tolerate longer
         # provider hiccups on a single provider.
         "api_max_retries": 3,
+        # Once api_max_retries AND the fallback chain are spent on a transient outage (5xx,
+        # overloaded/529, "no healthy deployments", connect/read timeouts) with nothing delivered
+        # yet, wait and retry this many more cycles (jittered 15/30/60/60/60s; a provider
+        # Retry-After wins up to 120s) with a visible "retrying automatically" countdown instead of
+        # ending the turn. Interrupt stops the wait; auth/format/billing/policy errors never enter.
+        # 0 disables.
+        "auto_recovery_cycles": 5,
         "service_tier": "",
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.

@@ -186,6 +186,15 @@ _OVERLOADED_PATTERNS = [
     "over capacity",
 ]
 
+# LiteLLM / proxy "every backend for this model is down" answers. LiteLLM raises these as
+# ``BadRequestError`` (HTTP 400) or 500/503; the request is fine and the backend is expected back,
+# so they are transient overload, not a format error.
+_NO_HEALTHY_DEPLOYMENT_PATTERNS = [
+    "no healthy deployments",
+    "no healthy deployment",
+    "no deployments available",
+]
+
 # Usage-limit patterns that need disambiguation (could be billing OR rate_limit)
 _USAGE_LIMIT_PATTERNS = [
     "usage limit",
@@ -661,6 +670,13 @@ def classify_api_error(
             retryable=False,
             should_fallback=True,
         )
+
+    # LiteLLM "There are no healthy deployments available" — transient even when it arrives as a
+    # 400 BadRequestError. Auth/billing/missing-model statuses keep their own classification.
+    if status_code not in {401, 402, 403, 404, 413} and any(
+        p in error_msg for p in _NO_HEALTHY_DEPLOYMENT_PATTERNS
+    ):
+        return _result(FailoverReason.overloaded, retryable=True)
 
     # Anthropic thinking block recovery (400).  Two distinct failure modes,
     # same recovery (strip all reasoning_details and retry without thinking

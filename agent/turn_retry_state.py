@@ -59,6 +59,9 @@ class TurnRetryState:
     primary_recovery_attempted: bool = False
     has_retried_429: bool = False
 
+    # Post-exhaustion auto-recovery cycles spent on this API call (agent.auto_recovery_cycles caps it).
+    auto_recovery_cycles_used: int = 0
+
     # ── Auth-failure provider failover ───────────────────────────────────
     # Set once we've escalated a persistent 401/403 (after the per-provider
     # credential-refresh attempt above failed) to the fallback chain, so we

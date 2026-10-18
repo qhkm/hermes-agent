@@ -845,6 +845,7 @@ Instead, when the budget is actually exhausted (90/90), Hermes injects one messa
 agent:
   max_turns: 90                # Max iterations per conversation turn (default: 90)
   api_max_retries: 3           # Retries per provider before fallback engages (default: 3)
+  auto_recovery_cycles: 5      # Extra wait-and-retry cycles on a transient outage once retries and fallbacks are spent (default: 5, 0 disables)
 ```
 
 When the iteration budget is fully exhausted, the CLI shows a notification to the user: `⚠ Iteration budget reached (90/90) — response may be incomplete`.
