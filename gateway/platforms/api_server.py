@@ -5188,6 +5188,13 @@ class APIServerAdapter(BasePlatformAdapter):
                         and _aborted_at is not None
                         and time.time() - _aborted_at > _TURN_LIVENESS_UNWIND_GRACE_S
                     ):
+                        # The worker thread is still alive: make its agent inert
+                        # so it cannot persist or run tools for a failed run.
+                        from agent.turn_liveness import mark_abandoned, release_abandoned
+                        mark_abandoned(agent)
+                        _run_future.add_done_callback(
+                            lambda _f, _a=agent: release_abandoned(_a)
+                        )
                         raise RuntimeError(
                             "turn made no progress and could not be interrupted: "
                             + str(agent._turn_liveness_aborted)

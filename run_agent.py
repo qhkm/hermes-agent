@@ -1733,6 +1733,9 @@ class AIAgent:
         never mutating the live message list used by the API call (#48677 is
         thus closed for every persist caller, not just this one).
         """
+        from agent.turn_liveness import is_abandoned
+        if is_abandoned(self, "persist the session"):
+            return
         # Scaffolding removal mutates the live list (desired — ephemeral
         # retry/failure sentinels must not survive into the real transcript).
         # Close and turn-start persistence can run on separate CLI threads; the
@@ -6508,6 +6511,10 @@ class AIAgent:
         segment in emission order so safe subsets still run concurrently
         while side-effect ordering is preserved.
         """
+        from agent.turn_liveness import is_abandoned
+        if is_abandoned(self, "dispatch tools"):
+            return
+
         tool_calls = assistant_message.tool_calls
 
         # Allow _vprint during tool execution even with stream consumers
@@ -6579,6 +6586,9 @@ class AIAgent:
                      skip_tool_request_middleware: bool = False,
                      tool_request_middleware_trace: Optional[list[dict[str, Any]]] = None) -> str:
         """Forwarder — see ``agent.agent_runtime_helpers.invoke_tool``."""
+        from agent.turn_liveness import is_abandoned
+        if is_abandoned(self, f"run tool {function_name}"):
+            return json.dumps({"error": "run abandoned; tool not executed"})
         from agent.agent_runtime_helpers import invoke_tool
         return invoke_tool(
             self,

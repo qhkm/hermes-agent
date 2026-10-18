@@ -1160,6 +1160,58 @@ class TestTurnLivenessRun:
         assert "run.completed" in second_body and "run.failed" not in second_body
         assert second_status["status"] == "completed"
 
+    @pytest.mark.asyncio
+    async def test_unwindable_run_fails_and_abandons_the_agent(self, adapter):
+        import threading
+        from agent import turn_liveness
+        from run_agent import AIAgent
+        import gateway.platforms.api_server as api_server
+
+        agent = AIAgent.__new__(AIAgent)
+        agent.session_id = "sess-wedged"
+        agent._interrupt_requested = False
+        agent._interrupt_message = None
+        agent._pending_redirect = None
+        agent._last_activity_ts = time.time()
+        agent._last_activity_desc = "idle"
+        agent.api_mode = "chat_completions"
+        agent._emit_warning = lambda *_a, **_k: None
+        agent._conversation_root_id = lambda: "root"
+        agent.session_prompt_tokens = 0
+        agent.session_completion_tokens = 0
+        agent.session_total_tokens = 0
+
+        release = threading.Event()
+
+        def _wedged(agent_, user_message, *a, **k):
+            release.wait(10)  # ignores the interrupt entirely
+            return {"final_response": "late", "completed": True}
+
+        before = turn_liveness.abandoned_thread_count()
+        cfg = {"agent": {"turn_liveness": {"timeout_s": 0.2, "poll_s": 0.02}}}
+        app = _create_runs_app(adapter)
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                with patch.object(adapter, "_create_agent", return_value=agent), patch(
+                    "agent.conversation_loop.run_conversation", _wedged
+                ), patch("hermes_cli.config.load_config", return_value=cfg), patch.object(
+                    api_server, "_TURN_LIVENESS_UNWIND_GRACE_S", 0.3
+                ):
+                    resp = await cli.post("/v1/runs", json={"input": "wedge"})
+                    run_id = (await resp.json())["run_id"]
+                    body = await (await cli.get(f"/v1/runs/{run_id}/events")).text()
+                    status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                    assert "run.failed" in body and status["status"] == "failed"
+                    assert agent._abandoned is True
+                    assert turn_liveness.abandoned_thread_count() == before + 1
+        finally:
+            release.set()
+        for _ in range(100):
+            if turn_liveness.abandoned_thread_count() == before:
+                break
+            await asyncio.sleep(0.05)
+        assert turn_liveness.abandoned_thread_count() == before
+
 
 def test_run_event_callback_forwards_lifecycle_status_as_run_status():
     """Auto-recovery waits reach /v1/runs consumers as ``run.status`` (unknown events are ignored)."""

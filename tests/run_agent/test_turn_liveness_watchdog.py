@@ -175,3 +175,39 @@ def test_aborted_result_carries_no_replayable_interrupt_message():
     assert seen["stored"] is None
     assert "interrupt_message" not in result
     assert "no progress" in result["error"]
+
+
+def test_abandoned_agent_neither_persists_nor_dispatches_tools(caplog):
+    import logging
+
+    agent = _make_agent()
+    agent._executing_tools = False
+    before = turn_liveness.abandoned_thread_count()
+    assert turn_liveness.mark_abandoned(agent) == before + 1
+    assert turn_liveness.mark_abandoned(agent) == before + 1  # idempotent
+
+    touched = []
+    agent._drop_trailing_empty_response_scaffolding = lambda m: touched.append("persist")
+    agent._flush_messages_to_session_db = lambda *a, **k: touched.append("flush")
+    agent._save_session_log = lambda *a, **k: touched.append("log")
+    agent._execute_tool_calls_sequential = lambda *a, **k: touched.append("tools")
+    agent._execute_tool_calls_concurrent = lambda *a, **k: touched.append("tools")
+
+    with caplog.at_level(logging.WARNING):
+        agent._persist_session([{"role": "user", "content": "x"}])
+        agent._persist_session([{"role": "user", "content": "x"}])
+        agent._execute_tool_calls(
+            type("M", (), {"tool_calls": [object(), object()]})(), [], "task"
+        )
+        out = agent._invoke_tool("terminal", {"command": "rm -rf /"}, "task")
+
+    assert touched == []
+    assert "not executed" in out
+    refusals = [r for r in caplog.records if "refused to" in r.getMessage()]
+    assert len(refusals) == 1  # logged once per agent at WARNING
+    assert refusals[0].levelno == logging.WARNING
+
+    turn_liveness.release_abandoned(agent)
+    assert turn_liveness.abandoned_thread_count() == before
+    turn_liveness.release_abandoned(agent)  # no double-decrement
+    assert turn_liveness.abandoned_thread_count() == before

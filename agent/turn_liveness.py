@@ -257,3 +257,69 @@ class TurnLivenessWatchdog:
             )
         except Exception:
             logger.debug("Failed to emit committed-abort warning", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Abandoned worker threads (Jentera addition)
+#
+# When a watchdog-aborted turn cannot unwind and the API server fails the run
+# anyway, the executor thread is still alive and still owns its agent. If it
+# ever wakes it would keep writing the session and running tools for a run the
+# caller was told had failed. Marking the agent abandoned makes both inert.
+# ---------------------------------------------------------------------------
+
+_abandoned_lock = threading.Lock()
+_abandoned_running = 0
+
+
+def abandoned_thread_count() -> int:
+    """Number of abandoned worker threads that have not finished yet."""
+    with _abandoned_lock:
+        return _abandoned_running
+
+
+def mark_abandoned(agent) -> int:
+    """Flag ``agent`` as abandoned (idempotent) and return the running abandoned count."""
+    global _abandoned_running
+    with _abandoned_lock:
+        if getattr(agent, "_abandoned", False):
+            return _abandoned_running
+        agent._abandoned = True
+        agent._abandoned_counted = True
+        _abandoned_running += 1
+        count = _abandoned_running
+    logger.warning(
+        "Turn worker thread abandoned (session=%s); %d abandoned thread(s) still running",
+        getattr(agent, "session_id", None) or "-", count,
+    )
+    return count
+
+
+def release_abandoned(agent) -> int:
+    """Called when an abandoned worker thread finally returns; drops it from the running count."""
+    global _abandoned_running
+    with _abandoned_lock:
+        if getattr(agent, "_abandoned_counted", False):
+            agent._abandoned_counted = False
+            _abandoned_running = max(_abandoned_running - 1, 0)
+            count = _abandoned_running
+        else:
+            return _abandoned_running
+    logger.warning(
+        "Abandoned turn worker thread finished (session=%s); %d abandoned thread(s) still running",
+        getattr(agent, "session_id", None) or "-", count,
+    )
+    return count
+
+
+def is_abandoned(agent, action: str) -> bool:
+    """True when ``agent`` was abandoned; logs once per agent at WARNING on the first refusal."""
+    if not getattr(agent, "_abandoned", False):
+        return False
+    if not getattr(agent, "_abandoned_logged", False):
+        agent._abandoned_logged = True
+        logger.warning(
+            "Abandoned agent (session=%s) refused to %s; further refusals are silent",
+            getattr(agent, "session_id", None) or "-", action,
+        )
+    return True
