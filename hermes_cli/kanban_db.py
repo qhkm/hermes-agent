@@ -6037,16 +6037,28 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
 # Workspace resolution
 # ---------------------------------------------------------------------------
 
+def _git_run(path: "Path | str", args: list, *, timeout: int) -> "subprocess.CompletedProcess":
+    """``git -C path args`` under :func:`noninteractive_repo_git_env`; never raises on non-zero exit.
+
+    The dispatcher runs these unattended inside whatever repository a task names, so the repo's
+    own ``.git/config`` (fsmonitor, hooks, clean/smudge filters) must not get to execute anything.
+    A call is refused (rc 1) when the repository's filter overrides cannot be discovered.
+    """
+    from hermes_cli._subprocess_compat import FILTER_DISCOVERY_FAILED, noninteractive_repo_git_env
+    argv = ["git", "-C", str(path), *args]
+    env = noninteractive_repo_git_env(path)
+    if env is None:
+        return subprocess.CompletedProcess(argv, 1, "", FILTER_DISCOVERY_FAILED)
+    return subprocess.run(
+        argv, capture_output=True, text=True, timeout=timeout, check=False,
+        stdin=subprocess.DEVNULL, env=env,
+    )
+
+
 def _git_toplevel(path: Path) -> Optional[Path]:
     """Return the git toplevel containing ``path``, or ``None`` if not in a repo."""
     try:
-        result = subprocess.run(
-            ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
+        result = _git_run(str(path), ["rev-parse", "--show-toplevel"], timeout=30)
     except Exception:
         return None
     if result.returncode != 0:
@@ -6062,13 +6074,7 @@ def _git_toplevel(path: Path) -> Optional[Path]:
 
 def _git_branch_exists(repo_root: Path, branch_name: str) -> bool:
     try:
-        result = subprocess.run(
-            ["git", "-C", str(repo_root), "show-ref", "--verify", f"refs/heads/{branch_name}"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
+        result = _git_run(str(repo_root), ["show-ref", "--verify", f"refs/heads/{branch_name}"], timeout=30)
     except Exception:
         return False
     return result.returncode == 0
@@ -6076,13 +6082,7 @@ def _git_branch_exists(repo_root: Path, branch_name: str) -> bool:
 
 def _git_common_dir(path: Path) -> Optional[Path]:
     try:
-        result = subprocess.run(
-            ["git", "-C", str(path), "rev-parse", "--path-format=absolute", "--git-common-dir"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
+        result = _git_run(str(path), ["rev-parse", "--path-format=absolute", "--git-common-dir"], timeout=30)
     except Exception:
         return None
     if result.returncode != 0:
@@ -6095,13 +6095,7 @@ def _git_common_dir(path: Path) -> Optional[Path]:
 
 def _git_dir(path: Path) -> Optional[Path]:
     try:
-        result = subprocess.run(
-            ["git", "-C", str(path), "rev-parse", "--path-format=absolute", "--git-dir"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
+        result = _git_run(str(path), ["rev-parse", "--path-format=absolute", "--git-dir"], timeout=30)
     except Exception:
         return None
     if result.returncode != 0:
@@ -6114,13 +6108,7 @@ def _git_dir(path: Path) -> Optional[Path]:
 
 def _git_current_branch(path: Path) -> Optional[str]:
     try:
-        result = subprocess.run(
-            ["git", "-C", str(path), "branch", "--show-current"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
+        result = _git_run(str(path), ["branch", "--show-current"], timeout=30)
     except Exception:
         return None
     if result.returncode != 0:
@@ -6171,13 +6159,9 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
             "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
             str(target), "HEAD",
         ]
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
+    # The checkout runs the repo-named smudge filters and the repo's post-checkout hook, so this
+    # goes through the filter-neutralizing environment; ``cmd`` is ``git -C <repo> <args...>``.
+    result = _git_run(cmd[2], cmd[3:], timeout=60)
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()
         raise RuntimeError(

@@ -12,7 +12,12 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 from agent.model_metadata import estimate_tokens_rough
-from hermes_cli._subprocess_compat import IS_WINDOWS, windows_hide_flags
+from hermes_cli._subprocess_compat import (
+    IS_WINDOWS,
+    harden_git_argv,
+    noninteractive_repo_git_env,
+    windows_hide_flags,
+)
 
 _QUOTED_REFERENCE_VALUE = r'(?:`[^`\n]+`|"[^"\n]+"|\'[^\'\n]+\')'
 REFERENCE_PATTERN = re.compile(
@@ -303,14 +308,20 @@ def _expand_git_reference(
     label: str,
 ) -> tuple[str | None, str | None]:
     _popen_kwargs = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {}
+    # Hermes runs this itself: ``diff`` hashes touched files through the repo's clean filter and
+    # reads the index (``core.fsmonitor``), and ``-p`` renders attribute-named diff drivers.
+    env = noninteractive_repo_git_env(cwd)
+    if env is None:
+        return f"{ref.raw}: git filter discovery failed", None
     try:
         result = subprocess.run(
-            ["git", *args],
+            ["git", *harden_git_argv(args)],
             cwd=cwd,
             capture_output=True,
             text=True,
             timeout=30,
             stdin=subprocess.DEVNULL,
+            env=env,
             **_popen_kwargs,
         )
     except subprocess.TimeoutExpired:

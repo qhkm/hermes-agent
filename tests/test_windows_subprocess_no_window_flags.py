@@ -4,8 +4,25 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 _CREATE_NO_WINDOW = 0x08000000
+
+
+@pytest.fixture(autouse=True)
+def _stub_hardened_git_env(monkeypatch):
+    """These tests patch ``subprocess.Popen``/``run`` to observe the probe's own spawn. The hardened
+    git environment shells out to ``git config`` while it is built, which would land in those
+    fakes; its behaviour is covered in ``tests/security/test_gitspawn_config_injection.py``."""
+    # Import the modules that bind these helpers by name first, so they never capture a stub.
+    import agent.context_references  # noqa: F401
+    import hermes_cli.web_git  # noqa: F401
+    from hermes_cli import _subprocess_compat
+
+    monkeypatch.setattr(_subprocess_compat, "noninteractive_git_env", lambda base=None: {"STUB_GIT_ENV": "1"})
+    monkeypatch.setattr(_subprocess_compat, "noninteractive_repo_git_env",
+                        lambda cwd, base=None: {"STUB_GIT_ENV": "1"})
 
 
 class _Completed:
@@ -379,6 +396,8 @@ def test_context_reference_git_and_rg_hide_windows(monkeypatch):
     monkeypatch.setattr(context_references, "IS_WINDOWS", True)
     monkeypatch.setattr(context_references, "windows_hide_flags", lambda: _CREATE_NO_WINDOW)
     monkeypatch.setattr(context_references.subprocess, "run", fake_run)
+    monkeypatch.setattr(context_references, "noninteractive_repo_git_env",
+                        lambda cwd, base=None: {"STUB_GIT_ENV": "1"})
 
     ref = context_references.ContextReference(
         raw="@diff",

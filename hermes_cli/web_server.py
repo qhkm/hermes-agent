@@ -1950,8 +1950,10 @@ def _fs_git_branch(cwd: str) -> str:
         }
         if sys.platform == "win32":
             run_kwargs["creationflags"] = windows_hide_flags()
+        from hermes_cli._subprocess_compat import noninteractive_git_env
         result = subprocess.run(
             ["git", "-C", cwd, "branch", "--show-current"],
+            stdin=subprocess.DEVNULL, env=noninteractive_git_env(),
             **run_kwargs,
         )
         return result.stdout.strip() if result.returncode == 0 else ""
