@@ -260,6 +260,15 @@ _LEGACY_TOOLSET_MAP = {
 # daemon start/stop, env var changes, etc.) on a 30 s horizon.
 _tool_defs_cache: Dict[tuple, List[Dict[str, Any]]] = {}
 
+# Availability verdicts each memoized result was computed under, by the same key
+# as ``_tool_defs_cache``: ((check_fn, verdict), ...). A memo hit is only valid
+# while every one of them still holds, so a tool whose availability probe flips
+# (Jentera's site tools and ask_specialist appear and disappear with a probe)
+# is added or dropped on the next call instead of staying frozen for the
+# process lifetime. The probes themselves are TTL-cached in tools.registry, so
+# revalidating costs a dict lookup per probe in the common case.
+_tool_defs_verdicts: Dict[tuple, tuple] = {}
+
 # Hard cap on memoized get_tool_definitions() results. A long-lived Gateway
 # process sees many distinct toolset/config fingerprints over its lifetime
 # (per-session toolset sets, config edits, kanban-task toggles); without a
@@ -274,6 +283,13 @@ def _clear_tool_defs_cache() -> None:
     schema dependencies change (e.g. discord capability cache reset,
     execute_code sandbox reconfigured)."""
     _tool_defs_cache.clear()
+    _tool_defs_verdicts.clear()
+
+
+def _verdicts_still_hold(verdicts: tuple) -> bool:
+    """True while every availability probe a memoized result relied on agrees."""
+    from tools.registry import _check_fn_cached
+    return all(_check_fn_cached(fn) == verdict for fn, verdict in verdicts)
 
 
 def get_tool_definitions(
@@ -325,6 +341,8 @@ def get_tool_definitions(
             bool(skip_tool_search_assembly),
         )
         cached = _tool_defs_cache.get(cache_key)
+        if cached is not None and not _verdicts_still_hold(_tool_defs_verdicts.get(cache_key, ())):
+            cached = None  # an availability probe flipped: membership changed
         if cached is not None:
             # Update _last_resolved_tool_names so downstream callers see
             # consistent state even on a cache hit.
@@ -334,8 +352,10 @@ def get_tool_definitions(
             # schemas are treated as read-only by all known callers.
             return list(cached)
 
+    verdicts: Dict[Any, bool] = {}
     result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                       skip_tool_search_assembly=skip_tool_search_assembly)
+                                       skip_tool_search_assembly=skip_tool_search_assembly,
+                                       verdicts=verdicts)
     if quiet_mode:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
@@ -348,8 +368,11 @@ def get_tool_definitions(
         # doesn't accumulate entries unboundedly across the many distinct
         # toolset/config fingerprints it sees over its lifetime (#19251).
         if len(_tool_defs_cache) >= _TOOL_DEFS_CACHE_MAX:
-            _tool_defs_cache.pop(next(iter(_tool_defs_cache)))  # evict oldest
+            _evicted = next(iter(_tool_defs_cache))
+            _tool_defs_cache.pop(_evicted)  # evict oldest
+            _tool_defs_verdicts.pop(_evicted, None)
         _tool_defs_cache[cache_key] = result
+        _tool_defs_verdicts[cache_key] = tuple(verdicts.items())
         return list(result)
     return result
 
@@ -359,8 +382,12 @@ def _compute_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    verdicts: Optional[Dict[Any, bool]] = None,
 ) -> List[Dict[str, Any]]:
-    """Uncached implementation of :func:`get_tool_definitions`."""
+    """Uncached implementation of :func:`get_tool_definitions`.
+
+    ``verdicts`` is filled with the availability probes the result depends on.
+    """
     # Determine which tool names the caller wants
     tools_to_include: set = set()
 
@@ -442,7 +469,7 @@ def _compute_tool_definitions(
     # other toolset.
 
     # Ask the registry for schemas (only returns tools whose check_fn passes)
-    filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
+    filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode, verdicts=verdicts)
 
     # The set of tool names that actually passed check_fn filtering.
     # Use this (not tools_to_include) for any downstream schema that references
@@ -566,7 +593,58 @@ def _compute_tool_definitions(
     except Exception as e:  # pragma: no cover — never break tool loading
         logger.warning("Tool search assembly skipped: %s", e)
 
-    return filtered_tools
+    return canonical_tool_defs(filtered_tools)
+
+
+def _canonical_function(function: Dict[str, Any]) -> Dict[str, Any]:
+    """Same schema, fixed top-level key order (name, description, parameters, rest sorted)."""
+    head = ("name", "description", "parameters")
+    ordered = {k: function[k] for k in head if k in function}
+    ordered.update((k, function[k]) for k in sorted(function) if k not in head)
+    return ordered
+
+
+def canonical_tool_defs(tool_defs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Deterministic ``tools[]``: the same set of tools always serialises to the same bytes.
+
+    ``tools[]`` heads every request, so any difference in its bytes re-prefills
+    the whole cached prompt. This fixes order and key order, and nothing else:
+    *which* tools are present is still decided afresh by the caller each turn
+    (availability probes, toolsets, config), so a tool that becomes available
+    appears on the next turn and one that disappears is dropped.
+
+    Order is (tier, name): built-in toolsets first, then plugin / MCP / injected
+    tools (the ones whose availability comes and goes, so a flip disturbs only
+    the tail of the cached prefix), then the tool_search bridge. Duplicate names
+    keep their first definition. Pure: returns new lists, never mutates ``tool_defs``.
+    """
+    from toolsets import TOOLSETS
+    from tools.tool_search import BRIDGE_TOOL_NAMES
+
+    def _name(td: Dict[str, Any]) -> str:
+        return (td.get("function") or {}).get("name", "") or ""
+
+    def _tier(name: str) -> int:
+        if name in BRIDGE_TOOL_NAMES:
+            return 2
+        return 0 if registry.get_toolset_for_tool(name) in TOOLSETS else 1
+
+    seen: set = set()
+    unique = []
+    for td in tool_defs:
+        name = _name(td)
+        if name in seen:
+            continue
+        seen.add(name)
+        unique.append(td)
+    unique.sort(key=lambda td: (_tier(_name(td)), _name(td)))
+    out = []
+    for td in unique:
+        fn = td.get("function")
+        if isinstance(fn, dict):
+            td = {**td, "function": _canonical_function(fn)}
+        out.append(td)
+    return out
 
 
 def _resolve_active_context_length() -> int:

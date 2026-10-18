@@ -2424,6 +2424,10 @@ def init_agent(
             agent.valid_tool_names.add(_tname)
             agent._context_engine_tool_names.add(_tname)
             _existing_tool_names.add(_tname)
+        if agent._context_engine_tool_names:
+            # Injected tools join the canonical order (tools[] heads every request).
+            from model_tools import canonical_tool_defs
+            agent.tools[:] = canonical_tool_defs(agent.tools)
 
     # Notify context engine of session start
     if hasattr(agent, "context_compressor") and agent.context_compressor:

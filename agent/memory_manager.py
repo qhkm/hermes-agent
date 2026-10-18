@@ -143,6 +143,9 @@ def inject_memory_provider_tools(agent: Any) -> int:
         existing_tool_names.add(tool_name)
         added += 1
 
+    if added:
+        from model_tools import canonical_tool_defs
+        tools[:] = canonical_tool_defs(tools)  # appended tools join the canonical order
     return added
 
 
