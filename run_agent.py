@@ -3422,11 +3422,15 @@ class AIAgent:
                     return False
                 self._turn_liveness_aborted = message
                 self._turn_liveness_aborted_at = time.time()
+            # No message: `interrupt(message)` stores it as `_interrupt_message`,
+            # which the finalizer copies to result["interrupt_message"] and the
+            # gateway re-queues as a new user turn. The reason lives in
+            # `_turn_liveness_aborted` and the result's error string instead.
             try:
-                self.interrupt(message)
+                self.interrupt()
             except Exception:
                 self._interrupt_requested = True
-                self._interrupt_message = message
+                self._interrupt_message = None
             return True
 
         watchdog = turn_liveness.TurnLivenessWatchdog(
@@ -6721,6 +6725,8 @@ class AIAgent:
                 result["completed"] = False
                 result["error"] = _aborted
                 result["turn_liveness_aborted"] = True
+                # Never replayable: the gateway re-queues this key as a user message.
+                result.pop("interrupt_message", None)
             return result
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:

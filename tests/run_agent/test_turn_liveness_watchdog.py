@@ -151,3 +151,27 @@ def test_commit_declines_when_turn_resumed_after_sample():
         agent._stop_turn_liveness_watchdog(stop, thread)
     assert agent._interrupt_requested is False
     assert getattr(agent, "_turn_liveness_aborted", None) is None
+
+
+def test_aborted_result_carries_no_replayable_interrupt_message():
+    """The gateway re-queues result["interrupt_message"] as a new user turn; a watchdog abort
+    must not feed its own text back as one."""
+    agent = _make_agent()
+    seen = {}
+
+    def _loop(agent_, user_message, *a, **k):
+        deadline = time.time() + 10
+        while not agent_._interrupt_requested and time.time() < deadline:
+            time.sleep(0.01)
+        seen["stored"] = agent_._interrupt_message
+        result = {"final_response": "Operation interrupted.", "interrupted": True, "completed": False}
+        # What turn_finalizer does with a stored interrupt message:
+        if agent_._interrupt_message:
+            result["interrupt_message"] = agent_._interrupt_message
+        return result
+
+    result = _run(agent, _loop, "stall me", _cfg(0.15))
+    assert result["turn_liveness_aborted"] is True
+    assert seen["stored"] is None
+    assert "interrupt_message" not in result
+    assert "no progress" in result["error"]
