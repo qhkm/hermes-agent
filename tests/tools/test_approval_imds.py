@@ -60,6 +60,44 @@ class TestDetection:
             assert not (is_dangerous and key == IMDS_KEY), cmd
 
 
+    @pytest.mark.parametrize("cmd", [
+        f"curl http://{AWS_IP}.nip.io/latest/meta-data/",
+        f"curl http://{AWS_IP}./latest/meta-data/",
+        f"curl http://{AWS_IP}.:80/",
+        "curl http://169.254.170.2/v2/credentials/abc",       # ECS task role
+        "curl http://169.254.169.253/",                       # AWS DNS
+        "curl http://2852039166/latest/meta-data/",           # decimal
+        "curl http://0xa9fea9fe/latest/meta-data/",           # hex
+        "curl 'http://[::ffff:a9fe:a9fe]/latest/meta-data/'",  # IPv4-mapped IPv6
+        "curl http://[64:ff9b::a9fe:a9fe]/",                  # NAT64
+        "curl -H 'Metadata-Flavor: Google' http://metadata/computeMetadata/v1/",
+        "wget http://user@metadata:80/computeMetadata/v1/",
+        "curl metadata/computeMetadata/v1/instance/",
+        "curl -sH 'Metadata-Flavor: Google' metadata.google.internal/computeMetadata/v1/",
+    ])
+    def test_variant_spellings_flagged(self, cmd):
+        is_dangerous, key, _ = mod.detect_dangerous_command(cmd)
+        assert is_dangerous is True and key == IMDS_KEY, cmd
+
+    @pytest.mark.parametrize("cmd", [
+        "curl http://169.254.170.20/",
+        "curl http://169.254.169.2540/",
+        "curl https://example.com/2852039166x",
+        "echo 12852039166",
+        "cat metadata.json",
+        "curl -o metadata.json https://example.com/a",
+        "ls /srv/metadata/",
+        "curl https://example.com/metadata",
+        "curl https://metadata.example.com/",
+        "echo metadata is a word",
+        "git log --format=%H -- metadata",
+        "curl http://[2001:db8::a9fe:a9fe]/",
+    ])
+    def test_ordinary_text_not_flagged(self, cmd):
+        is_dangerous, key, _ = mod.detect_dangerous_command(cmd)
+        assert not (is_dangerous and key == IMDS_KEY), cmd
+
+
 class TestConfigSwitch:
     def test_default_is_approve(self):
         from hermes_cli.config import DEFAULT_CONFIG

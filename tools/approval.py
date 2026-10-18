@@ -605,12 +605,29 @@ def _sudo_stdin_block_result(description: str) -> dict:
 # Cloud metadata endpoint (IMDS) detection
 # =========================================================================
 
-# 169.254.169.254 (AWS/Azure/GCP/OpenStack/DO/Oracle), its AWS IPv6 form
-# fd00:ec2::254, Alibaba Cloud's 100.100.100.200, and the GCP hostname.
+# 169.254.169.254 (AWS/Azure/GCP/OpenStack/DO/Oracle), the AWS ECS task endpoint 169.254.170.2, the
+# AWS DNS address 169.254.169.253, its AWS IPv6 form fd00:ec2::254, Alibaba Cloud's
+# 100.100.100.200, the GCP hostnames (``metadata.google.internal`` and the bare ``metadata`` host
+# when used as a URL host or a curl/wget argument), and the same address spelled as a decimal
+# integer (2852039166), hex (0xa9fea9fe) or an IPv4-mapped / NAT64 IPv6 literal.
+#
+# A pattern cannot catch built strings; the network-level block is the real fix.
+# (``$(printf '%s.%s' 169.254 169.254)``, base64, string concatenation, a DNS name that resolves
+# to the address: none of those are visible here.)
 _IMDS_PATTERN = (
-    r'(?<![\d.])(?:169\.254\.169\.254|100\.100\.100\.200)(?![\d.])'
-    r'|(?<![\w.-])metadata\.google\.internal(?![\w.-])'
+    # dotted quads; "." or a hostname suffix after the last octet (169.254.169.254.nip.io) still
+    # points at the address, so only a following digit ends the match.
+    r'(?<![\d.])(?:169\.254\.169\.254|169\.254\.169\.253|169\.254\.170\.2|100\.100\.100\.200)(?!\d)'
+    r'|(?<![\w.-])metadata\.google\.internal(?!\.?[\w-])'
+    # bare "metadata" host: only as a URL host (after // or @) ...
+    r'|(?:(?<=//)|(?<=@))metadata(?=[/:?#\s"\']|$)'
+    # ... or as the target argument of curl / wget
+    r'|\b(?:curl|wget)\b[^\n|;&]*?\s["\']?metadata(?=[/:])'
     r'|fd00:ec2::254'
+    r'|(?<![\w.])2852039166(?!\w)'
+    r'|(?<![\w.])0xa9fea9fe(?![0-9a-f])'
+    # IPv4-mapped (::ffff:a9fe:a9fe) and NAT64 (64:ff9b::a9fe:a9fe) literals
+    r'|(?<![0-9a-f])(?:ffff:|64:ff9b::|::)a9fe:a9fe(?![0-9a-f])'
 )
 _IMDS_DESCRIPTION = "cloud metadata endpoint access (instance credentials)"
 _IMDS_RE = re.compile(_IMDS_PATTERN, re.IGNORECASE)
