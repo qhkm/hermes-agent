@@ -739,6 +739,9 @@ class AIAgent:
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
         
+        # A new session starts with no priced transcript.
+        self._usage_anchor = None
+
         # Turn counter (added after reset_session_state was first written — #2635)
         self._user_turn_count = 0
 

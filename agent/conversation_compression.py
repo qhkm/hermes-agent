@@ -1835,6 +1835,8 @@ def compress_context(
         )
         agent.context_compressor.last_compression_rough_tokens = _compressed_est
         agent.context_compressor.last_prompt_tokens = -1
+        # The rewritten transcript is no longer what the provider priced.
+        agent._usage_anchor = None
         agent.context_compressor.last_completion_tokens = 0
         agent.context_compressor.awaiting_real_usage_after_compression = True
         # Arm the effectiveness verdict only after a completed rewrite crosses

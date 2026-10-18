@@ -38,6 +38,7 @@ from agent.conversation_compression import (
 )
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
+from agent.usage_anchor import agent_anchored_tokens
 from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
@@ -707,6 +708,12 @@ def build_turn_context(
             system_prompt=active_system_prompt or "",
             tools=agent.tools or None,
         )
+        # Real provider usage for the already-priced prefix (+ estimate of only the rows
+        # appended since) outranks the whole-request bytes/4 estimate; None -> keep estimate.
+        _preflight_rough_tokens = _preflight_tokens
+        _anchored_preflight = agent_anchored_tokens(agent, messages)
+        if _anchored_preflight is not None:
+            _preflight_tokens = _anchored_preflight
         _compressor = agent.context_compressor
         _defer_preflight = getattr(
             _compressor,
@@ -785,7 +792,9 @@ def build_turn_context(
             )
             for _pass in range(_max_preflight_passes):
                 _orig_len = len(messages)
-                _orig_tokens = _preflight_tokens
+                # Progress is judged rough-to-rough (the anchor fails closed once
+                # the transcript is rewritten), so compare like with like.
+                _orig_tokens = _preflight_rough_tokens
                 messages, active_system_prompt = agent._compress_context(
                     messages, system_message, approx_tokens=_preflight_tokens,
                     task_id=effective_task_id,
@@ -799,6 +808,7 @@ def build_turn_context(
                     system_prompt=active_system_prompt or "",
                     tools=agent.tools or None,
                 )
+                _preflight_rough_tokens = _preflight_tokens
                 if not _compression_made_progress(
                     _orig_len, len(messages), _orig_tokens, _preflight_tokens
                 ):

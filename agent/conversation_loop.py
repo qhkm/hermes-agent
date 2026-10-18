@@ -37,6 +37,7 @@ from agent.conversation_compression import (
     conversation_history_after_compression,
 )
 from agent.display import KawaiiSpinner
+from agent.usage_anchor import agent_anchored_tokens, capture_usage_anchor, set_usage_anchor
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
 from agent.turn_context import (
@@ -1262,12 +1263,18 @@ def run_conversation(
         # system text.
         _previous_preflight_pressure = _last_preflight_pressure
         _last_preflight_pressure = None
+        # The provider's real usage prices everything already sent; only the rows appended
+        # since (new tool results) are estimated. Stale or missing anchor -> rough estimate.
+        _anchored_pressure = agent_anchored_tokens(agent, messages)
+        _rough_request_pressure_tokens = request_pressure_tokens
+        if _anchored_pressure is not None:
+            request_pressure_tokens = _anchored_pressure
         if (
             _previous_preflight_pressure is not None
-            and request_pressure_tokens >= _preflight_threshold
+            and _rough_request_pressure_tokens >= _preflight_threshold
             and not _compression_warrants_another_preflight_pass(
                 _previous_preflight_pressure,
-                request_pressure_tokens,
+                _rough_request_pressure_tokens,
                 _preflight_threshold,
             )
         ):
@@ -1280,7 +1287,7 @@ def run_conversation(
                 "Pre-API compression made insufficient progress: ~%s -> "
                 "~%s request tokens; skipping additional preflight passes",
                 f"{_previous_preflight_pressure:,}",
-                f"{request_pressure_tokens:,}",
+                f"{_rough_request_pressure_tokens:,}",
             )
         _defer_preflight = getattr(
             _compressor, "should_defer_preflight_to_real_usage", lambda _t: False
@@ -1315,7 +1322,9 @@ def run_conversation(
                     tokens=request_pressure_tokens
                 )
             )
-            _last_preflight_pressure = request_pressure_tokens
+            # Progress is judged rough-to-rough: after a compaction the anchor fails
+            # closed, so the next pass compares like with like.
+            _last_preflight_pressure = _rough_request_pressure_tokens
             messages, active_system_prompt = agent._compress_context(
                 messages,
                 system_message,
@@ -2452,6 +2461,12 @@ def run_conversation(
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                     }
                     agent.context_compressor.update_from_response(usage_dict)
+                    # Anchor the provider's real count to this transcript position so the
+                    # compaction gates never fall back to the bytes/4 estimate for context
+                    # already priced (the reply is appended after this point).
+                    _new_anchor = capture_usage_anchor(prompt_tokens, completion_tokens, messages)
+                    if _new_anchor is not None:
+                        set_usage_anchor(agent, _new_anchor)
                 elif getattr(
                     agent.context_compressor,
                     "awaiting_real_usage_after_compression",
@@ -5374,7 +5389,12 @@ def run_conversation(
                 # a session can grow unbounded after disconnects because
                 # should_compress(0) never fires.  (#2153)
                 _compressor = agent.context_compressor
-                if _compressor.last_prompt_tokens > 0:
+                _anchored_tokens = agent_anchored_tokens(agent, messages)
+                if _anchored_tokens is not None:
+                    # Real provider usage plus ONLY the tool results appended since:
+                    # last_prompt_tokens alone lags a just-appended huge tool result.
+                    _real_tokens = _anchored_tokens
+                elif _compressor.last_prompt_tokens > 0:
                     # Only use prompt_tokens — completion/reasoning
                     # tokens don't consume context window space.
                     # Thinking models (GLM-5.1, QwQ, DeepSeek R1)
@@ -5404,7 +5424,11 @@ def run_conversation(
                     agent._safe_print("  ⟳ compacting context…")
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message,
-                        approx_tokens=agent.context_compressor.last_prompt_tokens,
+                        approx_tokens=(
+                            _real_tokens
+                            if _anchored_tokens is not None
+                            else agent.context_compressor.last_prompt_tokens
+                        ),
                         task_id=effective_task_id,
                     )
                     conversation_history = conversation_history_after_compression(
