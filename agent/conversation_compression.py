@@ -1413,6 +1413,11 @@ def compress_context(
         # the no-op via len(returned) == len(input).
         if getattr(agent.context_compressor, "_last_compress_aborted", False):
             try:
+                # An aborted (refused / failed) compaction must change nothing: if an
+                # engine mutated the caller's list in place before giving up, put the
+                # pre-dispatch snapshot back (mirrors the no-progress branch below).
+                if messages != messages_before_compression:
+                    messages[:] = copy.deepcopy(messages_before_compression)
                 _err = getattr(agent.context_compressor, "_last_summary_error", None) or "unknown error"
                 if getattr(agent, "_last_compression_summary_warning", None) != _err:
                     agent._last_compression_summary_warning = _err
