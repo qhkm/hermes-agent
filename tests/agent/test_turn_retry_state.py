@@ -30,6 +30,7 @@ EXPECTED_FIELDS = {
     "has_retried_429",
     "auth_failover_attempted",
     "auto_recovery_cycles_used",
+    "auto_recovery_started_at",
     "restart_with_compressed_messages",
     "restart_with_length_continuation",
     "restart_with_rebuilt_messages",
@@ -42,6 +43,9 @@ def test_all_guards_default_false():
     for name, value in s:
         if name == "auto_recovery_cycles_used":
             assert value == 0
+            continue
+        if name == "auto_recovery_started_at":
+            assert value is None
             continue
         assert value is False, f"{name} should default to False"
 

@@ -47,9 +47,9 @@ def auto_recovery_cycles(agent: Any) -> int:
 
 
 def auto_recovery_max_seconds(agent: Any) -> Optional[float]:
-    """Jentera-only ``agent.auto_recovery_max_seconds``: total wall-clock budget for a turn that
-    is using the ladder, measured from the turn's start. ``None`` (default) means no cap, which
-    is upstream's behaviour."""
+    """Jentera-only ``agent.auto_recovery_max_seconds``: wall-clock budget for one outage, from the
+    start of its first ladder cycle — never from the turn's start, or a long task that meets an
+    outage late would get no recovery at all. ``None`` (default) means no cap, as upstream."""
     raw = getattr(agent, "_auto_recovery_max_seconds", None)
     try:
         value = float(raw) if raw is not None else None
@@ -161,15 +161,17 @@ def auto_recover_after_exhaustion(
     cycle = used + 1
     wait_s = ladder_wait_seconds(cycle, api_error)
     max_s = auto_recovery_max_seconds(agent)
-    turn_started = getattr(agent, "_inflight_turn_started", None)
-    if max_s is not None and isinstance(turn_started, (int, float)) and turn_started > 0:
-        if time.time() + wait_s > turn_started + max_s:
+    now = time.time()
+    recovery_started = getattr(_retry, "auto_recovery_started_at", None) or now
+    if max_s is not None:
+        if now + wait_s > recovery_started + max_s:
             agent._emit_status(
                 f"⏳ Automatic recovery gave up after {used} cycles — the provider is still "
                 f"unavailable and the {max_s:.0f}s recovery budget would be exceeded."
             )
             return None
     _retry.auto_recovery_cycles_used = cycle
+    _retry.auto_recovery_started_at = recovery_started
     notice = ladder_notice(agent, wait_s=wait_s, cycle=cycle, total=total)
     # Durable line on every surface (CLI print, gateway status_callback) plus the live wait line.
     agent._emit_status(notice)

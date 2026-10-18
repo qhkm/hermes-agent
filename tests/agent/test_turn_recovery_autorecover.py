@@ -178,14 +178,23 @@ def test_max_seconds_cap_blocks_second_cycle(monkeypatch):
     monkeypatch.setattr(ar, "ladder_wait_seconds", lambda cycle, err: 15.0 if cycle == 1 else 30.0)
     agent = _Agent()
     agent._auto_recovery_max_seconds = 40.0
-    agent._inflight_turn_started = time.time()
     retry = TurnRetryState()
     out, retry = _run(agent, _Err(503, "down"), retry=retry)
     assert out == {"action": "continue"} and retry.auto_recovery_cycles_used == 1
-    agent._inflight_turn_started -= 15.0  # the first (mocked) wait elapsed
+    retry.auto_recovery_started_at -= 15.0  # the first (mocked) wait elapsed
     out, retry = _run(agent, _Err(503, "down"), retry=retry)  # now + 30 > start + 40: refused
     assert out is None and retry.auto_recovery_cycles_used == 1
     assert any("gave up" in s and "recovery budget" in s for s in agent.statuses)
+
+
+def test_max_seconds_counts_from_the_outage_not_the_turn(monkeypatch):
+    """A task that worked for ten minutes before the outage still gets its recovery budget."""
+    monkeypatch.setattr(ar, "ladder_wait_seconds", lambda cycle, err: 15.0)
+    agent = _Agent()
+    agent._auto_recovery_max_seconds = 40.0
+    agent._inflight_turn_started = time.time() - 600
+    out, retry = _run(agent, _Err(503, "down"), retry=TurnRetryState())
+    assert out == {"action": "continue"} and retry.auto_recovery_cycles_used == 1
 
 
 def test_absent_max_seconds_keeps_behaviour(monkeypatch):

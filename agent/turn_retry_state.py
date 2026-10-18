@@ -26,6 +26,7 @@ imported by the turn loop without an import cycle.
 
 from __future__ import annotations
 
+from typing import Optional
 from dataclasses import dataclass, fields
 
 
@@ -61,6 +62,9 @@ class TurnRetryState:
 
     # Post-exhaustion auto-recovery cycles spent on this API call (agent.auto_recovery_cycles caps it).
     auto_recovery_cycles_used: int = 0
+    # When the first of those cycles began; agent.auto_recovery_max_seconds counts from here
+    # (Jentera addition), so work done before the outage never eats the recovery budget.
+    auto_recovery_started_at: Optional[float] = None
 
     # ── Auth-failure provider failover ───────────────────────────────────
     # Set once we've escalated a persistent 401/403 (after the per-provider
