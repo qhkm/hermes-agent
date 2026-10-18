@@ -292,6 +292,28 @@ def _verdicts_still_hold(verdicts: tuple) -> bool:
     return all(_check_fn_cached(fn) == verdict for fn, verdict in verdicts)
 
 
+def _with_deferred_tools(
+    tool_names,
+    enabled_toolsets: Optional[List[str]],
+    disabled_toolsets: Optional[List[str]],
+) -> List[str]:
+    """Return ``tool_names`` plus this session's deferred (bridge-only) tools."""
+    names = list(tool_names or [])
+    try:
+        from tools.tool_search import scoped_deferrable_names
+        defs = get_tool_definitions(
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        ) or []
+        have = set(names)
+        names.extend(sorted(scoped_deferrable_names(defs) - have))
+    except Exception:
+        logger.debug("deferred-tool lookup for execute_code failed", exc_info=True)
+    return names
+
+
 def get_tool_definitions(
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
@@ -1371,6 +1393,11 @@ def handle_function_call(
                 # Prefer the caller-provided list so subagents can't overwrite
                 # the parent's tool set via the process-global.
                 sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
+                # The model-facing list leaves out tools deferred behind the
+                # tool-search bridge, but a script should still reach them.
+                sandbox_enabled = _with_deferred_tools(
+                    sandbox_enabled, enabled_toolsets, disabled_toolsets,
+                )
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
                     return registry.dispatch(
                         function_name, next_args,

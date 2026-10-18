@@ -587,3 +587,56 @@ class TestDisabledToolsetsPostureToolset:
             )
         }
         assert "write_file" not in no_file
+
+
+class TestExecuteCodeSeesDeferredTools:
+    """Tools hidden behind the tool-search bridge stay callable from scripts."""
+
+    def test_execute_code_sandbox_includes_deferred_core_tools(self):
+        from unittest.mock import patch
+
+        import model_tools
+        from tools.tool_search import ToolSearchConfig
+
+        cfg = ToolSearchConfig.from_raw({"enabled": "on", "defer": ["read_file"]})
+        captured = {}
+
+        def fake_dispatch(name, args, **kw):
+            captured["enabled_tools"] = kw.get("enabled_tools")
+            return "{}"
+
+        facing = ["terminal", "tool_search", "tool_describe", "tool_call"]
+        with patch("tools.tool_search.load_config_readonly", return_value=cfg), \
+             patch("model_tools.registry.dispatch", side_effect=fake_dispatch):
+            model_tools.handle_function_call(
+                "execute_code", {"code": "print(1)"}, task_id="t",
+                enabled_tools=facing, skip_pre_tool_call_hook=True,
+            )
+
+        assert "read_file" in (captured["enabled_tools"] or [])
+        assert "terminal" in captured["enabled_tools"]
+
+    def test_execute_code_sandbox_gains_nothing_when_nothing_is_deferred(self):
+        from unittest.mock import patch
+
+        import model_tools
+        from tools.tool_search import ToolSearchConfig
+
+        cfg = ToolSearchConfig.from_raw({"enabled": "off", "defer": []})
+        captured = {}
+
+        def fake_dispatch(name, args, **kw):
+            captured["enabled_tools"] = kw.get("enabled_tools")
+            return "{}"
+
+        with patch("tools.tool_search.load_config_readonly", return_value=cfg), \
+             patch("model_tools.registry.dispatch", side_effect=fake_dispatch):
+            model_tools.handle_function_call(
+                "execute_code", {"code": "print(1)"}, task_id="t",
+                enabled_tools=["terminal"], skip_pre_tool_call_hook=True,
+            )
+        # Other scoped names may ride along (the sandbox only ever uses the
+        # intersection with SANDBOX_ALLOWED_TOOLS); nothing sandbox-callable
+        # beyond what the session had is added.
+        from tools.code_execution_tool import SANDBOX_ALLOWED_TOOLS
+        assert set(captured["enabled_tools"]) & SANDBOX_ALLOWED_TOOLS == {"terminal"}
