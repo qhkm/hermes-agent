@@ -65,6 +65,63 @@ _SUMMARY_MISSING_CREDENTIAL_MARKERS: tuple[str, ...] = (
 )
 
 
+# A provider can return a natural-language refusal with finish_reason="stop". It is
+# non-empty, so the usual response validation accepts it, but it contains none of
+# the checkpoint needed to safely replace the compacted turns. Keep this narrow:
+# a real summary may mention a refusal in a recorded turn, while a refusal as the
+# whole response begins with one of these phrases and refers to the requested
+# summary/checkpoint.
+_SUMMARY_REFUSAL_PREFIX_RE = re.compile(
+    r"^\s*(?:(?:sorry|i(?:['’]m| am)\s+sorry|i\s+apologi[sz]e|as\s+an\s+ai)"
+    r"\s*[,;:]?\s*(?:but\s+)?)?(?:i|we)\s+"
+    r"(?:can(?:\s*not|['’]t)|could\s*not|couldn['’]t|won['’]t|will\s+not|must\s+decline|"
+    r"refuse\s+to|am\s+unable\s+to|am\s+not\s+able\s+to)\b"
+    r"|^\s*(?:i['’]?m|i\s+am)\s+(?:unable|not\s+able)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_summary_refusal(content: str) -> bool:
+    """Return whether a complete response is a refusal instead of a summary."""
+    normalized = " ".join(content.split())
+    if not _SUMMARY_REFUSAL_PREFIX_RE.match(normalized):
+        return False
+    # A refusal-only body never carries the template's "## " section headings; a real summary
+    # that merely opens with a hedging preamble ("I cannot see earlier turns, but here is...") does.
+    if re.search(r"(?m)^##\s", content):
+        return False
+    # Limit the search to the opener so a structured checkpoint that records a
+    # historical refusal elsewhere is not rejected. Stems catch summary/summarize/summarise.
+    return any(term in normalized[:400].casefold() for term in ("summar", "checkpoint"))
+
+
+def _response_refusal_text(response: Any) -> str:
+    """Explicit provider ``choices[0].message.refusal`` (str, or dict with message/reason/text); ``""`` when absent.
+
+    OpenAI-style structured-output refusals put the refusal here and leave ``content`` as filler or
+    empty, so the prose detector never sees it.
+    """
+    try:
+        choices = response.get("choices") if isinstance(response, dict) else getattr(response, "choices", None)
+        message = choices[0] if choices else None
+        message = message.get("message") if isinstance(message, dict) else getattr(message, "message", None)
+        refusal = message.get("refusal") if isinstance(message, dict) else getattr(message, "refusal", None)
+    except Exception:
+        return ""
+    if isinstance(refusal, dict):
+        refusal = refusal.get("message") or refusal.get("reason") or refusal.get("text")
+    return refusal.strip() if isinstance(refusal, str) else ""
+
+
+def _is_refusal_response(response: Any, content: str) -> bool:
+    """Single refusal predicate for the summarizer path.
+
+    An explicit provider ``message.refusal`` wins even when ``content`` looks like a
+    summary; otherwise fall back to the prose detector on the extracted content.
+    """
+    return bool(_response_refusal_text(response)) or _is_summary_refusal(content)
+
+
 def _is_summary_access_or_quota_error(exc: Exception) -> bool:
     """Return True for non-retryable summary auth, permission, or quota errors."""
 
@@ -1700,6 +1757,11 @@ class ContextCompressor(ContextEngine):
         # strictly better than discarding context for a transient blip
         # (#29559, #25585). Independent of abort_on_summary_failure.
         self._last_summary_network_failure: bool = False
+        # Set when the summary call returned empty content or a refusal (prose or
+        # provider ``refusal`` field) even after the one-shot main-model retry.
+        # Like the flags above, compress() ABORTS and preserves the transcript
+        # rather than replacing real turns with a deterministic placeholder.
+        self._last_summary_empty_content_failure: bool = False
         # retrying on the main model, record the failure so gateway /
         # CLI callers can still warn the user even though compression
         # succeeded.  Silent recovery would hide the broken config.
@@ -2782,6 +2844,15 @@ This compaction should PRIORITISE preserving all information related to the focu
             stripped = strip_think_blocks(None, content).strip()
             if stripped:
                 content = stripped
+            if _is_refusal_response(response, content):
+                # A refusal is unusable content. Reuse the empty-content
+                # fallback/cooldown path so it can never be committed as
+                # ``_previous_summary`` or replace the compacted turns.
+                raise RuntimeError(
+                    "Context compression LLM returned refusal content "
+                    f"(provider={self.provider or 'auto'} "
+                    f"model={self.summary_model or self.model})"
+                )
             # Redact the summary output as well — the summarizer LLM may
             # ignore prompt instructions and echo back secrets verbatim.
             summary = _redact_compaction_text(content.strip())
@@ -2794,6 +2865,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             self._last_summary_error = None
             self._last_summary_auth_failure = False
             self._last_summary_network_failure = False
+            self._last_summary_empty_content_failure = False
             return self._with_summary_prefix(summary)
         except Exception as e:
             # ``call_llm`` raises ``RuntimeError`` for two very different cases:
@@ -2963,6 +3035,12 @@ This compaction should PRIORITISE preserving all information related to the focu
             # the auth-failure carve-out; independent of abort_on_summary_failure.
             if _is_streaming_closed:
                 self._last_summary_network_failure = True
+            # Empty or refused summary (after the main-model retry above): the
+            # turns cannot be safely replaced, so compress() must abort too.
+            self._last_summary_empty_content_failure = (
+                isinstance(e, RuntimeError)
+                and any(m in str(e).lower() for m in ("empty content", "refusal content"))
+            )
             logger.warning(
                 "Failed to generate context summary: %s. "
                 "Further summary attempts paused for %d seconds.",
@@ -4325,6 +4403,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             self.abort_on_summary_failure
             or self._last_summary_auth_failure
             or self._last_summary_network_failure
+            or self._last_summary_empty_content_failure
         ):
             n_skipped = compress_end - compress_start
             self._last_summary_dropped_count = 0  # nothing actually dropped
@@ -4334,6 +4413,8 @@ This compaction should PRIORITISE preserving all information related to the focu
                 telemetry["failure_class"] = "summary_auth_failure"
             elif self._last_summary_network_failure:
                 telemetry["failure_class"] = "summary_network_failure"
+            elif self._last_summary_empty_content_failure:
+                telemetry["failure_class"] = "summary_empty_content_failure"
             else:
                 telemetry["failure_class"] = "summary_generation_aborted"
             # Roll back the self-heal rehydration so this aborted attempt is a
@@ -4350,6 +4431,14 @@ This compaction should PRIORITISE preserving all information related to the focu
                         "Check the provider credential, permission, quota, or "
                         "inference endpoint, then retry with /compress or "
                         "start fresh with /new.",
+                        n_skipped,
+                    )
+                elif self._last_summary_empty_content_failure:
+                    logger.warning(
+                        "Summary generation returned empty or refused content — "
+                        "aborting compression. %d message(s) preserved "
+                        "unchanged; the session was NOT rotated. Retry with "
+                        "/compress, or continue the conversation as-is.",
                         n_skipped,
                     )
                 elif self._last_summary_network_failure:
