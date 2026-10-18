@@ -87,6 +87,25 @@ tools:
 | `search_default_limit` | `5` | Hits returned when the model calls `tool_search` without a `limit`. |
 | `max_search_limit` | `20` | Hard upper bound the model can request via `limit`. Range 1–50. |
 
+### Deferring core tools
+
+Besides MCP and plugin tools, a short curated set of rarely used core tools
+sits behind the bridge by default, whatever `threshold_pct` says:
+`computer_use`, `session_search`, `image_generate`, `todo`, `cronjob` and the
+desktop GUI tools (`read_terminal`, `close_terminal`, `open_preview`,
+`focus_pane`). The working set (terminal, files, `execute_code`, web, memory,
+browser, delegation, skills, vision, `clarify`, `process`) is never deferred.
+
+```yaml
+tools:
+  tool_search:
+    defer: [computer_use, image_generate]   # replaces the default set; [] defers no core tool
+    never_defer: ["toolset:jentera", ask_specialist]   # names or toolset:<name>; wins over everything
+```
+
+`never_defer` defaults to the `jentera` toolset. The bridge description lists
+the deferred core tools by name, so the model knows what to search for.
+
 You can also flip the legacy boolean shape:
 
 ```yaml
