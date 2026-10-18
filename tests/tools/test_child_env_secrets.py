@@ -1,7 +1,8 @@
 """Child-process secret scrub (upstream #125755) plus Jentera's keep-list.
 
-Declared adapter secrets and Hermes' own secrets never reach an agent child; the names
-Jentera's sprite tools read from their environment (OPENROUTER_*, JENTERA_*, owner keys) do.
+Declared adapter secrets and Hermes' own secrets never reach an agent child; JENTERA_* and
+owner keys do. The model key (OPENROUTER_*) stays out of the terminal, as before: Jentera's
+connector tools read it from $HERMES_HOME/.env, not from their environment.
 """
 
 import glob
@@ -21,9 +22,11 @@ from tools.environments.local import (
     hermes_subprocess_env,
 )
 
-JENTERA_ENV = {
+MODEL_ENV = {
     "OPENROUTER_API_KEY": "sk-or-v1-jentera-runtime-key",
     "OPENROUTER_BASE_URL": "https://api.jentera.ai/v1/model",
+}
+JENTERA_ENV = {
     "JENTERA_RUN_ID": "run-1234",
     "JENTERA_CALENDAR_API": "https://api.jentera.ai/v1/connectors/google-calendar",
     "ACME_API_KEY": "owner-pasted-acme-key-1",
@@ -40,7 +43,7 @@ HERMES_SECRETS = {
 @pytest.fixture
 def child_environ(monkeypatch):
     monkeypatch.delenv("HERMES_CHILD_ENV_KEEP", raising=False)
-    for k, v in {**JENTERA_ENV, **HERMES_SECRETS}.items():
+    for k, v in {**JENTERA_ENV, **MODEL_ENV, **HERMES_SECRETS}.items():
         monkeypatch.setenv(k, v)
 
 
@@ -58,13 +61,16 @@ def test_terminal_child_sees_jentera_vars_and_not_hermes_secrets(child_environ, 
     for name in HERMES_SECRETS:
         assert name not in visible, f"{name} must not reach the terminal child"
         assert HERMES_SECRETS[name] not in out
+    # The model key stays out, as on the pin before this port (its URL is not a secret).
+    assert "OPENROUTER_API_KEY" not in visible
+    assert MODEL_ENV["OPENROUTER_API_KEY"] not in out
 
 
 def test_background_process_env_matches(child_environ):
     env = _sanitize_subprocess_env(dict(os.environ))
     for name in JENTERA_ENV:
         assert name in env
-    for name in HERMES_SECRETS:
+    for name in (*HERMES_SECRETS, "OPENROUTER_API_KEY"):
         assert name not in env
 
 

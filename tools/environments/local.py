@@ -496,8 +496,10 @@ def _inject_session_context_env(env: dict) -> None:
 # ``HERMES_CHILD_ENV_KEEP`` (comma-separated names, read from the Hermes process environment).
 # The keep-list can only rescue Tier-2 blocklist entries: Tier-1 secrets (``_ALWAYS_STRIP_KEYS``,
 # which includes every declared adapter secret) are never kept, whatever the list says.
+# OPENROUTER_API_KEY / OPENROUTER_BASE_URL are deliberately absent: the model key stays
+# out of the agent's terminal, as before this port. Jentera's connector tools read both
+# from $HERMES_HOME/.env themselves (runner/bin/jentera-calendar.mjs loadRuntimeEnv).
 _JENTERA_CHILD_ENV_KEEP_DEFAULT = frozenset({
-    "OPENROUTER_API_KEY", "OPENROUTER_BASE_URL",
     "JENTERA_RUN_ID", "HERMES_HOME", "HOME", "PATH", "DISPLAY", "PLAYWRIGHT_BROWSERS_PATH",
 })
 
