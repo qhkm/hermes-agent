@@ -65,6 +65,63 @@ _SUMMARY_MISSING_CREDENTIAL_MARKERS: tuple[str, ...] = (
 )
 
 
+# A provider can return a natural-language refusal with finish_reason="stop". It is
+# non-empty, so the usual response validation accepts it, but it contains none of
+# the checkpoint needed to safely replace the compacted turns. Keep this narrow:
+# a real summary may mention a refusal in a recorded turn, while a refusal as the
+# whole response begins with one of these phrases and refers to the requested
+# summary/checkpoint.
+_SUMMARY_REFUSAL_PREFIX_RE = re.compile(
+    r"^\s*(?:(?:sorry|i(?:['’]m| am)\s+sorry|i\s+apologi[sz]e|as\s+an\s+ai)"
+    r"\s*[,;:]?\s*(?:but\s+)?)?(?:i|we)\s+"
+    r"(?:can(?:\s*not|['’]t)|could\s*not|couldn['’]t|won['’]t|will\s+not|must\s+decline|"
+    r"refuse\s+to|am\s+unable\s+to|am\s+not\s+able\s+to)\b"
+    r"|^\s*(?:i['’]?m|i\s+am)\s+(?:unable|not\s+able)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_summary_refusal(content: str) -> bool:
+    """Return whether a complete response is a refusal instead of a summary."""
+    normalized = " ".join(content.split())
+    if not _SUMMARY_REFUSAL_PREFIX_RE.match(normalized):
+        return False
+    # A refusal-only body never carries the template's "## " section headings; a real summary
+    # that merely opens with a hedging preamble ("I cannot see earlier turns, but here is...") does.
+    if re.search(r"(?m)^##\s", content):
+        return False
+    # Limit the search to the opener so a structured checkpoint that records a
+    # historical refusal elsewhere is not rejected. Stems catch summary/summarize/summarise.
+    return any(term in normalized[:400].casefold() for term in ("summar", "checkpoint"))
+
+
+def _response_refusal_text(response: Any) -> str:
+    """Explicit provider ``choices[0].message.refusal`` (str, or dict with message/reason/text); ``""`` when absent.
+
+    OpenAI-style structured-output refusals put the refusal here and leave ``content`` as filler or
+    empty, so the prose detector never sees it.
+    """
+    try:
+        choices = response.get("choices") if isinstance(response, dict) else getattr(response, "choices", None)
+        message = choices[0] if choices else None
+        message = message.get("message") if isinstance(message, dict) else getattr(message, "message", None)
+        refusal = message.get("refusal") if isinstance(message, dict) else getattr(message, "refusal", None)
+    except Exception:
+        return ""
+    if isinstance(refusal, dict):
+        refusal = refusal.get("message") or refusal.get("reason") or refusal.get("text")
+    return refusal.strip() if isinstance(refusal, str) else ""
+
+
+def _is_refusal_response(response: Any, content: str) -> bool:
+    """Single refusal predicate for the summarizer path.
+
+    An explicit provider ``message.refusal`` wins even when ``content`` looks like a
+    summary; otherwise fall back to the prose detector on the extracted content.
+    """
+    return bool(_response_refusal_text(response)) or _is_summary_refusal(content)
+
+
 def _is_summary_access_or_quota_error(exc: Exception) -> bool:
     """Return True for non-retryable summary auth, permission, or quota errors."""
 
@@ -335,6 +392,12 @@ _ACTIVE_TASK_MAX_CHARS = 1400
 # high for small/light tails, but using all 20 as a hard floor here would bring
 # back the old large-tool-output case where nothing can be compacted.
 _MAX_TAIL_MESSAGE_FLOOR = 8
+# Hard share of the context window the verbatim tail may occupy, applied to
+# the tail budget and to its 1.5x soft ceiling. Without it a high
+# ``summary_target_ratio`` (or the soft-ceiling overrun alone) lets the
+# "protected" tail be most of the request on a small window, so every
+# compaction pass reclaims nothing.
+TAIL_MAX_CONTEXT_FRACTION = 0.20
 
 # Models with context windows below this get their compression threshold
 # floored at ``_SMALL_CTX_THRESHOLD_PERCENT`` (raise-only — an explicitly
@@ -1374,7 +1437,9 @@ class ContextCompressor(ContextEngine):
         self._apply_threshold_tokens_cap()
         # Recalculate token budgets for the new context length so the
         # compressor stays calibrated after a model switch (e.g. 200K → 32K).
-        target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
+        target_tokens = self._capped_tail_budget(
+            int(self.threshold_tokens * self.summary_target_ratio), context_length,
+        )
         self.tail_token_budget = target_tokens
         self.max_summary_tokens = min(
             int(context_length * 0.05), _SUMMARY_TOKENS_CEILING,
@@ -1618,7 +1683,9 @@ class ContextCompressor(ContextEngine):
         self.compression_count = 0
 
         # Derive token budgets: ratio is relative to the threshold, not total context
-        target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
+        target_tokens = self._capped_tail_budget(
+            int(self.threshold_tokens * self.summary_target_ratio), self.context_length,
+        )
         self.tail_token_budget = target_tokens
         self.max_summary_tokens = min(
             int(self.context_length * 0.05), _SUMMARY_TOKENS_CEILING,
@@ -1700,6 +1767,16 @@ class ContextCompressor(ContextEngine):
         # strictly better than discarding context for a transient blip
         # (#29559, #25585). Independent of abort_on_summary_failure.
         self._last_summary_network_failure: bool = False
+        # Set when the summary call returned empty content or a refusal (prose or
+        # provider ``refusal`` field) even after the one-shot main-model retry.
+        # Like the flags above, compress() ABORTS and preserves the transcript
+        # rather than replacing real turns with a deterministic placeholder.
+        self._last_summary_empty_content_failure: bool = False
+        # Set when the summary provider reports it is overloaded (503/529,
+        # "at capacity") and the one-shot main-model retry also failed. The
+        # overload is transient, so compress() ABORTS and keeps the transcript
+        # for a later retry instead of committing the deterministic fallback.
+        self._last_summary_overload_failure: bool = False
         # retrying on the main model, record the failure so gateway /
         # CLI callers can still warn the user even though compression
         # succeeded.  Silent recovery would hide the broken config.
@@ -2782,6 +2859,15 @@ This compaction should PRIORITISE preserving all information related to the focu
             stripped = strip_think_blocks(None, content).strip()
             if stripped:
                 content = stripped
+            if _is_refusal_response(response, content):
+                # A refusal is unusable content. Reuse the empty-content
+                # fallback/cooldown path so it can never be committed as
+                # ``_previous_summary`` or replace the compacted turns.
+                raise RuntimeError(
+                    "Context compression LLM returned refusal content "
+                    f"(provider={self.provider or 'auto'} "
+                    f"model={self.summary_model or self.model})"
+                )
             # Redact the summary output as well — the summarizer LLM may
             # ignore prompt instructions and echo back secrets verbatim.
             summary = _redact_compaction_text(content.strip())
@@ -2794,6 +2880,8 @@ This compaction should PRIORITISE preserving all information related to the focu
             self._last_summary_error = None
             self._last_summary_auth_failure = False
             self._last_summary_network_failure = False
+            self._last_summary_empty_content_failure = False
+            self._last_summary_overload_failure = False
             return self._with_summary_prefix(summary)
         except Exception as e:
             # ``call_llm`` raises ``RuntimeError`` for two very different cases:
@@ -2963,6 +3051,20 @@ This compaction should PRIORITISE preserving all information related to the focu
             # the auth-failure carve-out; independent of abort_on_summary_failure.
             if _is_streaming_closed:
                 self._last_summary_network_failure = True
+            # Empty or refused summary (after the main-model retry above): the
+            # turns cannot be safely replaced, so compress() must abort too.
+            self._last_summary_empty_content_failure = (
+                isinstance(e, RuntimeError)
+                and any(m in str(e).lower() for m in ("empty content", "refusal content"))
+            )
+            self._last_summary_overload_failure = (
+                not self._last_summary_empty_content_failure
+                and not _is_access_or_quota_error
+                and (
+                    classify_api_error(e).reason is FailoverReason.overloaded
+                    or any(m in _err_str for m in ("overloaded", "at capacity", "over capacity"))
+                )
+            )
             logger.warning(
                 "Failed to generate context summary: %s. "
                 "Further summary attempts paused for %d seconds.",
@@ -3872,6 +3974,23 @@ This compaction should PRIORITISE preserving all information related to the focu
             idx += 1
         return idx
 
+    @staticmethod
+    def _capped_tail_budget(budget: int, context_length: int) -> int:
+        """Cap the tail budget at ``TAIL_MAX_CONTEXT_FRACTION`` of the window."""
+        if context_length and context_length > 0:
+            budget = min(budget, int(context_length * TAIL_MAX_CONTEXT_FRACTION))
+        return max(1, budget)
+
+    def _tail_soft_ceiling(self, token_budget: int) -> int:
+        """Optional tail rows may overrun the budget by 1.5x so whole rows are
+        kept, but never past ``TAIL_MAX_CONTEXT_FRACTION`` of the window.
+        Required anchors and atomic tool groups may still exceed it."""
+        ceiling = int(token_budget * 1.5)
+        ctx = getattr(self, "context_length", 0) or 0
+        if ctx > 0:
+            ceiling = min(ceiling, int(ctx * TAIL_MAX_CONTEXT_FRACTION))
+        return max(ceiling, token_budget)
+
     def _find_tail_cut_by_tokens(
         self, messages: List[Dict[str, Any]], head_end: int,
         token_budget: int | None = None,
@@ -3909,7 +4028,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             min(min_tail_floor, compressible_tail_cap, available_tail)
             if available_tail > 1 else 0
         )
-        soft_ceiling = int(token_budget * 1.5)
+        soft_ceiling = self._tail_soft_ceiling(token_budget)
         accumulated = 0
         cut_idx = n  # start from beyond the end
 
@@ -4325,6 +4444,8 @@ This compaction should PRIORITISE preserving all information related to the focu
             self.abort_on_summary_failure
             or self._last_summary_auth_failure
             or self._last_summary_network_failure
+            or self._last_summary_empty_content_failure
+            or self._last_summary_overload_failure
         ):
             n_skipped = compress_end - compress_start
             self._last_summary_dropped_count = 0  # nothing actually dropped
@@ -4334,6 +4455,10 @@ This compaction should PRIORITISE preserving all information related to the focu
                 telemetry["failure_class"] = "summary_auth_failure"
             elif self._last_summary_network_failure:
                 telemetry["failure_class"] = "summary_network_failure"
+            elif self._last_summary_empty_content_failure:
+                telemetry["failure_class"] = "summary_empty_content_failure"
+            elif self._last_summary_overload_failure:
+                telemetry["failure_class"] = "summary_overload_failure"
             else:
                 telemetry["failure_class"] = "summary_generation_aborted"
             # Roll back the self-heal rehydration so this aborted attempt is a
@@ -4350,6 +4475,23 @@ This compaction should PRIORITISE preserving all information related to the focu
                         "Check the provider credential, permission, quota, or "
                         "inference endpoint, then retry with /compress or "
                         "start fresh with /new.",
+                        n_skipped,
+                    )
+                elif self._last_summary_empty_content_failure:
+                    logger.warning(
+                        "Summary generation returned empty or refused content — "
+                        "aborting compression. %d message(s) preserved "
+                        "unchanged; the session was NOT rotated. Retry with "
+                        "/compress, or continue the conversation as-is.",
+                        n_skipped,
+                    )
+                elif self._last_summary_overload_failure:
+                    logger.warning(
+                        "Summary generation failed because the provider is "
+                        "overloaded — aborting compression. %d message(s) "
+                        "preserved unchanged; the session was NOT rotated. "
+                        "Retry with /compress once capacity recovers, or "
+                        "continue the conversation as-is.",
                         n_skipped,
                     )
                 elif self._last_summary_network_failure:

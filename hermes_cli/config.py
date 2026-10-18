@@ -1418,7 +1418,9 @@ DEFAULT_CONFIG = {
                                       # threshold and this token count. Clamped to
                                       # the model's context length at apply-time.
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
-        "protect_last_n": 20,         # minimum recent messages to keep uncompressed
+        # protect_last_n: minimum recent messages kept uncompressed, honoured up to a small count
+        # floor; the verbatim tail is otherwise token-bounded and never above 20% of the window.
+        "protect_last_n": 20,
         "max_attempts": 3,            # compression retry rounds before a turn gives up
                                       # with "max compression attempts reached". Raise
                                       # (e.g. 6) for tool-schema-heavy sessions where 3
