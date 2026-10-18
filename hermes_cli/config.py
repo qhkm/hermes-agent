@@ -2760,6 +2760,9 @@ DEFAULT_CONFIG = {
     # Pre-exec security scanning via tirith
     "security": {
         "allow_private_urls": False,  # Allow requests to private/internal IPs (for OpenWrt, proxies, VPNs)
+        # Let a URL whose DNS lookup fails through while HTTP(S)_PROXY is set (the proxy resolves
+        # it). Off: a failed lookup blocks the request, as before the proxy-delegation change.
+        "proxy_dns_delegation": False,
         "redact_secrets": True,
         "tirith_enabled": True,
         "tirith_path": "tirith",

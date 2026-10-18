@@ -35,6 +35,26 @@ def _proxy_is_configured() -> bool:
     return any(os.environ.get(v) for v in _PROXY_ENV_VARS)
 
 
+def _proxy_dns_delegation_enabled() -> bool:
+    """True only when the operator opted in to letting a URL whose DNS lookup fails through while a
+    proxy is configured (``security.proxy_dns_delegation: true`` or ``HERMES_PROXY_DNS_DELEGATION=1``).
+
+    Off by default: with the proxy doing the resolving, this process never sees the answer, so a
+    name that resolves to an internal address on the proxy's side would pass the pre-flight check.
+    Only sandboxes that block direct DNS at the network level need it."""
+    env_val = os.getenv("HERMES_PROXY_DNS_DELEGATION", "").strip().lower()
+    if env_val in {"true", "1", "yes"}:
+        return True
+    if env_val in {"false", "0", "no"}:
+        return False
+    try:
+        from hermes_cli.config import read_raw_config
+        block = read_raw_config().get("security", {})
+        return isinstance(block, dict) and is_truthy_value(block.get("proxy_dns_delegation"), default=False)
+    except Exception:
+        return False
+
+
 def normalize_url_for_request(url: str) -> str:
     """ASCII-safe HTTP URL for Hermes-owned URL tools (IRI -> URI, e.g. ``https://wttr.in/Köln``).
     Preserves URL syntax and existing percent escapes while IDNA-encoding the host and
@@ -130,6 +150,7 @@ _CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 # answer an IPv4 name (on the reporting macOS host, fake-IP TUN DNS returns it alongside the
 # plain address). ``ip.ipv4_mapped`` does not read it; ``_embedded_ipv4`` handles it explicitly.
 _IPV4_TRANSLATED_NETWORK = ipaddress.ip_network("::ffff:0:0:0/96")
+
 
 # Address classes a ``security.fake_ip_ranges`` declaration can never excuse: a local proxy owns
 # none of them, and a declaration is trusted like ``allow_private_urls`` for whatever it names,
@@ -253,8 +274,8 @@ def _getaddrinfo(hostname: str, port: Optional[int] = None):
 
 
 def _embedded_ipv4(ip: _IPAddress) -> _IPAddress:
-    """The IPv4 address an IPv6 wrapper stands for — IPv4-mapped (``::ffff:x.x.x.x``) or
-    IPv4-translated (``::ffff:0:x.x.x.x``); *ip* unchanged otherwise. ``ipaddress`` reads both
+    """The IPv4 address an IPv6 wrapper stands for — IPv4-mapped (``::ffff:x.x.x.x``),
+    or IPv4-translated (``::ffff:0:x.x.x.x``); *ip* unchanged otherwise. ``ipaddress`` reads both
     wrappers as distinct IPv6 addresses, so every classification must see through them, or a
     resolver's sentinel / a cloud-metadata answer arrives as unrelated IPv6 space."""
     if isinstance(ip, ipaddress.IPv6Address):
@@ -365,11 +386,11 @@ def is_safe_url(url: str) -> bool:
         try:
             addr_info = _getaddrinfo(hostname)
         except socket.gaierror:
-            # Sandbox/proxy environments may block direct DNS; when a proxy is
-            # configured, delegate resolution to it (metadata hostnames were already
-            # rejected above). Literal IPs need no DNS, so a failure on one is not a
-            # proxy symptom — keep them fail-closed.
-            if _parse_ip(hostname) is None and _proxy_is_configured():
+            # Sandbox/proxy environments may block direct DNS. Fail closed by default (as the
+            # production pin does); only an explicit opt-in (security.proxy_dns_delegation) lets a
+            # lookup failure through to the proxy (metadata hostnames were already rejected
+            # above). Literal IPs need no DNS, so a failure on one is not a proxy symptom.
+            if _parse_ip(hostname) is None and _proxy_is_configured() and _proxy_dns_delegation_enabled():
                 logger.debug(
                     "DNS resolution failed for %s — proxy configured, allowing through for proxy-side resolution",
                     hostname)

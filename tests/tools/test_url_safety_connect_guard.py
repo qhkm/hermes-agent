@@ -103,22 +103,46 @@ class TestProxyEnvironmentDnsDelegation:
 
     @pytest.fixture(autouse=True)
     def _clear_proxy_env(self, monkeypatch):
-        for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+        for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy",
+                    "HERMES_PROXY_DNS_DELEGATION"):
             monkeypatch.delenv(var, raising=False)
 
-    def test_dns_failure_allowed_when_proxy_configured(self, monkeypatch):
+    def test_dns_failure_blocked_when_proxy_configured_by_default(self, monkeypatch):
+        """Fail closed: a proxy alone does not excuse a failed lookup."""
         monkeypatch.setenv("HTTPS_PROXY", "http://host.docker.internal:9090")
+        monkeypatch.delenv("HERMES_PROXY_DNS_DELEGATION", raising=False)
+        with patch("socket.getaddrinfo", side_effect=socket.gaierror("blocked at network level")):
+            assert is_safe_url("https://api.openai.com/v1/models") is False
+
+    def test_dns_failure_allowed_when_proxy_configured_and_opted_in(self, monkeypatch):
+        monkeypatch.setenv("HTTPS_PROXY", "http://host.docker.internal:9090")
+        monkeypatch.setenv("HERMES_PROXY_DNS_DELEGATION", "1")
         with patch("socket.getaddrinfo", side_effect=socket.gaierror("blocked at network level")):
             assert is_safe_url("https://api.openai.com/v1/models") is True
 
+    def test_dns_failure_allowed_when_opted_in_by_config(self, monkeypatch):
+        import hermes_cli.config as cfg
+        monkeypatch.setenv("HTTPS_PROXY", "http://host.docker.internal:9090")
+        monkeypatch.delenv("HERMES_PROXY_DNS_DELEGATION", raising=False)
+        monkeypatch.setattr(cfg, "read_raw_config", lambda: {"security": {"proxy_dns_delegation": True}})
+        with patch("socket.getaddrinfo", side_effect=socket.gaierror("blocked at network level")):
+            assert is_safe_url("https://api.openai.com/v1/models") is True
+
+    def test_opt_in_without_proxy_still_blocks(self, monkeypatch):
+        monkeypatch.setenv("HERMES_PROXY_DNS_DELEGATION", "1")
+        with patch("socket.getaddrinfo", side_effect=socket.gaierror("no dns")):
+            assert is_safe_url("https://api.openai.com/v1/models") is False
+
     def test_metadata_hostname_still_blocked_with_proxy(self, monkeypatch):
         """The blocked-hostname floor runs BEFORE the DNS skip."""
+        monkeypatch.setenv("HERMES_PROXY_DNS_DELEGATION", "1")
         monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:3128")
         with patch("socket.getaddrinfo", side_effect=socket.gaierror("no dns")):
             assert is_safe_url("http://metadata.google.internal/computeMetadata/v1/") is False
 
     def test_literal_metadata_ip_still_blocked_with_proxy(self, monkeypatch):
         """Literal IPs never take the DNS-failure path — floor intact."""
+        monkeypatch.setenv("HERMES_PROXY_DNS_DELEGATION", "1")
         monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:3128")
         assert is_safe_url("http://169.254.169.254/latest/meta-data/") is False
 
@@ -603,3 +627,4 @@ class TestDeclaredFakeIpSentinelRanges:
                 assert is_safe_url("https://example.com/") is True
         finally:
             _reset_allow_private_cache()
+
