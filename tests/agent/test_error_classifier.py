@@ -2170,3 +2170,43 @@ class Test408RequestTimeout:
         assert result.should_fallback is True
         assert result.should_compress is False
 
+
+
+class TestNoHealthyDeploymentsVsOverflow:
+    def test_no_deployments_available_alone_is_not_an_outage(self):
+        err = MockAPIError("litellm.BadRequestError: no deployments available for this key", status_code=400)
+        assert classify_api_error(err, provider="custom").reason != FailoverReason.overloaded
+
+    def test_no_healthy_deployments_is_still_an_outage(self):
+        err = MockAPIError("There are no healthy deployments available for this model.", status_code=400)
+        result = classify_api_error(err, provider="custom")
+        assert result.reason == FailoverReason.overloaded and result.retryable
+
+    @pytest.mark.parametrize("status", [400, 500])
+    def test_litellm_context_window_error_mentioning_deployments_is_overflow(self, status):
+        err = MockAPIError(
+            "litellm.ContextWindowExceededError: prompt exceeds the context window of every "
+            "model in the group. No healthy deployments available with a large enough context window.",
+            status_code=status,
+        )
+        result = classify_api_error(err, provider="custom")
+        assert result.reason == FailoverReason.context_overflow
+        assert result.should_compress is True
+
+    def test_too_large_for_all_deployments_leads_to_compression_not_ladder(self):
+        from agent.turn_recovery_autorecover import ladder_eligible
+
+        class _A:
+            _auto_recovery_cycles = 5
+            _current_streamed_assistant_text = ""
+
+            def _has_content_after_think_block(self, t):
+                return False
+
+        err = MockAPIError(
+            "This model's maximum context length is 8192 tokens. no healthy deployments could accept it",
+            status_code=400,
+        )
+        result = classify_api_error(err, provider="custom")
+        assert result.reason == FailoverReason.context_overflow
+        assert not ladder_eligible(_A(), result)

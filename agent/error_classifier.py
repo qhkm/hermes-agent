@@ -192,7 +192,6 @@ _OVERLOADED_PATTERNS = [
 _NO_HEALTHY_DEPLOYMENT_PATTERNS = [
     "no healthy deployments",
     "no healthy deployment",
-    "no deployments available",
 ]
 
 # Usage-limit patterns that need disambiguation (could be billing OR rate_limit)
@@ -673,8 +672,12 @@ def classify_api_error(
 
     # LiteLLM "There are no healthy deployments available" — transient even when it arrives as a
     # 400 BadRequestError. Auth/billing/missing-model statuses keep their own classification.
-    if status_code not in {401, 402, 403, 404, 413} and any(
-        p in error_msg for p in _NO_HEALTHY_DEPLOYMENT_PATTERNS
+    # A prompt too large for every deployment makes LiteLLM say "no healthy deployments" too, but
+    # that is a context overflow (compress, don't wait for the backend), so overflow wording wins.
+    if (
+        status_code not in {401, 402, 403, 404, 413}
+        and any(p in error_msg for p in _NO_HEALTHY_DEPLOYMENT_PATTERNS)
+        and not any(p in error_msg for p in _CONTEXT_OVERFLOW_PATTERNS)
     ):
         return _result(FailoverReason.overloaded, retryable=True)
 
