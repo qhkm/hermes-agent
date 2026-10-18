@@ -628,3 +628,35 @@ class TestDeclaredFakeIpSentinelRanges:
         finally:
             _reset_allow_private_cache()
 
+
+class TestNat64SSRF:
+    """``64:ff9b::/96`` is forwarded by a NAT64 gateway to the embedded IPv4, so it is classified
+    by that IPv4: 64:ff9b::a9fe:a9fe is 169.254.169.254."""
+
+    def test_nat64_metadata_hits_the_floor(self, monkeypatch):
+        _reset_allow_private_cache()
+        with _resolves_to("64:ff9b::a9fe:a9fe"):
+            assert is_always_blocked_url("http://evil.example/") is True
+        monkeypatch.setenv("HERMES_ALLOW_PRIVATE_URLS", "true")
+        _reset_allow_private_cache()
+        with _resolves_to("64:ff9b::a9fe:a9fe"):
+            assert is_safe_url("http://evil.example/") is False
+        _reset_allow_private_cache()
+
+    def test_literal_nat64_metadata_is_blocked_without_dns(self):
+        with patch("socket.getaddrinfo", side_effect=socket.gaierror("nope")):
+            assert is_always_blocked_url("http://[64:ff9b::a9fe:a9fe]/") is True
+            assert is_safe_url("http://[64:ff9b::a9fe:a9fe]/") is False
+
+    def test_nat64_loopback_is_private(self):
+        with _resolves_to("64:ff9b::7f00:1"):
+            assert is_safe_url("https://example.com/") is False
+
+    def test_nat64_public_address_is_allowed(self):
+        with _resolves_to("64:ff9b::5db8:d822"):  # 93.184.216.34
+            assert is_safe_url("https://example.com/") is True
+
+    def test_connect_time_check_blocks_nat64_metadata(self):
+        with _resolves_to("64:ff9b::a9fe:a9fe"):
+            with pytest.raises(SSRFConnectionBlocked):
+                _resolved_http_connect_ips("example.com", 443, "https")
