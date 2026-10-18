@@ -19,6 +19,11 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from hermes_cli._subprocess_compat import (
+    harden_git_argv,
+    noninteractive_repo_git_env,
+)
+
 _GIT_TIMEOUT = 30
 _GH_TIMEOUT = 30
 _MAX_BUFFER = 32 * 1024 * 1024
@@ -31,14 +36,23 @@ _TRUNK_BRANCHES = ("main", "master")
 
 def _git(cwd: str, args: list[str], *, timeout: int = _GIT_TIMEOUT) -> tuple[int, str, str]:
     """Run ``git`` in ``cwd``. Returns (returncode, stdout, stderr); never raises
-    on a non-zero exit (callers decide what an error means)."""
+    on a non-zero exit (callers decide what an error means).
+
+    Runs under :func:`noninteractive_repo_git_env`: the review pane polls ``status``/``diff`` on
+    whatever repo the session sits in, which would otherwise execute its ``core.fsmonitor``, hooks
+    and clean/smudge filters. Refuses (rc 1) when filter discovery cannot be trusted."""
     try:
+        env = noninteractive_repo_git_env(cwd)
+        if env is None:
+            return 1, "", "git filter discovery failed"
         proc = subprocess.run(
-            ["git", *args],
+            ["git", *harden_git_argv(args)],
             cwd=cwd,
             capture_output=True,
             text=True,
             timeout=timeout,
+            stdin=subprocess.DEVNULL,
+            env=env,
         )
     except (OSError, subprocess.SubprocessError):
         return 1, "", "git invocation failed"

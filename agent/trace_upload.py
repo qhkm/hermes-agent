@@ -159,10 +159,12 @@ def build_trace_jsonl(
     git_branch = ""
     try:
         import subprocess
+        from hermes_cli._subprocess_compat import noninteractive_git_env
         if cwd:
             r = subprocess.run(
                 ["git", "rev-parse", "--abbrev-ref", "HEAD"],
                 capture_output=True, text=True, timeout=3, cwd=cwd,
+                stdin=subprocess.DEVNULL, env=noninteractive_git_env(),
             )
             if r.returncode == 0:
                 git_branch = r.stdout.strip()

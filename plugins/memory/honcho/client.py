@@ -739,11 +739,13 @@ class HonchoClientConfig:
         """Return the git repo root directory name, or None if not in a repo."""
         import subprocess
 
+        from hermes_cli._subprocess_compat import noninteractive_git_env
+
         try:
             root = subprocess.run(
                 ["git", "rev-parse", "--show-toplevel"],
                 capture_output=True, text=True, cwd=cwd, timeout=5,
-                stdin=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL, env=noninteractive_git_env(),
             )
             if root.returncode == 0:
                 return Path(root.stdout.strip()).name

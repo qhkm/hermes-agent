@@ -27,10 +27,12 @@ guarantee.
 
 from __future__ import annotations
 
+import os
+import re
 import shutil
 import subprocess
 import sys
-from typing import Sequence
+from typing import Mapping, Sequence
 
 __all__ = [
     "IS_WINDOWS",
@@ -40,6 +42,12 @@ __all__ = [
     "windows_hide_flags",
     "windows_detach_popen_kwargs",
     "bounded_git_probe",
+    "bounded_probe_run",
+    "harden_git_argv",
+    "noninteractive_git_env",
+    "noninteractive_repo_git_env",
+    "FILTER_DISCOVERY_FAILED",
+    "NO_DRIVER_DIFF_FLAGS",
 ]
 
 
@@ -241,6 +249,209 @@ def windows_detach_popen_kwargs() -> dict:
 # -----------------------------------------------------------------------------
 
 
+# -----------------------------------------------------------------------------
+# Hardened environment for git that Hermes runs on its own
+# -----------------------------------------------------------------------------
+
+# Flags that neutralize *attribute-scoped* diff drivers on any diff-rendering git command. A
+# malicious repo can name a driver in ``.gitattributes`` (``* diff=evil``) and point it at an
+# arbitrary program via ``[diff "evil"] command=/textconv=`` in ``.git/config``; because the
+# attacker chooses the name, ``GIT_CONFIG_KEY`` overrides in ``noninteractive_git_env`` cannot
+# enumerate it -- only these flags do. ``--no-ext-diff`` kills ``command=``; ``--no-textconv`` kills
+# ``textconv=``; each alone leaves the other live. Repository-named clean/smudge/process filters
+# are handled separately by ``noninteractive_repo_git_env`` at repo-scoped automatic call sites.
+NO_DRIVER_DIFF_FLAGS = ("--no-ext-diff", "--no-textconv")
+
+# A missing object in a partial clone would otherwise trigger a lazy fetch (network) from a probe.
+NO_LAZY_FETCH_ENV = {"GIT_NO_LAZY_FETCH": "1"}
+
+# Only these subcommands accept ``NO_DRIVER_DIFF_FLAGS`` -- ``status`` and friends reject them
+# (``unknown option``), so the helper gates on this set rather than blanket-prepending.
+_DIFF_RENDERING_SUBCOMMANDS = frozenset({"diff", "show", "log", "blame"})
+
+# Options that consume the FOLLOWING token, so that value is never mistaken for the subcommand
+# (``-C diff`` is a path; ``-c diff=x`` is a config pair).
+_GIT_VALUE_OPTS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
+
+
+def harden_git_argv(args: Sequence[str]) -> list[str]:
+    """Copy of subcommand-first git *args* (no leading ``"git"``) with :data:`NO_DRIVER_DIFF_FLAGS`
+    inserted right after a diff-rendering subcommand; other subcommands are returned unchanged.
+
+    Pair with :func:`noninteractive_git_env`: the env layer disables fsmonitor/hooks/pager/editor/
+    credential sinks, this closes the one class (attacker-named attribute drivers) env cannot reach.
+    """
+    out = list(args)
+    i = 0
+    while i < len(out):
+        tok = out[i]
+        if tok in _GIT_VALUE_OPTS:
+            i += 2
+            continue
+        if tok.startswith("-"):
+            i += 1
+            continue
+        if tok in _DIFF_RENDERING_SUBCOMMANDS:
+            return out[: i + 1] + list(NO_DRIVER_DIFF_FLAGS) + out[i + 1 :]
+        return out  # first non-option token is a non-diff subcommand
+    return out
+
+
+# GIT_CONFIG_KEY_n/VALUE_n overrides for internal git children: no credential/askpass prompts, no
+# repo-configured fsmonitor/hooks/pager/editor/external-diff programs.
+_GIT_CONFIG_INJECT_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
+_GIT_CONFIG_OVERRIDES = {
+    "credential.helper": "",
+    "core.askPass": "",
+    "core.fsmonitor": "false",
+    "core.untrackedCache": "false",
+    "core.hooksPath": os.devnull,
+    "core.pager": "cat",
+    "core.editor": "true",
+    "sequence.editor": "true",
+    "diff.external": "",
+    # ssh bypasses stdin=DEVNULL/GIT_TERMINAL_PROMPT and opens /dev/tty directly; BatchMode makes
+    # it fail instead of prompting. Config layer, so an explicit GIT_SSH_COMMAND still wins.
+    "core.sshCommand": "ssh -o BatchMode=yes",
+}
+
+
+def _user_safe_directories(base_env: "Mapping[str, str]") -> list[str]:
+    """The user's configured ``safe.directory`` values, in git's own effective order.
+
+    ``safe.directory`` is honoured only from global/system config, which
+    :func:`noninteractive_git_env` blanks; without replaying it every internal git call fails
+    "detected dubious ownership" on a repo owned by another uid. Order and empty reset markers are
+    policy, so every value is kept verbatim (``-z`` keeps whitespace inside one entry). Best-effort:
+    any failure yields no entries.
+    """
+    env = dict(base_env)
+    for key in list(env):
+        if key == "GIT_CONFIG_PARAMETERS" or key.startswith(_GIT_CONFIG_INJECT_PREFIXES):
+            env.pop(key, None)
+    env.pop("GIT_CONFIG_COUNT", None)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    values: list[str] = []
+    for scope in ("--system", "--global"):
+        try:
+            proc = subprocess.run(
+                ["git", "config", scope, "-z", "--get-all", "safe.directory"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=5, stdin=subprocess.DEVNULL, env=env, check=False,
+                creationflags=windows_hide_flags(),
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if proc.returncode != 0:
+            continue
+        records = proc.stdout.split("\0")
+        if records and records[-1] == "":
+            records.pop()
+        values.extend(records)
+    return values
+
+
+def noninteractive_git_env(base: "Mapping[str, str] | None" = None) -> dict[str, str]:
+    """Environment for *internal* git invocations that must never prompt or run repo code.
+
+    Copy of ``base`` (default ``os.environ``) with ``GIT_TERMINAL_PROMPT=0``, ``GCM_INTERACTIVE=Never``
+    and isolated git config: inherited ``GIT_CONFIG_*`` injection, global/system config, pagers,
+    editors, fsmonitor, external diff and hooks are all disabled, so a cloned repository's own
+    ``.git/config`` cannot execute a program just because Hermes looked at it. Pair with
+    ``stdin=subprocess.DEVNULL``. Internal plumbing only -- the agent's terminal tool is the
+    agent's own action and is deliberately not routed through this.
+    """
+    env = dict(base if base is not None else os.environ)
+    # Captured before the isolation below rewrites GIT_CONFIG_GLOBAL/SYSTEM to /dev/null.
+    safe_directories = _user_safe_directories(base if base is not None else os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GCM_INTERACTIVE"] = "Never"
+    for key in list(env):
+        if key == "GIT_CONFIG_PARAMETERS" or key.startswith(_GIT_CONFIG_INJECT_PREFIXES):
+            env.pop(key, None)
+    env.pop("GIT_CONFIG_COUNT", None)
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_CONFIG_SYSTEM"] = os.devnull
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_PAGER"] = "cat"
+    env["PAGER"] = "cat"
+    env["GIT_EDITOR"] = "true"
+    overrides = list(_GIT_CONFIG_OVERRIDES.items())
+    overrides.extend(("safe.directory", value) for value in safe_directories)
+    env["GIT_CONFIG_COUNT"] = str(len(overrides))
+    for idx, (key, value) in enumerate(overrides):
+        env[f"GIT_CONFIG_KEY_{idx}"] = key
+        env[f"GIT_CONFIG_VALUE_{idx}"] = value
+    return env
+
+
+_FILTER_COMMAND_KEY = re.compile(r"^filter\..+\.(?:clean|smudge|process)$", re.IGNORECASE)
+# Any ``includeIf`` is evaluated against the CURRENT checkout: ``onbranch:`` against the current
+# branch, ``gitdir:`` against the current git dir (``.git/worktrees/<name>`` during ``worktree add``),
+# so the spawned git can load filters this discovery never saw; refuse rather than half-harden.
+# Global/system config is already /dev/null, so only repo-local includes reach this.
+_INCLUDE_IF_KEY = re.compile(r"^includeif\..*\.path$", re.IGNORECASE)
+# Each discovered key costs two env entries; a repo with tens of thousands of filters would make
+# every spawn fail with E2BIG ("Argument list too long"), so refuse past a generous cap.
+_MAX_FILTER_KEYS = 256
+# Stand-in stderr for a git call refused because filter discovery could not be trusted.
+FILTER_DISCOVERY_FAILED = "git filter discovery failed"
+
+
+def noninteractive_repo_git_env(
+    cwd: "str | os.PathLike[str]",
+    base: "Mapping[str, str] | None" = None,
+) -> "dict[str, str] | None":
+    """Harden internal git for one repository, including named clean/smudge/process filters.
+
+    The static environment can pin fixed config keys such as core.fsmonitor and
+    core.hooksPath, but a repository chooses filter driver names through .gitattributes.
+    Discover the effective filter command keys for this checkout and append empty command
+    overrides plus required=false to the already-isolated config block. Discovery is
+    bounded and fail-closed: if filter discovery cannot be trusted, callers skip the
+    automatic git operation instead of running with only partial hardening.
+    """
+    env = noninteractive_git_env(base)
+    # (Not bounded_git_probe: rc 1 = "no filters" is a verdict, not a failure.)
+    proc = bounded_probe_run(
+        [
+            "git", "-C", str(cwd), "config", "--includes", "--name-only", "-z",
+            "--get-regexp", r"^(filter\..*\.(clean|smudge|process)|includeif\..*\.path)$",
+        ],
+        timeout=2, env=env,
+    )
+    if proc is None or proc.returncode not in (0, 1):
+        return None
+
+    keys: list[str] = []
+    required: list[str] = []
+    seen: set[str] = set()
+    # Dedup on the exact name ``--name-only`` prints: git lowercases section and variable but keeps
+    # the subsection's case, and ``[filter "Evil"]`` is a different driver from ``[filter "evil"]``.
+    for raw in proc.stdout.split("\0"):
+        key = raw.strip()
+        if _INCLUDE_IF_KEY.fullmatch(key):
+            return None
+        if not key or key in seen or not _FILTER_COMMAND_KEY.fullmatch(key):
+            continue
+        seen.add(key)
+        keys.append(key)
+        if len(keys) > _MAX_FILTER_KEYS:
+            return None
+        required_key = key.rsplit(".", 1)[0] + ".required"
+        if required_key not in seen:
+            seen.add(required_key)
+            required.append(required_key)
+
+    start = int(env["GIT_CONFIG_COUNT"])  # always set by noninteractive_git_env
+    overrides = [(key, "") for key in keys] + [(key, "false") for key in required]
+    for offset, (key, value) in enumerate(overrides):
+        env[f"GIT_CONFIG_KEY_{start + offset}"] = key
+        env[f"GIT_CONFIG_VALUE_{start + offset}"] = value
+    env["GIT_CONFIG_COUNT"] = str(start + len(overrides))
+    return env
+
+
 def _kill_git_process_tree(proc: "subprocess.Popen") -> None:
     """Best-effort terminate *proc* and, on Windows, its descendants.
 
@@ -276,7 +487,44 @@ def _kill_git_process_tree(proc: "subprocess.Popen") -> None:
             pass
 
 
-def bounded_git_probe(argv: Sequence[str], *, timeout: float) -> str:
+def bounded_probe_run(
+    argv: Sequence[str], *, timeout: float, env: "Mapping[str, str] | None" = None,
+) -> "subprocess.CompletedProcess[str] | None":
+    """Deadlock-safe ``subprocess.run(argv, capture_output=True, timeout=...)`` for fail-open probes.
+
+    Returns a ``CompletedProcess`` when the child finished within *timeout* (any exit code), or
+    ``None`` on spawn failure or timeout; see :func:`bounded_git_probe` for why not ``run``.
+    """
+    _popen_kwargs = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {}
+    try:
+        proc = subprocess.Popen(
+            list(argv),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=None if env is None else dict(env),
+            **_popen_kwargs,
+        )
+    except Exception:
+        return None
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except Exception:
+        _kill_git_process_tree(proc)
+        try:
+            proc.communicate(timeout=1)
+        except Exception:
+            pass
+        return None
+    return subprocess.CompletedProcess(list(argv), proc.returncode, stdout or "", stderr or "")
+
+
+def bounded_git_probe(
+    argv: Sequence[str], *, timeout: float, env: "Mapping[str, str] | None" = None,
+) -> str:
     """Run a short, throwaway ``git`` probe and return stripped stdout, or ``""``
     on ANY failure (nonzero exit, timeout, spawn error, decode error).
 
@@ -300,32 +548,12 @@ def bounded_git_probe(argv: Sequence[str], *, timeout: float) -> str:
 
     The normal-path spawn contract mirrors the previous ``run`` call byte-for-byte:
     PIPE/PIPE/DEVNULL, ``text`` with UTF-8 ``errors="replace"`` decoding, and the
-    hidden-window ``creationflags`` on Windows only.
+    hidden-window ``creationflags`` on Windows only. The child runs under
+    :func:`noninteractive_git_env` unless the caller supplies a hardened *env*.
     """
-    _popen_kwargs = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {}
-    try:
-        proc = subprocess.Popen(
-            list(argv),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            stdin=subprocess.DEVNULL,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            **_popen_kwargs,
-        )
-    except Exception:
+    result = bounded_probe_run(
+        argv, timeout=timeout,
+        env={**(env if env is not None else noninteractive_git_env()), **NO_LAZY_FETCH_ENV})
+    if result is None or result.returncode != 0:
         return ""
-    try:
-        stdout, _ = proc.communicate(timeout=timeout)
-    except Exception:
-        # Timeout OR any other communicate() failure (torn-down pipe, decode
-        # error): terminate the child + descendants and drain bounded. Leaving
-        # it running would leak the same suspended-descendant class this guards.
-        _kill_git_process_tree(proc)
-        try:
-            proc.communicate(timeout=1)
-        except Exception:
-            pass
-        return ""
-    return stdout.strip() if proc.returncode == 0 else ""
+    return (result.stdout or "").strip()
