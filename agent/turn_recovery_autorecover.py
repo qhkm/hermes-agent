@@ -122,6 +122,25 @@ def _interruptible_wait(agent: Any, wait_s: float, label: str) -> bool:
     return False
 
 
+def _return_to_primary(agent: Any) -> None:
+    """After a ladder wait, put the agent back on the primary provider/model and reset the
+    fallback chain, so a recovered primary is tried first and a fallback only if it fails again.
+
+    Done after the wait, not before: exhausting the chain arms a short ``_rate_limited_until``
+    cooldown (``_FALLBACK_EXHAUSTED_COOLDOWN_S``, 5 s) that makes ``restore_primary_runtime``
+    decline, and the wait outlasts it. A primary still inside a real rate-limit cooldown is left
+    alone by the same gate. Never raises."""
+    restore = getattr(agent, "_restore_primary_runtime", None)
+    if not callable(restore):
+        return
+    try:
+        if restore():
+            agent._emit_status("⏳ Retrying on the primary provider.")
+    except Exception:
+        logger.warning("%sCould not return to the primary provider for auto-recovery",
+                       agent.log_prefix, exc_info=True)
+
+
 def auto_recover_after_exhaustion(
     agent: Any, api_error: Any, classified: Any, _retry: Any, *, messages: Any,
     conversation_history: Any, api_call_count: int,
@@ -178,4 +197,5 @@ def auto_recover_after_exhaustion(
                 "interrupted": True,
             },
         }
+    _return_to_primary(agent)
     return {"action": "continue"}

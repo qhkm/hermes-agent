@@ -196,3 +196,32 @@ def test_absent_max_seconds_keeps_behaviour(monkeypatch):
     for expected in (1, 2, 3):
         out, retry = _run(agent, _Err(503, "down"), retry=retry)
         assert out == {"action": "continue"} and retry.auto_recovery_cycles_used == expected
+
+
+def test_ladder_returns_to_primary_after_the_wait():
+    calls = []
+    agent = _Agent()
+    agent._restore_primary_runtime = lambda: calls.append("restore") or True
+    out, _ = _run(agent, _Err(503, "down"))
+    assert out == {"action": "continue"} and calls == ["restore"]
+    assert any("primary provider" in s for s in agent.statuses)
+
+
+def test_interrupted_wait_does_not_restore_primary():
+    calls = []
+    agent = _Agent()
+    agent._interrupt_requested = True
+    agent._restore_primary_runtime = lambda: calls.append("restore") or True
+    out, _ = _run(agent, _Err(503, "down"))
+    assert out["action"] == "return" and calls == []
+
+
+def test_restore_failure_never_breaks_the_ladder():
+    agent = _Agent()
+
+    def _boom():
+        raise RuntimeError("client build failed")
+
+    agent._restore_primary_runtime = _boom
+    out, retry = _run(agent, _Err(503, "down"))
+    assert out == {"action": "continue"} and retry.auto_recovery_cycles_used == 1

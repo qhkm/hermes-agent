@@ -4397,6 +4397,10 @@ def run_conversation(
                     if _ladder is not None:
                         if _ladder["action"] == "return":
                             return _ladder["result"]
+                        # The ladder may have moved back to the primary; refresh the in-flight
+                        # system message's Model/Provider identity lines to match.
+                        active_system_prompt = _sync_failover_system_message(
+                            agent, api_messages, active_system_prompt)
                         retry_count = 0
                         continue
                     # Terminal — flush buffered retry/fallback trace.
