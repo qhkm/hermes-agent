@@ -132,12 +132,13 @@ def _load_image_bytes(ref: str) -> Tuple[bytes, str]:
     ref = ref.strip()
     lower = ref.lower()
     if lower.startswith(("http://", "https://")):
-        import requests
+        # A model-supplied reference URL is remote-party-controlled: SSRF-guarded fetch.
+        from agent.provider_media import open_remote_stream
 
-        resp = requests.get(ref, timeout=60)
-        resp.raise_for_status()
+        with open_remote_stream(ref, timeout=60, label="Image reference") as resp:
+            content = resp.read()
         name = ref.split("?", 1)[0].rsplit("/", 1)[-1] or "image.png"
-        return resp.content, name
+        return content, name
     if lower.startswith("data:"):
         import base64
 

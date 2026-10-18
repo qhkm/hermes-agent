@@ -213,7 +213,8 @@ class TestClawHubSource(unittest.TestCase):
         self.assertEqual(meta.tags, ["automation"])
 
     @patch("tools.skills_hub.httpx.get")
-    def test_fetch_resolves_latest_version_and_downloads_raw_files(self, mock_get):
+    @patch("tools.skills_hub._ssrf_safe_http_get")
+    def test_fetch_resolves_latest_version_and_downloads_raw_files(self, mock_get, mock_raw_get):
         def side_effect(url, *args, **kwargs):
             if url.endswith("/skills/caldav-calendar"):
                 return _MockResponse(
@@ -238,6 +239,7 @@ class TestClawHubSource(unittest.TestCase):
             return _MockResponse(status_code=404, json_data={})
 
         mock_get.side_effect = side_effect
+        mock_raw_get.side_effect = side_effect  # raw file downloads still use httpx.get
 
         bundle = self.src.fetch("caldav-calendar")
 

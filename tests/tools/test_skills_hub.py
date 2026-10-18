@@ -313,10 +313,59 @@ class TestSkillsShSource:
         assert results[0].path == "vercel-react-best-practices"
         assert results[0].extra["installs"] == 207679
 
+    def test_sitemap_fetches_go_through_guarded_get_and_ask_for_gzip_only(self, monkeypatch):
+        """Sitemap hops use the hub's SSRF-guarded GET and keep the gzip-only
+        Accept-Encoding pin (upstream 3933fdf63b)."""
+        monkeypatch.setattr("tools.skills_hub.is_safe_url", lambda _url: True)
+        monkeypatch.setattr("tools.skills_hub.check_website_access", lambda _url: None)
+        monkeypatch.setattr("tools.skills_hub._read_index_cache", lambda _key: None)
+        monkeypatch.setattr("tools.skills_hub._write_index_cache", lambda _key, _v: None)
+        calls = []
+
+        def fake_get(url, *, timeout, headers=None):
+            calls.append((url, headers))
+            body = ("<sitemapindex><sitemap><loc>https://www.skills.sh/sitemap-skills-0.xml</loc></sitemap></sitemapindex>"
+                    if url.endswith("/sitemap.xml") else
+                    "<urlset><url><loc>https://skills.sh/acme/repo/my-skill</loc></url></urlset>")
+            return MagicMock(status_code=200, headers={}, text=body)
+
+        monkeypatch.setattr("tools.skills_hub._ssrf_safe_http_get", fake_get)
+
+        results = self._source()._sitemap_catalog(limit=5)
+
+        assert [r.identifier for r in results] == ["skills-sh/acme/repo/my-skill"]
+        assert [u for u, _ in calls] == ["https://www.skills.sh/sitemap.xml", "https://www.skills.sh/sitemap-skills-0.xml"]
+        assert all(h == {"Accept-Encoding": "gzip"} for _, h in calls), calls
+
+    def test_sitemap_loc_pointing_at_metadata_is_not_fetched(self, monkeypatch):
+        monkeypatch.setattr("tools.skills_hub.check_website_access", lambda _url: None)
+        monkeypatch.setattr("tools.skills_hub._read_index_cache", lambda _key: None)
+        monkeypatch.setattr("tools.skills_hub._write_index_cache", lambda _key, _v: None)
+        calls = []
+
+        def fake_get(url, *, timeout, headers=None):
+            calls.append(url)
+            if url.endswith("/sitemap.xml"):
+                return MagicMock(status_code=200, headers={}, text="<sitemapindex><sitemap>"
+                                 "<loc>http://169.254.169.254/sitemap-skills-0.xml</loc></sitemap></sitemapindex>")
+            return MagicMock(status_code=200, headers={}, text="<urlset></urlset>")
+
+        monkeypatch.setattr("tools.skills_hub._ssrf_safe_http_get", fake_get)
+        monkeypatch.setattr("tools.url_safety.is_safe_url", lambda u: "169.254" not in u)
+        monkeypatch.setattr("tools.skills_hub.is_safe_url", lambda u: "169.254" not in u)
+
+        src = self._source()
+        monkeypatch.setattr(src, "_featured_skills", lambda limit: [])
+        src._sitemap_catalog(limit=5)
+
+        assert all("169.254" not in u for u in calls)
+
     @patch("tools.skills_hub._write_index_cache")
     @patch("tools.skills_hub._read_index_cache", return_value=None)
+    @patch("tools.skills_hub._ssrf_safe_http_get")
     @patch("tools.skills_hub.httpx.get")
-    def test_empty_search_uses_featured_homepage_links(self, mock_get, _mock_read_cache, _mock_write_cache):
+    def test_empty_search_uses_featured_homepage_links(self, mock_get, mock_guarded_get, _mock_read_cache, _mock_write_cache):
+        mock_guarded_get.return_value = MagicMock(status_code=200, headers={}, text="<urlset></urlset>")
         mock_get.return_value = MagicMock(
             status_code=200,
             text='''
@@ -644,7 +693,7 @@ class TestSkillsShSource:
 
     @patch("tools.skills_hub._write_index_cache")
     @patch("tools.skills_hub._read_index_cache", return_value=None)
-    @patch("tools.skills_hub.httpx.get")
+    @patch("tools.skills_hub._ssrf_safe_http_get")
     def test_empty_query_walks_sitemap_not_homepage(
         self, mock_get, _mock_read_cache, _mock_write_cache,
     ):
@@ -802,7 +851,7 @@ class TestWellKnownSkillSource:
 
     @patch("tools.skills_hub._write_index_cache")
     @patch("tools.skills_hub._read_index_cache", return_value=None)
-    @patch("tools.skills_hub.httpx.get")
+    @patch("tools.skills_hub._ssrf_safe_http_get")
     def test_search_reads_index_from_well_known_url(self, mock_get, _mock_read_cache, _mock_write_cache):
         mock_get.return_value = MagicMock(
             status_code=200,
@@ -824,7 +873,7 @@ class TestWellKnownSkillSource:
 
     @patch("tools.skills_hub._write_index_cache")
     @patch("tools.skills_hub._read_index_cache", return_value=None)
-    @patch("tools.skills_hub.httpx.get")
+    @patch("tools.skills_hub._ssrf_safe_http_get")
     def test_search_accepts_domain_root_and_resolves_index(self, mock_get, _mock_read_cache, _mock_write_cache):
         mock_get.return_value = MagicMock(
             status_code=200,
@@ -839,7 +888,7 @@ class TestWellKnownSkillSource:
 
     @patch("tools.skills_hub._write_index_cache")
     @patch("tools.skills_hub._read_index_cache", return_value=None)
-    @patch("tools.skills_hub.httpx.get")
+    @patch("tools.skills_hub._ssrf_safe_http_get")
     def test_inspect_fetches_skill_md_from_well_known_endpoint(self, mock_get, _mock_read_cache, _mock_write_cache):
         def fake_get(url, *args, **kwargs):
             if url.endswith("/index.json"):
@@ -861,7 +910,7 @@ class TestWellKnownSkillSource:
 
     @patch("tools.skills_hub._write_index_cache")
     @patch("tools.skills_hub._read_index_cache", return_value=None)
-    @patch("tools.skills_hub.httpx.get")
+    @patch("tools.skills_hub._ssrf_safe_http_get")
     def test_fetch_downloads_skill_files_from_well_known_endpoint(self, mock_get, _mock_read_cache, _mock_write_cache):
         def fake_get(url, *args, **kwargs):
             if url.endswith("/index.json"):
@@ -954,7 +1003,7 @@ class TestUrlSource:
         assert self._source().search("anything") == []
 
     # ── inspect ─────────────────────────────────────────────────────────
-    @patch("tools.skills_hub.httpx.get")
+    @patch("tools.skills_hub._ssrf_safe_http_get")
     def test_inspect_reads_frontmatter_from_url(self, mock_get):
         mock_get.return_value = MagicMock(
             status_code=200,
@@ -1002,7 +1051,7 @@ class TestUrlSource:
         assert self._source().inspect("http://127.0.0.1/SKILL.md") is None
         mock_get.assert_not_called()
 
-    @patch("tools.skills_hub.httpx.get")
+    @patch("tools.skills_hub._ssrf_safe_http_get")
     def test_inspect_flags_awaiting_name_when_unresolvable(self, mock_get):
         # No frontmatter name + a URL path that can't produce a valid slug
         # (``SKILL`` isn't a valid skill name).
@@ -1016,7 +1065,7 @@ class TestUrlSource:
         assert meta.extra["awaiting_name"] is True
 
     # ── fetch ───────────────────────────────────────────────────────────
-    @patch("tools.skills_hub.httpx.get")
+    @patch("tools.skills_hub._ssrf_safe_http_get")
     def test_fetch_builds_single_file_bundle(self, mock_get):
         skill_md = (
             "---\n"
@@ -1037,7 +1086,7 @@ class TestUrlSource:
         assert bundle.metadata["url"] == "https://sharethis.chat/SKILL.md"
         assert bundle.metadata["awaiting_name"] is False
 
-    @patch("tools.skills_hub.httpx.get")
+    @patch("tools.skills_hub._ssrf_safe_http_get")
     def test_fetch_falls_back_to_url_directory_name(self, mock_get):
         # Frontmatter has no ``name:`` — we slug from the URL directory.
         mock_get.return_value = MagicMock(
@@ -1049,7 +1098,7 @@ class TestUrlSource:
         assert bundle.name == "my-skill"
         assert bundle.metadata["awaiting_name"] is False
 
-    @patch("tools.skills_hub.httpx.get")
+    @patch("tools.skills_hub._ssrf_safe_http_get")
     def test_fetch_falls_back_to_filename_when_no_parent_dir(self, mock_get):
         mock_get.return_value = MagicMock(
             status_code=200,
@@ -1060,7 +1109,7 @@ class TestUrlSource:
         assert bundle.name == "my-skill"
         assert bundle.metadata["awaiting_name"] is False
 
-    @patch("tools.skills_hub.httpx.get")
+    @patch("tools.skills_hub._ssrf_safe_http_get")
     def test_fetch_awaiting_name_when_unresolvable(self, mock_get):
         # Bare ``SKILL.md`` at the domain root with no frontmatter name.
         mock_get.return_value = MagicMock(
@@ -1074,7 +1123,7 @@ class TestUrlSource:
         # File content still present — CLI will reuse it after picking a name.
         assert bundle.files["SKILL.md"].startswith("---\n")
 
-    @patch("tools.skills_hub.httpx.get")
+    @patch("tools.skills_hub._ssrf_safe_http_get")
     def test_fetch_awaiting_name_rejects_sentinel_slug(self, mock_get):
         # Frontmatter has no name AND the URL filename slug is ``README`` —
         # our valid-name check rejects it, so we flag awaiting_name.
@@ -1087,7 +1136,7 @@ class TestUrlSource:
         assert bundle.name == ""
         assert bundle.metadata["awaiting_name"] is True
 
-    @patch("tools.skills_hub.httpx.get")
+    @patch("tools.skills_hub._ssrf_safe_http_get")
     def test_fetch_ignores_unsafe_frontmatter_name_and_falls_through_to_slug(self, mock_get):
         # Traversal / unsafe names are rejected by ``_is_valid_skill_name``;
         # resolver falls through to URL slug (``my-skill`` here) and succeeds.
@@ -1104,7 +1153,7 @@ class TestUrlSource:
         mock_get.return_value = MagicMock(status_code=404)
         assert self._source().fetch("https://example.com/SKILL.md") is None
 
-    @patch("tools.skills_hub.httpx.get")
+    @patch("tools.skills_hub._ssrf_safe_http_get")
     @patch("tools.skills_hub.check_website_access", return_value=None)
     @patch("tools.skills_hub.is_safe_url", side_effect=[True, False])
     def test_fetch_blocks_redirect_to_private_url(self, _mock_safe, _mock_policy, mock_get):
