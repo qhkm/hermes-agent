@@ -445,6 +445,17 @@ def _resolve_runtime_from_pool_entry(
         base_url = base_url or OPENROUTER_BASE_URL
     elif provider == "xai":
         api_mode = "codex_responses"
+        # Env-seeded rows keep the registry host. model.base_url is the relay
+        # override, and only while the row is still that host (or empty) -- an
+        # explicit per-credential endpoint stays authoritative, and a base_url
+        # saved under a different model.provider is ignored (#121347).
+        pconfig = PROVIDER_REGISTRY.get("xai")
+        canonical = (pconfig.inference_base_url if pconfig else "").rstrip("/")
+        if base_url.rstrip("/") in ("", canonical):
+            if str(model_cfg.get("provider") or "").strip().lower() == "xai":
+                cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
+                if cfg_base_url:
+                    base_url = cfg_base_url
     elif provider == "nous":
         api_mode = "chat_completions"
         base_url = _nous_inference_base_url_override() or base_url
@@ -1099,6 +1110,13 @@ def _resolve_openrouter_runtime(
             cfg_base_url, cfg_provider
         ):
             use_config_base_url = True
+        elif requested_norm == "openrouter" and cfg_provider == "openrouter":
+            # provider: openrouter with a base_url saved beside it is an
+            # OpenRouter-compatible relay/proxy the user chose. Honour it even
+            # when OPENROUTER_BASE_URL is unset, rather than reaching openrouter.ai
+            # with the relay's key (#121614). A base_url saved under a different
+            # model.provider never reaches this branch.
+            use_config_base_url = True
 
     base_url = (
         (explicit_base_url or "").strip()
@@ -1121,6 +1139,10 @@ def _resolve_openrouter_runtime(
         requested_norm == "openrouter"
         and (env_openrouter_base_url or base_url == env_openrouter_base_url)
         and base_url == (env_openrouter_base_url or "").rstrip("/")
+    ) or (
+        requested_norm == "openrouter"
+        and use_config_base_url
+        and base_url == cfg_base_url.strip().rstrip("/")
     )
     if _is_openrouter_context:
         api_key_candidates = [
@@ -1711,6 +1733,14 @@ def resolve_runtime_provider(
             or env_openrouter_base_url
         )
         if cfg_base_url and cfg_provider in {"auto", "custom"}:
+            has_custom_endpoint = True
+        elif (
+            cfg_base_url
+            and cfg_provider == "openrouter"
+            and not base_url_host_matches(cfg_base_url, "openrouter.ai")
+        ):
+            # A saved OpenRouter-compatible relay: skip the env-seeded pool row,
+            # whose canonical host would otherwise win (#121614).
             has_custom_endpoint = True
         has_runtime_override = bool(explicit_api_key or explicit_base_url)
         should_use_pool = (
