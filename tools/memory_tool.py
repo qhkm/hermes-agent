@@ -26,6 +26,7 @@ Design:
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 from contextlib import contextmanager
@@ -90,6 +91,52 @@ def _scan_memory_content(content: str) -> Optional[str]:
     return _first_threat_message(content, scope="strict")
 
 
+# Typography a model re-types differently from the stored entry: every quote/backtick -> "'",
+# every dash/minus -> "-". Plus whitespace runs (re-wrapped lines, NBSP) -> one space.
+_MATCH_FOLD = str.maketrans({**dict.fromkeys("\"`\u2018\u2019\u201a\u201b\u201c\u201d\u201e\u201f", "'"),
+                             **dict.fromkeys("\u2010\u2011\u2012\u2013\u2014\u2015\u2212", "-")})
+
+
+def _normalize_for_match(text: str) -> str:
+    """Quote/dash/whitespace-folded form for tolerant old_text matching. Models re-emit an
+    entry with straight quotes for curly ones, '-' for an em dash, unwrapped lines, or a
+    newline over-escaped to a literal backslash-n, and a byte-exact substring test then
+    reports "No entry matched" for an unambiguous target (#133038)."""
+    return " ".join(str(text).replace("\\n", " ").translate(_MATCH_FOLD).split())
+
+
+def _substring_matches(entries: List[str], old_text: str) -> List[int]:
+    """Indices of entries containing *old_text*: byte-exact first, else typography-folded."""
+    if exact := [i for i, e in enumerate(entries) if old_text in e]:
+        return exact
+    needle = _normalize_for_match(old_text)
+    if not any(c.isalnum() for c in needle):  # punctuation/space alone would select a whole entry
+        return []
+    return [i for i, e in enumerate(entries) if needle in _normalize_for_match(e)]
+
+
+def _closest_entries(entries: List[str], old_text: str) -> List[str]:
+    """Up to 3 entries sharing >= 30% of old_text's words (a paraphrased or stale
+    old_text usually still shares most of them)."""
+    def _words(text: str) -> set:
+        return set(re.findall(r"\w+", text.lower()))
+    words = _words(old_text)
+    if not words:
+        return []
+    scored = sorted(((len(words & _words(e)) / len(words), i) for i, e in enumerate(entries)),
+                    key=lambda p: (-p[0], p[1]))
+    return [entries[i] for score, i in scored[:3] if score >= 0.3]
+
+
+def _no_match_hint(old_text: str) -> str:
+    return (" old_text must come from ONE entry ('\u00a7' separates entries); use one op per entry."
+            if "\u00a7" in old_text else "")
+
+
+def _over_limit(new_total: int, limit: int) -> str:
+    return f"would put memory at {new_total:,}/{limit:,} chars: free at least {new_total - limit:,} chars"
+
+
 def _drift_error(path: "Path", bak_path: str) -> Dict[str, Any]:
     """Build the error dict returned when external drift is detected.
 
@@ -102,10 +149,10 @@ def _drift_error(path: "Path", bak_path: str) -> Dict[str, Any]:
     return {
         "success": False,
         "error": (
-            f"Refusing to write {path.name}: file on disk has content that "
-            f"wouldn't round-trip through the memory tool (likely added by "
-            f"the patch tool, a shell append, a manual edit, or a "
-            f"concurrent session). A snapshot was saved to {bak_path}. "
+            f"Refusing to write {path.name}: it holds an entry larger than the "
+            f"whole store's char limit, i.e. free-form text written without "
+            f"\u00a7 delimiters (the patch tool, a shell append, a manual edit). "
+            f"Rewriting it would lose that text. A snapshot was saved to {bak_path}. "
             f"Resolve the drift first — either rewrite the file as a clean "
             f"§-delimited list of entries, or move the extra content out — "
             f"then retry. This guard exists to prevent silent data loss "
@@ -379,11 +426,11 @@ class MemoryStore:
                 return self._consolidation_failure({
                     "success": False,
                     "error": (
-                        f"Memory at {current:,}/{limit:,} chars. "
-                        f"Adding this entry ({len(content)} chars) would exceed the limit. "
-                        f"Consolidate now: use 'replace' to merge overlapping entries into "
-                        f"shorter ones or 'remove' stale or less important entries (see "
-                        f"current_entries below), then retry this add — all in this turn."
+                        f"Memory at {current:,}/{limit:,} chars; adding this entry "
+                        f"({len(content)} chars) would exceed the limit by {new_total - limit:,} chars. "
+                        f"Retry as ONE 'operations' batch that removes or shortens (replace) stale "
+                        f"entries from current_entries below to free at least {new_total - limit:,} "
+                        f"chars AND adds this entry — the limit is checked only on the batch result."
                     ),
                     "current_entries": entries,
                     "usage": f"{current:,}/{limit:,}",
@@ -415,14 +462,10 @@ class MemoryStore:
                 return _drift_error(self._path_for(target), bak)
 
             entries = self._entries_for(target)
-            matches = [(i, e) for i, e in enumerate(entries) if old_text in e]
+            matches = [(i, entries[i]) for i in _substring_matches(entries, old_text)]
 
             if not matches:
-                return self._consolidation_failure({
-                    "success": False,
-                    "error": f"No entry matched '{old_text}'. Check current_entries below and retry with the exact text of the entry you want to replace.",
-                    "current_entries": entries,
-                })
+                return self._consolidation_failure(self._no_match_failure(entries, old_text, "replace"))
 
             if len(matches) > 1:
                 # If all matches are identical (exact duplicates), operate on the first one
@@ -449,10 +492,10 @@ class MemoryStore:
                 return self._consolidation_failure({
                     "success": False,
                     "error": (
-                        f"Replacement would put memory at {new_total:,}/{limit:,} chars. "
-                        f"Shorten the new content, or 'remove' other stale or less important "
-                        f"entries to make room (see current_entries below), then retry — all "
-                        f"in this turn."
+                        f"Replacement {_over_limit(new_total, limit)}. Shorten the new content, "
+                        f"or retry as ONE 'operations' batch with this replace plus removes/"
+                        f"shortenings of other stale entries (see current_entries below) — the "
+                        f"limit is checked only on the batch result."
                     ),
                     "current_entries": entries,
                     "usage": f"{current:,}/{limit:,}",
@@ -476,14 +519,10 @@ class MemoryStore:
                 return _drift_error(self._path_for(target), bak)
 
             entries = self._entries_for(target)
-            matches = [(i, e) for i, e in enumerate(entries) if old_text in e]
+            matches = [(i, entries[i]) for i in _substring_matches(entries, old_text)]
 
             if not matches:
-                return self._consolidation_failure({
-                    "success": False,
-                    "error": f"No entry matched '{old_text}'. Check current_entries below and retry with the exact text of the entry you want to remove.",
-                    "current_entries": entries,
-                })
+                return self._consolidation_failure(self._no_match_failure(entries, old_text, "remove"))
 
             if len(matches) > 1:
                 # If all matches are identical (exact duplicates), remove the first one
@@ -559,11 +598,17 @@ class MemoryStore:
                     if not content:
                         return self._batch_error(
                             target,
-                            f"{pos}: content is required (use action='remove' to delete).",
+                            f"{pos}: content is required \u2014 set this operation object's own 'content' "
+                            f"to the COMPLETE new entry (or use action='remove' to delete).",
                         )
-                    matches = [j for j, e in enumerate(working) if old_text in e]
+                    matches = _substring_matches(working, old_text)
                     if not matches:
-                        return self._batch_error(target, f"{pos}: no entry matched '{old_text}'.")
+                        return self._batch_error(
+                            target,
+                            f"{pos}: No entry matched '{old_text}'.{_no_match_hint(old_text)} Retry with "
+                            f"old_text copied verbatim from the intended entry.",
+                            closest_entries=_closest_entries(working, old_text),
+                        )
                     if len({working[j] for j in matches}) > 1:
                         return self._batch_error(
                             target,
@@ -574,9 +619,14 @@ class MemoryStore:
                 elif act == "remove":
                     if not old_text:
                         return self._batch_error(target, f"{pos}: old_text is required.")
-                    matches = [j for j, e in enumerate(working) if old_text in e]
+                    matches = _substring_matches(working, old_text)
                     if not matches:
-                        return self._batch_error(target, f"{pos}: no entry matched '{old_text}'.")
+                        return self._batch_error(
+                            target,
+                            f"{pos}: No entry matched '{old_text}'.{_no_match_hint(old_text)} Retry with "
+                            f"old_text copied verbatim from the intended entry.",
+                            closest_entries=_closest_entries(working, old_text),
+                        )
                     if len({working[j] for j in matches}) > 1:
                         return self._batch_error(
                             target,
@@ -597,9 +647,9 @@ class MemoryStore:
                 return self._consolidation_failure({
                     "success": False,
                     "error": (
-                        f"After applying all {len(operations)} operations, memory would be at "
-                        f"{new_total:,}/{limit:,} chars -- over the limit. Remove or shorten more "
-                        f"entries in the same batch (see current_entries below), then retry."
+                        f"Applying all {len(operations)} operations {_over_limit(new_total, limit)} "
+                        f"more. Add removes or shorter replacements of other stale entries to the "
+                        f"same batch (see current_entries below), then retry."
                     ),
                     "current_entries": self._entries_for(target),
                     "usage": f"{current:,}/{limit:,}",
@@ -611,16 +661,39 @@ class MemoryStore:
 
         return self._success_response(target, f"Applied {len(operations)} operation(s).")
 
-    def _batch_error(self, target: str, message: str) -> Dict[str, Any]:
-        """Build a batch-abort error that reports live (uncommitted) state."""
+    @staticmethod
+    def _no_match_failure(entries: List[str], old_text: str, verb: str) -> Dict[str, Any]:
+        """Zero-match error that names the fix: the entries most like old_text, and a
+        pointer when old_text spans several entries joined by the delimiter."""
+        closest = _closest_entries(entries, old_text)
+        out: Dict[str, Any] = {
+            "success": False,
+            "error": (
+                f"No entry matched '{old_text}'.{_no_match_hint(old_text)} Retry the {verb} with "
+                f"old_text copied verbatim from the intended entry"
+                + (" (closest_entries below)." if closest else ".")
+            ),
+            "current_entries": entries,
+        }
+        if closest:
+            out["closest_entries"] = closest
+        return out
+
+    def _batch_error(self, target: str, message: str,
+                     closest_entries: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Build a batch-abort error that reports live (uncommitted) state. A zero-match
+        op also carries its few ``closest_entries``."""
         current = self._char_count(target)
         limit = self._char_limit(target)
-        return self._consolidation_failure({
+        out = {
             "success": False,
             "error": message + " No operations were applied (batch is all-or-nothing).",
             "current_entries": self._entries_for(target),
             "usage": f"{current:,}/{limit:,}",
-        })
+        }
+        if closest_entries:
+            out["closest_entries"] = closest_entries
+        return self._consolidation_failure(out)
 
     def format_for_system_prompt(self, target: str) -> Optional[str]:
         """
@@ -746,12 +819,15 @@ class MemoryStore:
             return None
 
         parsed = [e.strip() for e in raw.split(ENTRY_DELIMITER) if e.strip()]
-        roundtrip = ENTRY_DELIMITER.join(parsed)
 
         char_limit = self._char_limit(target)
         max_entry_len = max((len(e) for e in parsed), default=0)
 
-        drift_detected = (raw.strip() != roundtrip) or (max_entry_len > char_limit)
+        # Layout differences (blank lines around the delimiter, empty entries, padding)
+        # are NOT drift: parsing only strips whitespace, so the rewrite loses nothing but
+        # whitespace, and refusing blocked every replace/remove on a hand-formatted file
+        # for good (#107270, #133038). The oversized entry is the one signal left.
+        drift_detected = max_entry_len > char_limit
         if not drift_detected:
             return None
 
