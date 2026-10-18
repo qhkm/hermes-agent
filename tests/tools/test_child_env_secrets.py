@@ -36,6 +36,9 @@ HERMES_SECRETS = {
     "API_SERVER_KEY": "api-server-secret-1",
     "TELEGRAM_BOT_TOKEN": "123456:telegram-bot-token-abc",
     "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD": "dash-pass-1",
+    # Tier 1 but absent from the provider blocklist: only a Tier-1 check on the terminal paths
+    # keeps it out.
+    "SLACK_SIGNING_SECRET": "slack-signing-1",
 }
 # Code-only adapter names: Jentera runs none of those platforms, so on a sprite these are keys an
 # owner pasted and must reach the agent's terminal, as on the production pin.
@@ -161,3 +164,25 @@ def test_every_secret_named_gateway_and_adapter_read_is_covered():
                     missing.add(name)
     # Names that are not secrets despite the suffix, or belong to the user.
     assert not (missing - {"SLACK_USER_TOKEN"}), sorted(missing)
+
+
+def test_tier1_names_outside_provider_blocklist_are_dropped_on_terminal_paths(monkeypatch):
+    from tools import env_passthrough as ep
+    from tools.environments.local import _make_run_env
+
+    assert "SLACK_SIGNING_SECRET" in _ALWAYS_STRIP_KEYS
+    assert "SLACK_SIGNING_SECRET" not in _HERMES_PROVIDER_ENV_BLOCKLIST
+    monkeypatch.setenv("SLACK_SIGNING_SECRET", "slack-signing-1")
+    monkeypatch.setenv("HERMES_CHILD_ENV_KEEP", "SLACK_SIGNING_SECRET")
+    ep.clear_env_passthrough()
+    ep.register_env_passthrough(["SLACK_SIGNING_SECRET"])
+    try:
+        assert "SLACK_SIGNING_SECRET" not in _make_run_env({})
+        assert "SLACK_SIGNING_SECRET" not in _make_run_env({"SLACK_SIGNING_SECRET": "x"})
+        assert "SLACK_SIGNING_SECRET" not in _sanitize_subprocess_env(dict(os.environ))
+        assert "SLACK_SIGNING_SECRET" not in _sanitize_subprocess_env({}, {"SLACK_SIGNING_SECRET": "x"})
+        forced = {"_HERMES_FORCE_SLACK_SIGNING_SECRET": "x"}
+        assert "SLACK_SIGNING_SECRET" not in _sanitize_subprocess_env({}, forced)
+        assert "SLACK_SIGNING_SECRET" not in _make_run_env(forced)
+    finally:
+        ep.clear_env_passthrough()

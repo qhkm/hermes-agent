@@ -524,6 +524,13 @@ def _child_env_keep() -> frozenset:
     return frozenset(names - _ALWAYS_STRIP_KEYS)
 
 
+def _is_tier1_or_internal_secret(key: str) -> bool:
+    """Tier-1 name (``_ALWAYS_STRIP_KEYS``, e.g. ``SLACK_SIGNING_SECRET``) or a Hermes-internal
+    dynamic secret. The terminal / background-process builders used to check only the provider
+    blocklist, which does not hold every Tier-1 name, so those names reached the agent's children."""
+    return key in _ALWAYS_STRIP_KEYS or _is_hermes_internal_secret(key)
+
+
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
     """Filter Hermes-managed secrets from a subprocess environment."""
     try:
@@ -537,7 +544,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     for key, value in (base_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             continue
-        if _is_hermes_internal_secret(key):
+        if _is_tier1_or_internal_secret(key):
             continue
         if key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key) or key in keep:
             sanitized[key] = value
@@ -545,10 +552,10 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     for key, value in (extra_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             real_key = key[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
-            if _is_hermes_internal_secret(real_key):
+            if _is_tier1_or_internal_secret(real_key):
                 continue
             sanitized[real_key] = value
-        elif _is_hermes_internal_secret(key):
+        elif _is_tier1_or_internal_secret(key):
             continue
         elif key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key) or key in keep:
             sanitized[key] = value
@@ -1215,10 +1222,10 @@ def _make_run_env(env: dict) -> dict:
     for k, v in merged.items():
         if k.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             real_key = k[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
-            if _is_hermes_internal_secret(real_key):
+            if _is_tier1_or_internal_secret(real_key):
                 continue
             run_env[real_key] = v
-        elif _is_hermes_internal_secret(k):
+        elif _is_tier1_or_internal_secret(k):
             continue
         elif k not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(k) or k in keep:
             run_env[k] = v
