@@ -391,7 +391,7 @@ class TestMemoryConsolidationGracefulDegrade:
             r = store.replace("memory", "nonexistent", "new")
             assert r["success"] is False
             assert "current_entries" in r  # actionable feedback, keep trying
-            assert "retry with the exact text" in r["error"]
+            assert "copied verbatim" in r["error"]
         # The next failure degrades: terminal, no retry instruction.
         r = store.replace("memory", "nonexistent", "new")
         assert r["success"] is False
@@ -408,7 +408,7 @@ class TestMemoryConsolidationGracefulDegrade:
         for _ in range(cap):
             r = store.add("memory", big)
             assert r["success"] is False
-            assert "retry this add" in r["error"]  # still instructs in-turn retry
+            assert "Retry as ONE" in r["error"]  # still instructs in-turn retry
         r = store.add("memory", big)
         assert r["success"] is False
         assert r["done"] is True
@@ -656,7 +656,7 @@ class TestMemoryBatch:
             store=store,
         ))
         assert result["success"] is False
-        assert "limit" in result["error"].lower()
+        assert "free at least 100 chars" in result["error"]
         assert len(store.memory_entries) == 0
 
     def test_batch_duplicate_add_is_noop_not_failure(self, store):
@@ -915,3 +915,77 @@ class TestLoadTimeSnapshotSanitization:
         # Block marker appears exactly once, not nested
         assert snapshot.count("[BLOCKED:") == 1
         assert "Clean fact" in snapshot
+
+
+# =========================================================================
+# #133038: hand-formatted files, tolerant matching, errors that name the fix
+# =========================================================================
+
+
+class TestHandFormattedFilesAndFixableErrors:
+    def test_layout_and_retyped_typography_match_but_punctuation_never_does(self, store):
+        """#107270: blank lines around the delimiter are not drift, and a target re-typed with
+        ASCII quotes/dashes/unwrapped lines still matches. Punctuation-only needles match nothing."""
+        path = store._path_for("memory")
+        path.write_text("Deploys: Fly.io, manual approval.\n\n§\n\nHost: forge\n§\n\n§\nRepo: acme", encoding="utf-8")
+        assert store.replace("memory", "Deploys:", "Deploys: Fly.io, 30m canary.")["success"] is True
+        assert store.remove("memory", "Repo: acme")["success"] is True
+        assert path.read_text(encoding="utf-8") == "Deploys: Fly.io, 30m canary.\n§\nHost: forge"
+        assert not list(path.parent.glob("MEMORY.md.bak.*"))
+        store.add("memory", 'User runs a fleet (“Omarchy” — Trinity)')
+        store.add("memory", "Tests: run ‘make test’ (needs\n  docker up)")
+        assert store.replace("memory", "fleet (\"Omarchy\" - Trinity)", "fleet (Zeus hub)")["success"] is True
+        assert store.apply_batch("memory", [{"action": "replace", "old_text": "run 'make test' (needs\\n docker up)",
+                                             "content": "Tests: make test-fast"}])["success"] is True
+        store.add("memory", 'Literal sequence " - inside a note')
+        assert store.remove("memory", "“ —")["success"] is False
+        assert store.apply_batch("memory", [{"action": "remove", "old_text": "“ —"}])["success"] is False
+        assert store.memory_entries == ["Deploys: Fly.io, 30m canary.", "Host: forge", "fleet (Zeus hub)",
+                                        "Tests: make test-fast", 'Literal sequence " - inside a note']
+
+    def test_failures_name_the_fix(self, store):
+        store.add("memory", "Deploys go through GitHub Actions to Fly.io with manual approval.")
+        store.add("memory", "x" * 380)  # 65 + 3 + 380 = 448 of 500
+        full = store.add("memory", "y" * 54)  # 448 + 3 + 54 = 505
+        assert "by 5 chars" in full["error"] and "free at least 5 chars" in full["error"]
+        miss = store.replace("memory", "Deploys via GitHub Actions to Fly", "z")
+        assert "No entry matched" in miss["error"]
+        assert miss["closest_entries"] == ["Deploys go through GitHub Actions to Fly.io with manual approval."]
+        span = store.remove("memory", "approval.\n§\nxxx")
+        assert "ONE entry" in span["error"]
+        store.add("memory", "ok")  # a success resets the per-turn failure budget
+        batch = store.apply_batch("memory", [{"action": "replace", "old_text": "Deploys via GitHub Actions to Fly",
+                                              "content": "z"}])
+        assert batch["success"] is False and "No entry matched" in batch["error"]
+        assert batch["closest_entries"] == ["Deploys go through GitHub Actions to Fly.io with manual approval."]
+        nocontent = store.apply_batch("memory", [{"action": "replace", "old_text": "Deploys go"}])
+        assert "own 'content'" in nocontent["error"]
+
+
+class TestWrittenFormatUnchanged:
+    """Jentera's runner parses MEMORY.md/USER.md straight from disk ('\\n§\\n' between entries,
+    no header, no trailing newline). The fixtures were produced by the base (pre-port) code;
+    the written bytes must stay identical."""
+
+    FIXTURES = Path(__file__).parent / "fixtures" / "memory_base_format"
+
+    def test_bytes_match_base_format(self, store, tmp_path):
+        s = MemoryStore(memory_char_limit=2200, user_char_limit=1375)
+        s.load_from_disk()
+        for c in ["Deploys: Fly.io, manual approval.", "Host: forge — “quoted”",
+                  "Multi\nline entry\nkeeps newlines", "Repo: acme"]:
+            assert s.add("memory", c)["success"]
+        assert s.replace("memory", "Repo:", "Repo: acme/main")["success"]
+        assert s.add("user", "Name: Aisyah")["success"]
+        assert s.add("user", "Prefers Bahasa Malaysia")["success"]
+        for name in ("MEMORY.md", "USER.md"):
+            assert (tmp_path / name).read_bytes() == (self.FIXTURES / name).read_bytes()
+
+    def test_hand_formatted_file_is_rewritten_in_base_format(self, store, tmp_path):
+        path = tmp_path / "MEMORY.md"
+        path.write_text("a\n\n§\n\nb\n§\n\n§\nc\n", encoding="utf-8")
+        assert store.replace("memory", "b", "b2")["success"]
+        assert path.read_bytes() == "a\n§\nb2\n§\nc".encode("utf-8")
+
+    def test_caps_unchanged(self):
+        assert MemoryStore().memory_char_limit == 2200 and MemoryStore().user_char_limit == 1375

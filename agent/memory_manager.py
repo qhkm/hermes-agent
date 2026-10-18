@@ -34,6 +34,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
+from agent.redact import redact_for_egress
 from agent.skill_commands import extract_user_instruction_from_skill_message
 from tools.registry import tool_error
 
@@ -170,6 +171,59 @@ def sanitize_context(text: str) -> str:
     text = _INTERNAL_NOTE_RE.sub('', text)
     text = _FENCE_TAG_RE.sub('', text)
     return text
+
+
+def _scrub(text: str) -> str:
+    """The shared egress scrub. Like chat-platform and cron delivery it holds even when
+    ``security.redact_secrets`` is off (that setting governs local logs, not what leaves the agent)
+    and fails closed."""
+    return redact_for_egress(text)
+
+
+_TOKEN_RE = re.compile(r"[A-Za-z0-9_\-./+]{16,}")
+
+
+def _redact_for_provider(*values: Any) -> Any:
+    """Copies of ``values`` with every string scrubbed before it reaches a memory provider.
+
+    Providers archive whatever they are handed (#115104), so each manager fan-out (turn sync, recall
+    queries, session-end and pre-compress transcripts, memory-tool mirrors, delegation results, provider
+    tool args) goes through ``_scrub``. Walks dicts/lists/tuples so tool-call arguments and multimodal text
+    parts are covered; ``data:`` URLs (inline media) pass through. A value the scrub masked anywhere in the
+    hand-off is then masked everywhere in it, so a key detected in a tool result is also caught where the
+    model repeats it bare in prose. Never mutates the caller's objects: unchanged values come back as-is,
+    changed containers as shallow copies. One value in → one value out; several → a tuple.
+    """
+    learned: set = set()
+
+    def walk(value: Any, fix) -> Any:
+        if isinstance(value, str):
+            return value if not value or value.startswith("data:") else fix(value)
+        if isinstance(value, dict):
+            out = {k: walk(v, fix) for k, v in value.items()}
+            return value if all(out[k] is value[k] for k in value) else out
+        if isinstance(value, (list, tuple)):
+            items = [walk(v, fix) for v in value]
+            if all(new is old for new, old in zip(items, value)):
+                return value
+            return tuple(items) if isinstance(value, tuple) else items
+        return value
+
+    def scrub(text: str) -> str:
+        out = _scrub(text)
+        if out != text:
+            learned.update(set(_TOKEN_RE.findall(text)) - set(_TOKEN_RE.findall(out)))
+        return out
+
+    scrubbed = [walk(v, scrub) for v in values]
+    if learned:
+        pattern = re.compile("|".join(re.escape(t) for t in sorted(learned, key=len, reverse=True)))
+        scrubbed = [walk(v, lambda t: pattern.sub("[redacted]", t) if pattern.search(t) else t) for v in scrubbed]
+    return scrubbed[0] if len(scrubbed) == 1 else tuple(scrubbed)
+
+
+def _redact_messages_for_egress(messages: Optional[List[Any]]) -> Optional[List[Any]]:
+    return None if messages is None else list(_redact_for_provider(messages))
 
 
 class StreamingContextScrubber:
@@ -524,6 +578,7 @@ class MemoryManager:
         clean_query = self._strip_skill_scaffolding(query)
         if not clean_query:
             return ""
+        clean_query = _redact_for_provider(clean_query)
         parts = []
         for provider in self._providers:
             try:
@@ -601,6 +656,7 @@ class MemoryManager:
         clean_query = self._strip_skill_scaffolding(query)
         if not clean_query:
             return
+        clean_query = _redact_for_provider(clean_query)
 
         def _run() -> None:
             for provider in providers:
@@ -660,7 +716,11 @@ class MemoryManager:
         clean_user_content = self._strip_skill_scaffolding(user_content)
         if not clean_user_content:
             return
-        user_content = clean_user_content
+        # Everything forwarded is provider egress: turn strings AND the ``messages`` transcript
+        # slice (tool outputs included) are scrubbed so secrets are never archived verbatim in a
+        # provider's store (#115104).
+        user_content, assistant_content, messages = _redact_for_provider(
+            clean_user_content, assistant_content, messages)
 
         def _run() -> None:
             for provider in providers:
@@ -830,6 +890,7 @@ class MemoryManager:
         provider = self._tool_to_provider.get(tool_name)
         if provider is None:
             return tool_error(f"No memory provider handles tool '{tool_name}'")
+        args = _redact_for_provider(args)
         try:
             return provider.handle_tool_call(tool_name, args, **kwargs)
         except Exception as e:
@@ -846,6 +907,7 @@ class MemoryManager:
 
         kwargs may include: remaining_tokens, model, platform, tool_count.
         """
+        message = _redact_for_provider(message)
         for provider in self._providers:
             try:
                 provider.on_turn_start(turn_number, message, **kwargs)
@@ -857,6 +919,7 @@ class MemoryManager:
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Notify all providers of session end."""
+        messages = _redact_messages_for_egress(messages or [])
         for provider in self._providers:
             try:
                 provider.on_session_end(messages)
@@ -971,6 +1034,7 @@ class MemoryManager:
         summary prompt. Empty string if no provider contributes.
         """
         parts = []
+        messages = _redact_messages_for_egress(messages or [])
         for provider in self._providers:
             try:
                 result = provider.on_pre_compress(messages)
@@ -1020,6 +1084,7 @@ class MemoryManager:
 
         Skips the builtin provider itself (it's the source of the write).
         """
+        content, metadata = _redact_for_provider(content, dict(metadata or {}))
         for provider in self._providers:
             if provider.name == "builtin":
                 continue
@@ -1123,6 +1188,7 @@ class MemoryManager:
     def on_delegation(self, task: str, result: str, *,
                       child_session_id: str = "", **kwargs) -> None:
         """Notify all providers that a subagent completed."""
+        task, result = _redact_for_provider(task, result)
         for provider in self._providers:
             try:
                 provider.on_delegation(
