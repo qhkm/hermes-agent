@@ -42,6 +42,7 @@ Requires:
 
 import asyncio
 import errno
+import functools
 import hashlib
 import hmac
 import json
@@ -4894,6 +4895,11 @@ class APIServerAdapter(BasePlatformAdapter):
             return existing + "\n" + late
         return existing or late
 
+    def _call_in_profile_scope(self, profile: Optional[str], fn):
+        """Run ``fn()`` inside ``profile``'s scope (for executor threads)."""
+        with self._profile_scope(profile):
+            return fn()
+
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
         def _push(event: Dict[str, Any]) -> None:
@@ -5103,25 +5109,27 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="run.cancelled",
                     )
                     return
-                def _build_agent():
-                    # Agent construction resolves tool definitions, which can
-                    # re-run availability probes (blocking I/O); keep it off
-                    # the event loop. The profile scope is re-entered here
-                    # because the executor thread does not inherit it.
-                    with self._profile_scope(request_profile):
-                        return self._create_agent(
-                            ephemeral_system_prompt=ephemeral_system_prompt,
-                            session_id=session_id,
-                            stream_delta_callback=_text_cb,
-                            tool_progress_callback=event_cb,
-                            gateway_session_key=gateway_session_key,
-                            route=route,
-                            status_callback=lambda kind, text: event_cb(
-                                "run.status", preview=str(text), kind=str(kind)
-                            ),
-                        )
-
-                agent = await asyncio.get_running_loop().run_in_executor(None, _build_agent)
+                # Agent construction resolves tool definitions, which can
+                # re-run availability probes (blocking I/O); keep it off the
+                # event loop. The profile scope is re-entered on the executor
+                # thread, which does not inherit it.
+                agent = await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    self._call_in_profile_scope,
+                    request_profile,
+                    functools.partial(
+                        self._create_agent,
+                        ephemeral_system_prompt=ephemeral_system_prompt,
+                        session_id=session_id,
+                        stream_delta_callback=_text_cb,
+                        tool_progress_callback=event_cb,
+                        gateway_session_key=gateway_session_key,
+                        route=route,
+                        status_callback=lambda kind, text: event_cb(
+                            "run.status", preview=str(text), kind=str(kind)
+                        ),
+                    ),
+                )
                 self._active_run_agents[run_id] = agent
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
