@@ -2013,6 +2013,25 @@ def _looks_like_help_or_version_command(command: str) -> bool:
     )
 
 
+def _promoted_note(requested: int, notify: bool) -> str:
+    """Tell the model an over-cap foreground call was started in the background."""
+    head = (
+        f"Requested foreground timeout {requested}s exceeds the "
+        f"{FOREGROUND_MAX_TIMEOUT}s cap, so this command was started as a "
+        "tracked background process instead of being refused. Do NOT re-run it. "
+    )
+    if notify:
+        return head + (
+            "Its completion (exit code + output tail) arrives as a notification; "
+            "poll with process(action=\"poll\", session_id=...) if you need it sooner."
+        )
+    return head + (
+        "This session cannot receive completion notifications, so poll with "
+        "process(action=\"poll\", session_id=...) or process(action=\"wait\", "
+        "session_id=...) to get the result."
+    )
+
+
 def _foreground_background_guidance(command: str) -> str | None:
     """Suggest background mode when a foreground command looks long-lived.
 
@@ -2206,19 +2225,11 @@ def terminal_tool(
         default_timeout = config["timeout"]
         effective_timeout = timeout or default_timeout
 
-        # Reject foreground commands where the model explicitly requests
-        # a timeout above FOREGROUND_MAX_TIMEOUT — nudge it toward background.
-        if not background and timeout and timeout > FOREGROUND_MAX_TIMEOUT:
-            return json.dumps({
-                "error": (
-                    f"Foreground timeout {timeout}s exceeds the maximum of "
-                    f"{FOREGROUND_MAX_TIMEOUT}s. Use background=true with "
-                    f"notify_on_complete=true for long-running commands."
-                ),
-            }, ensure_ascii=False)
-
         # Guardrail: long-lived server/watch commands should run as managed
-        # background sessions, not foreground shell hacks.
+        # background sessions, not foreground shell hacks. This runs whether or
+        # not the call is promoted below: a promoted `cmd &` would start a
+        # tracked shell that exits at once while its payload runs untracked.
+        promoted_from_foreground = None
         if not background:
             guidance = _foreground_background_guidance(command)
             if guidance:
@@ -2228,6 +2239,16 @@ def terminal_tool(
                     "error": guidance,
                     "status": "error",
                 }, ensure_ascii=False)
+
+            # An explicit foreground timeout above FOREGROUND_MAX_TIMEOUT is a
+            # bounded job the caller wants to wait for (test suites, builds).
+            # Refusing it only bought a mechanical retry, so run it as a
+            # tracked background process with notify_on_complete instead and
+            # say so in the result. Only the model's explicit timeout counts,
+            # never the configured default.
+            if timeout and timeout > FOREGROUND_MAX_TIMEOUT:
+                promoted_from_foreground = timeout
+                background, notify_on_complete, watch_patterns = True, True, None
 
         # Start cleanup thread
         _start_cleanup_thread()
@@ -2694,6 +2715,12 @@ def terminal_tool(
                     proc_session.watch_patterns = list(watch_patterns)
                     result_data["watch_patterns"] = proc_session.watch_patterns
 
+                if promoted_from_foreground is not None:
+                    result_data["promoted_from_foreground"] = _promoted_note(
+                        promoted_from_foreground,
+                        bool(result_data.get("notify_on_complete")),
+                    )
+
                 return json.dumps(result_data, ensure_ascii=False)
             except Exception as e:
                 return json.dumps({
@@ -3088,7 +3115,7 @@ TERMINAL_SCHEMA = {
             },
             "timeout": {
                 "type": "integer",
-                "description": f"Max seconds to wait (default: 180, foreground max: {FOREGROUND_MAX_TIMEOUT}). Returns INSTANTLY when command finishes — set high for long tasks, you won't wait unnecessarily. Foreground timeout above {FOREGROUND_MAX_TIMEOUT}s is rejected; use background=true for longer commands.",
+                "description": f"Max seconds to wait (default: 180, foreground max: {FOREGROUND_MAX_TIMEOUT}). Returns INSTANTLY when command finishes — set high for long tasks, you won't wait unnecessarily. A foreground timeout above {FOREGROUND_MAX_TIMEOUT}s runs the command as a tracked background process with notify_on_complete=true instead (the result says so; do not re-run it).",
                 "minimum": 1
             },
             "workdir": {
