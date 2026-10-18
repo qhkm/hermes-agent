@@ -1491,6 +1491,9 @@ def restore_primary_runtime(agent) -> bool:
         # ── Reset fallback chain for the new turn ──
         agent._fallback_activated = False
         agent._fallback_index = 0
+        # Back on the primary: an anchor taken on the fallback priced the transcript differently.
+        from agent.usage_anchor import clear_usage_anchor
+        clear_usage_anchor(agent)
 
         # Reset the stale-call circuit breaker (#58962): the streak measured
         # the FALLBACK provider we're leaving; the restored primary deserves

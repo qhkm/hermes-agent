@@ -1717,6 +1717,10 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True
+        # The anchor holds the old provider's prompt_tokens; a different model/provider
+        # tokenizes and prices the transcript differently.
+        from agent.usage_anchor import clear_usage_anchor
+        clear_usage_anchor(agent)
 
         # Rebind the credential pool to the fallback provider when the provider
         # changes.  Keeping the primary pool attached would make downstream

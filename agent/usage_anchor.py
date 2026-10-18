@@ -36,8 +36,33 @@ def message_fingerprint(msg: Any) -> Optional[str]:
     return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()
 
 
+def context_fingerprint(system_prompt: Any, tools: Any) -> str:
+    """Digest of the non-message part of a request: the system prompt and the tool schema list.
+    The provider's prompt_tokens priced these too, so a change to either (prompt rewrite on
+    fallback, a toolset toggle, MCP tools appearing) makes an anchor taken before it a lie."""
+    try:
+        tools_raw = json.dumps(tools or [], sort_keys=True, default=str, ensure_ascii=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        tools_raw = repr(tools)
+    h = hashlib.sha256()
+    h.update(str(system_prompt or "").encode("utf-8", "replace"))
+    h.update(b"\x00")
+    h.update(tools_raw.encode("utf-8", "replace"))
+    return h.hexdigest()
+
+
+def agent_context_fingerprint(agent: Any) -> str:
+    """``context_fingerprint`` of what ``agent`` would send now (cached prompt + ephemeral + tools)."""
+    prompt = getattr(agent, "_cached_system_prompt", None) or ""
+    ephemeral = getattr(agent, "ephemeral_system_prompt", None)
+    if ephemeral:
+        prompt = f"{prompt}\n\n{ephemeral}"
+    return context_fingerprint(prompt, getattr(agent, "tools", None))
+
+
 def capture_usage_anchor(
     prompt_tokens: Any, completion_tokens: Any, messages: List[Dict[str, Any]],
+    context_fp: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Build a usage anchor from provider-reported usage, or None when usage is unusable."""
     try:
@@ -54,6 +79,7 @@ def capture_usage_anchor(
         "base_count": len(messages),
         "base_last_role": last.get("role") if isinstance(last, dict) else None,
         "base_last_fp": message_fingerprint(last),
+        "context_fp": context_fp,
     }
 
 
@@ -95,6 +121,17 @@ def set_usage_anchor(agent: Any, anchor: Optional[Dict[str, Any]]) -> None:
     agent._usage_anchor = anchor
 
 
+def clear_usage_anchor(agent: Any) -> None:
+    """Drop the anchor: the provider that priced it is no longer the one answering."""
+    agent._usage_anchor = None
+
+
 def agent_anchored_tokens(agent: Any, messages: List[Dict[str, Any]]) -> Optional[int]:
-    """The agent's anchored context figure for ``messages``, or None (no/stale anchor)."""
-    return anchored_context_tokens(messages, getattr(agent, "_usage_anchor", None))
+    """The agent's anchored context figure for ``messages``, or None (no/stale anchor).
+
+    An anchor that recorded a system-prompt/tool-schema digest is stale once either changed."""
+    anchor = getattr(agent, "_usage_anchor", None)
+    if isinstance(anchor, dict) and anchor.get("context_fp") is not None:
+        if anchor["context_fp"] != agent_context_fingerprint(agent):
+            return None
+    return anchored_context_tokens(messages, anchor)

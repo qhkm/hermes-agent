@@ -37,7 +37,12 @@ from agent.conversation_compression import (
     conversation_history_after_compression,
 )
 from agent.display import KawaiiSpinner
-from agent.usage_anchor import agent_anchored_tokens, capture_usage_anchor, set_usage_anchor
+from agent.usage_anchor import (
+    agent_anchored_tokens,
+    agent_context_fingerprint,
+    capture_usage_anchor,
+    set_usage_anchor,
+)
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
 from agent.turn_context import (
@@ -2465,7 +2470,10 @@ def run_conversation(
                     # Anchor the provider's real count to this transcript position so the
                     # compaction gates never fall back to the bytes/4 estimate for context
                     # already priced (the reply is appended after this point).
-                    _new_anchor = capture_usage_anchor(prompt_tokens, completion_tokens, messages)
+                    _new_anchor = capture_usage_anchor(
+                        prompt_tokens, completion_tokens, messages,
+                        context_fp=agent_context_fingerprint(agent),
+                    )
                     if _new_anchor is not None:
                         set_usage_anchor(agent, _new_anchor)
                 elif getattr(
