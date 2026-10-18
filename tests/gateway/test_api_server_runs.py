@@ -548,8 +548,8 @@ class TestRunEvents:
                 victim_run = (await victim_resp.json())["run_id"]
                 attacker_run = (await attacker_resp.json())["run_id"]
 
-                victim_ready.wait(timeout=3.0)
-                attacker_ready.wait(timeout=3.0)
+                await asyncio.to_thread(victim_ready.wait, 3.0)
+                await asyncio.to_thread(attacker_ready.wait, 3.0)
                 assert auth_adapter._run_approval_sessions[victim_run] == victim_run
                 assert auth_adapter._run_approval_sessions[attacker_run] == attacker_run
                 assert auth_adapter._run_approval_sessions[victim_run] != auth_adapter._run_approval_sessions[attacker_run]
@@ -938,7 +938,7 @@ class TestSteerRun:
 
                 start_resp = await cli.post("/v1/runs", json={"input": "hello"})
                 run_id = (await start_resp.json())["run_id"]
-                assert run_started.wait(timeout=3.0)
+                assert await asyncio.to_thread(run_started.wait, 3.0)
 
                 stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
                 assert stop_resp.status == 200
@@ -1033,6 +1033,35 @@ class TestSteerRun:
         assert status["status"] == expected_status
         assert status["pending_steer"] == expected_steer
         assert "late one" in body
+
+    @pytest.mark.asyncio
+    async def test_runs_build_the_agent_off_the_event_loop(self, adapter):
+        """Agent construction can block (tool-availability probes); it must not
+        run on the API server's event loop thread."""
+        app = _create_runs_app(adapter)
+        loop_thread = threading.get_ident()
+        build_threads = []
+
+        def _fake_create(*_a, **_kw):
+            build_threads.append(threading.get_ident())
+            agent = MagicMock()
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+            agent.run_conversation.return_value = {"final_response": "ok"}
+            return agent
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=_fake_create):
+                start_resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await start_resp.json())["run_id"]
+                for _ in range(60):
+                    if adapter._run_statuses.get(run_id, {}).get("status") == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert adapter._run_statuses[run_id]["status"] == "completed"
+        assert build_threads and build_threads[0] != loop_thread
 
     @pytest.mark.asyncio
     async def test_completed_run_without_leftover_has_no_pending_steer(self, adapter):
@@ -1246,7 +1275,7 @@ class TestRunLifecycleSweep:
                 start_resp = await cli.post("/v1/runs", json={"input": "hello"})
                 assert start_resp.status == 202
                 run_id = (await start_resp.json())["run_id"]
-                assert agent_ready.wait(timeout=3.0)
+                assert await asyncio.to_thread(agent_ready.wait, 3.0)
 
                 task = adapter._active_run_tasks[run_id]
                 assert isinstance(task, asyncio.Task)
@@ -1303,7 +1332,7 @@ class TestRunLifecycleSweep:
 
                 start_resp = await cli.post("/v1/runs", json={"input": "hello"})
                 run_id = (await start_resp.json())["run_id"]
-                assert agent_ready.wait(timeout=3.0)
+                assert await asyncio.to_thread(agent_ready.wait, 3.0)
                 expired_queue = adapter._run_streams[run_id]
                 stream_delta = mock_create.call_args.kwargs["stream_delta_callback"]
 
@@ -1416,7 +1445,7 @@ class TestStopRun:
 
                 resp = await cli.post("/v1/runs", json={"input": "hello"})
                 run_id = (await resp.json())["run_id"]
-                assert started.wait(timeout=3)
+                assert await asyncio.to_thread(started.wait, 3)
 
                 stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
                 assert stop_resp.status == 200
@@ -1453,7 +1482,7 @@ class TestStopRun:
                 run_id = data["run_id"]
 
                 # Wait for agent to start running in the thread
-                agent_ready.wait(timeout=3.0)
+                await asyncio.to_thread(agent_ready.wait, 3.0)
                 await asyncio.sleep(0.1)
 
                 # Verify agent ref is stored
@@ -1545,7 +1574,7 @@ class TestStopRun:
                 data = await resp.json()
                 run_id = data["run_id"]
 
-                agent_ready.wait(timeout=3.0)
+                await asyncio.to_thread(agent_ready.wait, 3.0)
                 await asyncio.sleep(0.1)
 
                 stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
@@ -1568,7 +1597,7 @@ class TestStopRun:
                 data = await resp.json()
                 run_id = data["run_id"]
 
-                agent_ready.wait(timeout=3.0)
+                await asyncio.to_thread(agent_ready.wait, 3.0)
                 await asyncio.sleep(0.1)
 
                 # Subscribe to events in background

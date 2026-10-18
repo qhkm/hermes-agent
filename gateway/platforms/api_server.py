@@ -5098,18 +5098,25 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="run.cancelled",
                     )
                     return
-                with self._profile_scope(request_profile):
-                    agent = self._create_agent(
-                        ephemeral_system_prompt=ephemeral_system_prompt,
-                        session_id=session_id,
-                        stream_delta_callback=_text_cb,
-                        tool_progress_callback=event_cb,
-                        gateway_session_key=gateway_session_key,
-                        route=route,
-                        status_callback=lambda kind, text: event_cb(
-                            "run.status", preview=str(text), kind=str(kind)
-                        ),
-                    )
+                def _build_agent():
+                    # Agent construction resolves tool definitions, which can
+                    # re-run availability probes (blocking I/O); keep it off
+                    # the event loop. The profile scope is re-entered here
+                    # because the executor thread does not inherit it.
+                    with self._profile_scope(request_profile):
+                        return self._create_agent(
+                            ephemeral_system_prompt=ephemeral_system_prompt,
+                            session_id=session_id,
+                            stream_delta_callback=_text_cb,
+                            tool_progress_callback=event_cb,
+                            gateway_session_key=gateway_session_key,
+                            route=route,
+                            status_callback=lambda kind, text: event_cb(
+                                "run.status", preview=str(text), kind=str(kind)
+                            ),
+                        )
+
+                agent = await asyncio.get_running_loop().run_in_executor(None, _build_agent)
                 self._active_run_agents[run_id] = agent
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
