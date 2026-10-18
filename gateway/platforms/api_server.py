@@ -1832,6 +1832,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
+        status_callback=None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1949,6 +1950,7 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
+            status_callback=status_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
@@ -4892,6 +4894,16 @@ class APIServerAdapter(BasePlatformAdapter):
                     "duration": round(kwargs.get("duration", 0), 3),
                     "error": kwargs.get("is_error", False),
                 })
+            elif event_type == "run.status":
+                # Lifecycle lines (retrying, fallback, automatic recovery waits). Consumers that
+                # do not know the event ignore it.
+                _push({
+                    "event": "run.status",
+                    "run_id": run_id,
+                    "timestamp": ts,
+                    "kind": kwargs.get("kind") or "lifecycle",
+                    "text": preview or "",
+                })
             elif event_type == "reasoning.available":
                 _push({
                     "event": "reasoning.available",
@@ -5064,6 +5076,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         tool_progress_callback=event_cb,
                         gateway_session_key=gateway_session_key,
                         route=route,
+                        status_callback=lambda kind, text: event_cb(
+                            "run.status", preview=str(text), kind=str(kind)
+                        ),
                     )
                 self._active_run_agents[run_id] = agent
 

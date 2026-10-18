@@ -47,6 +47,7 @@ from agent.turn_context import (
     reanchor_current_turn_user_idx,
 )
 from agent.turn_retry_state import TurnRetryState
+from agent.turn_recovery_autorecover import auto_recover_after_exhaustion
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
     _repair_tool_call_arguments,
@@ -4385,6 +4386,18 @@ def run_conversation(
                         retry_count = 0
                         compression_attempts = 0
                         _retry.primary_recovery_attempted = False
+                        continue
+                    # Fallback first (above); only with nothing left to move to does the bounded
+                    # auto-recovery ladder park the turn on a transient outage instead of ending
+                    # it (upstream #116353).
+                    _ladder = auto_recover_after_exhaustion(
+                        agent, api_error, classified, _retry, messages=messages,
+                        conversation_history=conversation_history, api_call_count=api_call_count,
+                    )
+                    if _ladder is not None:
+                        if _ladder["action"] == "return":
+                            return _ladder["result"]
+                        retry_count = 0
                         continue
                     # Terminal — flush buffered retry/fallback trace.
                     agent._flush_status_buffer()

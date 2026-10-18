@@ -1159,3 +1159,23 @@ class TestTurnLivenessRun:
         assert first_status["status"] == "failed"
         assert "run.completed" in second_body and "run.failed" not in second_body
         assert second_status["status"] == "completed"
+
+
+def test_run_event_callback_forwards_lifecycle_status_as_run_status():
+    """Auto-recovery waits reach /v1/runs consumers as ``run.status`` (unknown events are ignored)."""
+    import asyncio
+    from gateway.config import PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter
+
+    async def _go():
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        loop = asyncio.get_running_loop()
+        q = asyncio.Queue()
+        adapter._run_streams["r1"] = q
+        cb = adapter._make_run_event_callback("r1", loop)
+        cb("run.status", preview="⏳ Provider temporarily unavailable — retrying automatically in 15s (cycle 1/5)", kind="lifecycle")
+        event = await asyncio.wait_for(q.get(), 1)
+        assert event["event"] == "run.status" and event["kind"] == "lifecycle"
+        assert "cycle 1/5" in event["text"] and event["run_id"] == "r1"
+
+    asyncio.run(_go())

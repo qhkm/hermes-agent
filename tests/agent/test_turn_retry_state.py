@@ -29,6 +29,7 @@ EXPECTED_FIELDS = {
     "primary_recovery_attempted",
     "has_retried_429",
     "auth_failover_attempted",
+    "auto_recovery_cycles_used",
     "restart_with_compressed_messages",
     "restart_with_length_continuation",
     "restart_with_rebuilt_messages",
@@ -39,6 +40,9 @@ EXPECTED_FIELDS = {
 def test_all_guards_default_false():
     s = TurnRetryState()
     for name, value in s:
+        if name == "auto_recovery_cycles_used":
+            assert value == 0
+            continue
         assert value is False, f"{name} should default to False"
 
 
