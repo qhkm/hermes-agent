@@ -589,8 +589,15 @@ class TestDisabledToolsetsPostureToolset:
         assert "write_file" not in no_file
 
 
+from model_tools import handle_function_call as _REAL_HANDLE_FUNCTION_CALL  # noqa: E402
+
+
 class TestExecuteCodeSeesDeferredTools:
     """Tools hidden behind the tool-search bridge stay callable from scripts."""
+
+    # Bound at collection time: other test modules patch
+    # model_tools.handle_function_call from threads and can leave the module
+    # attribute pointing at their mock when this class runs.
 
     def test_execute_code_sandbox_includes_deferred_core_tools(self):
         from unittest.mock import patch
@@ -608,7 +615,7 @@ class TestExecuteCodeSeesDeferredTools:
         facing = ["terminal", "tool_search", "tool_describe", "tool_call"]
         with patch("tools.tool_search.load_config_readonly", return_value=cfg), \
              patch("model_tools.registry.dispatch", side_effect=fake_dispatch):
-            model_tools.handle_function_call(
+            _REAL_HANDLE_FUNCTION_CALL(
                 "execute_code", {"code": "print(1)"}, task_id="t",
                 enabled_tools=facing, skip_pre_tool_call_hook=True,
             )
@@ -631,7 +638,7 @@ class TestExecuteCodeSeesDeferredTools:
 
         with patch("tools.tool_search.load_config_readonly", return_value=cfg), \
              patch("model_tools.registry.dispatch", side_effect=fake_dispatch):
-            model_tools.handle_function_call(
+            _REAL_HANDLE_FUNCTION_CALL(
                 "execute_code", {"code": "print(1)"}, task_id="t",
                 enabled_tools=["terminal"], skip_pre_tool_call_hook=True,
             )
