@@ -103,3 +103,55 @@ class TestSummaryRefusalGuard:
             result = c.compress(msgs, current_tokens=999999, force=True)
         assert c._last_summary_empty_content_failure is False
         assert result != msgs
+
+
+class _StubProviderError(Exception):
+    def __init__(self, message, *, status_code=None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class TestOverloadedSummaryProvider:
+    """upstream NousResearch/hermes-agent#115906"""
+
+    def test_provider_overload_aborts_instead_of_dropping_context(self):
+        err = _StubProviderError(
+            "Our servers are currently overloaded. Please try again later.",
+            status_code=503,
+        )
+        c = _compressor()
+        c.summary_model = "test/auxiliary"
+        msgs = _msgs()
+        with patch("agent.context_compressor.call_llm", side_effect=err) as mock_call:
+            result = c.compress(msgs, current_tokens=999999, force=True)
+
+        assert mock_call.call_count == 2  # aux model, then one main-model retry
+        assert result == msgs
+        assert c._last_compress_aborted is True
+        assert c._last_summary_fallback_used is False
+        assert c._last_summary_dropped_count == 0
+        assert c._last_compression_telemetry["failure_class"] == "summary_overload_failure"
+
+    def test_overload_flag_clears_after_a_good_summary(self):
+        err = _StubProviderError("provider at capacity", status_code=529)
+        c = _compressor()
+        msgs = _msgs()
+        with patch("agent.context_compressor.call_llm", side_effect=err):
+            c.compress(msgs, current_tokens=999999, force=True)
+        assert c._last_summary_overload_failure is True
+        c._clear_compression_failure_cooldown()
+        good = _mock_response("## Goal\nFinish.\n\n## Completed Actions\n1. Did X.")
+        with patch("agent.context_compressor.call_llm", return_value=good):
+            result = c.compress(msgs, current_tokens=999999, force=True)
+        assert c._last_summary_overload_failure is False
+        assert result != msgs
+
+    def test_unrelated_failure_still_uses_fallback_summary(self):
+        c = _compressor()
+        msgs = _msgs()
+        with patch("agent.context_compressor.call_llm", side_effect=_StubProviderError("bad request", status_code=400)):
+            result = c.compress(msgs, current_tokens=999999, force=True)
+        assert c._last_summary_overload_failure is False
+        assert c._last_compress_aborted is False
+        assert c._last_summary_fallback_used is True
+        assert result != msgs

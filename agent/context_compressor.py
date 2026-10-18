@@ -1762,6 +1762,11 @@ class ContextCompressor(ContextEngine):
         # Like the flags above, compress() ABORTS and preserves the transcript
         # rather than replacing real turns with a deterministic placeholder.
         self._last_summary_empty_content_failure: bool = False
+        # Set when the summary provider reports it is overloaded (503/529,
+        # "at capacity") and the one-shot main-model retry also failed. The
+        # overload is transient, so compress() ABORTS and keeps the transcript
+        # for a later retry instead of committing the deterministic fallback.
+        self._last_summary_overload_failure: bool = False
         # retrying on the main model, record the failure so gateway /
         # CLI callers can still warn the user even though compression
         # succeeded.  Silent recovery would hide the broken config.
@@ -2866,6 +2871,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             self._last_summary_auth_failure = False
             self._last_summary_network_failure = False
             self._last_summary_empty_content_failure = False
+            self._last_summary_overload_failure = False
             return self._with_summary_prefix(summary)
         except Exception as e:
             # ``call_llm`` raises ``RuntimeError`` for two very different cases:
@@ -3040,6 +3046,14 @@ This compaction should PRIORITISE preserving all information related to the focu
             self._last_summary_empty_content_failure = (
                 isinstance(e, RuntimeError)
                 and any(m in str(e).lower() for m in ("empty content", "refusal content"))
+            )
+            self._last_summary_overload_failure = (
+                not self._last_summary_empty_content_failure
+                and not _is_access_or_quota_error
+                and (
+                    classify_api_error(e).reason is FailoverReason.overloaded
+                    or any(m in _err_str for m in ("overloaded", "at capacity", "over capacity"))
+                )
             )
             logger.warning(
                 "Failed to generate context summary: %s. "
@@ -4404,6 +4418,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             or self._last_summary_auth_failure
             or self._last_summary_network_failure
             or self._last_summary_empty_content_failure
+            or self._last_summary_overload_failure
         ):
             n_skipped = compress_end - compress_start
             self._last_summary_dropped_count = 0  # nothing actually dropped
@@ -4415,6 +4430,8 @@ This compaction should PRIORITISE preserving all information related to the focu
                 telemetry["failure_class"] = "summary_network_failure"
             elif self._last_summary_empty_content_failure:
                 telemetry["failure_class"] = "summary_empty_content_failure"
+            elif self._last_summary_overload_failure:
+                telemetry["failure_class"] = "summary_overload_failure"
             else:
                 telemetry["failure_class"] = "summary_generation_aborted"
             # Roll back the self-heal rehydration so this aborted attempt is a
@@ -4439,6 +4456,15 @@ This compaction should PRIORITISE preserving all information related to the focu
                         "aborting compression. %d message(s) preserved "
                         "unchanged; the session was NOT rotated. Retry with "
                         "/compress, or continue the conversation as-is.",
+                        n_skipped,
+                    )
+                elif self._last_summary_overload_failure:
+                    logger.warning(
+                        "Summary generation failed because the provider is "
+                        "overloaded — aborting compression. %d message(s) "
+                        "preserved unchanged; the session was NOT rotated. "
+                        "Retry with /compress once capacity recovers, or "
+                        "continue the conversation as-is.",
                         n_skipped,
                     )
                 elif self._last_summary_network_failure:
