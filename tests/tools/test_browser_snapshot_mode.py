@@ -47,6 +47,56 @@ class TestHelpers:
         assert bt._snapshot_cap() == 1000
 
 
+class TestSecretScope:
+    def test_scope_value_used_without_environ(self):
+        from agent.secret_scope import set_secret_scope, reset_secret_scope
+        tok = set_secret_scope({"JENTERA_BROWSER_SNAPSHOT": "interactive",
+                                "JENTERA_BROWSER_SNAPSHOT_MAX": "2500"})
+        try:
+            assert bt._snapshot_mode() == "interactive"
+            assert bt._snapshot_cap() == 2500
+        finally:
+            reset_secret_scope(tok)
+
+    def test_environ_fallback_when_scope_silent(self, monkeypatch):
+        from agent.secret_scope import set_secret_scope, reset_secret_scope
+        monkeypatch.setenv("JENTERA_BROWSER_SNAPSHOT", "interactive")
+        tok = set_secret_scope({})
+        try:
+            assert bt._snapshot_mode() == "interactive"
+        finally:
+            reset_secret_scope(tok)
+
+    def test_multiplex_scope_is_authoritative(self, monkeypatch):
+        from agent.secret_scope import (set_secret_scope, reset_secret_scope,
+                                        set_multiplex_active)
+        monkeypatch.setenv("JENTERA_BROWSER_SNAPSHOT", "interactive")
+        set_multiplex_active(True)
+        tok = set_secret_scope({})
+        try:
+            assert bt._snapshot_mode() == "default"
+        finally:
+            reset_secret_scope(tok)
+            set_multiplex_active(False)
+
+    def test_multiplex_unscoped_falls_back_to_default(self):
+        from agent.secret_scope import set_multiplex_active
+        set_multiplex_active(True)
+        try:
+            assert bt._snapshot_mode() == "default"
+            assert bt._snapshot_cap() == bt.SNAPSHOT_SUMMARIZE_THRESHOLD
+        finally:
+            set_multiplex_active(False)
+
+    def test_get_secret_raising_gives_defaults(self, monkeypatch):
+        import agent.secret_scope as ss
+        def boom(*a, **k):
+            raise RuntimeError("x")
+        monkeypatch.setattr(ss, "get_secret", boom)
+        assert bt._snapshot_mode() == "default"
+        assert bt._snapshot_cap() == bt.SNAPSHOT_SUMMARIZE_THRESHOLD
+
+
 class TestBrowserSnapshot:
     def _run(self, text, full=False, user_task="do it"):
         calls = []

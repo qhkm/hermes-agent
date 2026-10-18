@@ -2782,12 +2782,29 @@ def _extract_relevant_content(
         return _truncate_snapshot(snapshot_text)
 
 
+def _snapshot_setting(name: str) -> str:
+    """Read a snapshot setting through the per-turn secret scope.
+
+    The multiplexing gateway rebuilds the active profile's secrets from its
+    ``.env`` on every request, so a changed value applies on the next turn
+    without a restart. ``get_secret`` falls back to ``os.environ`` when
+    multiplexing is off. Any failure (including the fail-closed unscoped
+    read) yields "" so the caller uses its default; this never raises.
+    """
+    try:
+        from agent.secret_scope import get_secret
+        return str(get_secret(name) or "")
+    except Exception:
+        return ""
+
+
 def _snapshot_mode() -> str:
     """'interactive' when JENTERA_BROWSER_SNAPSHOT=interactive, else 'default'.
 
-    Read at call time so the switch can change without restarting.
+    Read at call time (through the secret scope) so the switch can change
+    without restarting.
     """
-    if os.environ.get("JENTERA_BROWSER_SNAPSHOT", "").strip().lower() == "interactive":
+    if _snapshot_setting("JENTERA_BROWSER_SNAPSHOT").strip().lower() == "interactive":
         return "interactive"
     return "default"
 
@@ -2799,7 +2816,7 @@ def _snapshot_cap() -> int:
     Default 6000 in interactive mode, SNAPSHOT_SUMMARIZE_THRESHOLD otherwise.
     """
     default = 6000 if _snapshot_mode() == "interactive" else SNAPSHOT_SUMMARIZE_THRESHOLD
-    raw = os.environ.get("JENTERA_BROWSER_SNAPSHOT_MAX", "").strip()
+    raw = _snapshot_setting("JENTERA_BROWSER_SNAPSHOT_MAX").strip()
     if not raw:
         return default
     try:
