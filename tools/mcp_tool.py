@@ -6056,7 +6056,12 @@ def refresh_agent_mcp_tools(
     # (``build_api_kwargs``) can't see a partial rebuild or a cross-attribute
     # half-swap. ``staged_engine_names`` are the context-engine routing names
     # this rebuild actually appended (matching agent_init's dedup-aware add).
+    _registry_count = len(new_defs)
     staged_engine_names = _reinject_post_build_tools(agent, new_defs, new_names)
+    if len(new_defs) != _registry_count:
+        # Injected tools join the canonical order: same bytes as a fresh build of this set.
+        from model_tools import canonical_tool_defs
+        new_defs = canonical_tool_defs(new_defs)
 
     # Single atomic read-diff-publish so the returned ``added`` is consistent
     # with what was actually published, even under concurrent callers, and a

@@ -2950,8 +2950,14 @@ DEFAULT_CONFIG = {
     # in the model-facing tools array with three bridge tools —
     # tool_search / tool_describe / tool_call — and surfaced on demand.
     #
-    # Core Hermes tools (terminal, read_file, write_file, patch,
-    # search_files, todo, memory, browser_*, etc.) are NEVER deferred.
+    # Core working-set tools (terminal, read_file, write_file, patch,
+    # search_files, memory, browser_*, etc.) are never deferred. A curated set
+    # of rarely used core tools (computer_use, session_search, image_generate,
+    # todo, cronjob, desktop GUI tools) is, regardless of ``enabled: auto``'s
+    # threshold: ``tools.tool_search.defer: [names]`` replaces that set
+    # (``[]`` = defer none) and ``never_defer: [names | toolset:<name>]``
+    # protects tools (default: the ``jentera`` toolset). Neither key is listed
+    # below on purpose: absent means "use the default set".
     # See tools/tool_search.py for full design notes and the
     # openclaw-tool-search-report PDF in this PR for the rationale.
     "tools": {

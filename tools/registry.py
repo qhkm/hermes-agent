@@ -527,7 +527,12 @@ class ToolRegistry:
     # Schema retrieval
     # ------------------------------------------------------------------
 
-    def get_definitions(self, tool_names: Set[str], quiet: bool = False) -> List[dict]:
+    def get_definitions(
+        self,
+        tool_names: Set[str],
+        quiet: bool = False,
+        verdicts: Optional[Dict[Callable, bool]] = None,
+    ) -> List[dict]:
         """Return OpenAI-format tool schemas for the requested tool names.
 
         Only tools whose ``check_fn()`` returns True (or have no check_fn)
@@ -537,6 +542,10 @@ class ToolRegistry:
         etc.); TTL chosen so env-var changes (``hermes tools enable foo``)
         still take effect in near-real-time without forcing a full cache
         flush on every call.
+
+        ``verdicts``, when given, is filled with every ``check_fn`` consulted
+        and its verdict, so a caller that memoizes the result can tell later
+        whether an availability flip has made it stale.
         """
         result = []
         # Per-call cache on top of the 30 s TTL — handles repeat probes of the
@@ -551,6 +560,8 @@ class ToolRegistry:
             if entry.check_fn:
                 if entry.check_fn not in check_results:
                     check_results[entry.check_fn] = _check_fn_cached(entry.check_fn)
+                    if verdicts is not None:
+                        verdicts[entry.check_fn] = check_results[entry.check_fn]
                 if not check_results[entry.check_fn]:
                     if not quiet:
                         logger.debug("Tool %s unavailable (check failed)", name)
