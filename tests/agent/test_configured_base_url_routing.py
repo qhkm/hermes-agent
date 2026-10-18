@@ -325,3 +325,41 @@ def test_xai_pool_row_ignores_base_url_of_another_provider(monkeypatch):
     resolved = rp.resolve_runtime_provider(requested="xai")
 
     assert resolved["base_url"] == "https://api.x.ai/v1"
+
+
+# -- OPENAI_API_KEY must not follow the OpenRouter ladder to another host (#120299) -----------
+
+@pytest.mark.parametrize("openai_base_url, expected_key", [
+    ("https://proxy.corp.example/v1", ""),
+    ("proxy.corp.example:8080/v1", ""),  # scheme-less still names a foreign host
+    ("https://openrouter.ai/api/v1", "sk-openai-fallback"),
+    ("", "sk-openai-fallback"),
+])
+def test_openai_key_bound_to_another_host_never_reaches_openrouter(
+    monkeypatch, openai_base_url, expected_key,
+):
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {})
+    monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-fallback")
+    if openai_base_url:
+        monkeypatch.setenv("OPENAI_BASE_URL", openai_base_url)
+    else:
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+
+    resolved = rp._resolve_openrouter_runtime(requested_provider="openrouter")
+
+    assert resolved["base_url"] == "https://openrouter.ai/api/v1"
+    assert resolved["api_key"] == expected_key
+
+
+def test_jentera_key_precedence_unchanged_with_foreign_openai_base_url(write_config, monkeypatch):
+    """OPENROUTER_API_KEY still wins; a bound OPENAI_API_KEY is never the fallback."""
+    write_config(_jentera_config())
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-elsewhere")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://proxy.corp.example/v1")
+
+    resolved = rp.resolve_runtime_provider(requested="openrouter")
+
+    assert resolved["base_url"] == PROXY
+    assert resolved["api_key"] == KEY

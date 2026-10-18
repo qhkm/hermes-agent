@@ -4879,7 +4879,18 @@ class AIAgent:
         # Azure endpoints use static API keys — OAuth token rotation doesn't apply.
         # Refreshing would pick up ~/.claude/.credentials.json OAuth token and break auth.
         _base = getattr(self, "_anthropic_base_url", "") or ""
-        if "azure.com" in _base:
+        if base_url_host_matches(_base, "azure.com"):
+            return False
+        # Off the official hosts (a /anthropic proxy the resolver accepts, or a URL-bearing alias,
+        # #28660) rotate only a credential the endpoint already holds: swapping a custom key for
+        # ANTHROPIC_API_KEY / the OAuth token would leak it (#17829). Hostname match, not substring,
+        # so ``proxy.example/anthropic.com`` stays foreign (#120299).
+        _official_host = not _base or any(
+            base_url_host_matches(_base, host) for host in ("anthropic.com", "claude.com"))
+        _current_key = str(self._anthropic_api_key or "")
+        if not _official_host and not (
+            _current_key.startswith("sk-ant-") or getattr(self, "_is_anthropic_oauth", False)
+        ):
             return False
 
         try:

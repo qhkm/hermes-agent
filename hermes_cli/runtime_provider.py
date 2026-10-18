@@ -1145,10 +1145,14 @@ def _resolve_openrouter_runtime(
         and base_url == cfg_base_url.strip().rstrip("/")
     )
     if _is_openrouter_context:
+        # OPENAI_API_KEY is a legacy home for an OpenRouter key -- unless OPENAI_BASE_URL binds it
+        # to another host, where sending it here leaks that host's credential (#120299).
+        openai_base_host = base_url_hostname(_getenv("OPENAI_BASE_URL", "").strip())
+        openai_key_ok = not openai_base_host or openai_base_host == base_url_hostname(base_url)
         api_key_candidates = [
             explicit_api_key,
             _getenv("OPENROUTER_API_KEY"),
-            _getenv("OPENAI_API_KEY"),
+            _getenv("OPENAI_API_KEY") if openai_key_ok else "",
         ]
     else:
         # Custom endpoint: use api_key from config when using config base_url (#1760).
