@@ -23,8 +23,14 @@ pair and revalidated at the commit point under the lock shared with
 surfaced is never aborted.
 
 Jentera port: this fork has no durable turn lease, so the upstream lease
-deactivation and the ``require_generation`` interrupt claim are omitted; the
-revalidation and the interrupt both happen inside the activity lock instead.
+deactivation and the ``require_generation`` interrupt claim are omitted. The generation
+revalidation and the abort decision happen inside the activity lock; ``interrupt()`` itself runs
+just after the lock is released. It is deliberately not called under the lock: it runs arbitrary
+callbacks (request-abort closures that close sockets, child-agent interrupts, tool-thread
+signalling), none of which can be shown to avoid ``_touch_activity``, and the lock is a plain
+non-reentrant ``Lock``, so a callback that stamped activity would deadlock the agent. Once the
+decision is committed, a later ``_touch_activity`` cannot undo it: nothing clears the
+interrupt except the turn finalizer.
 """
 
 from __future__ import annotations

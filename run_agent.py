@@ -3410,8 +3410,11 @@ class AIAgent:
         self._turn_liveness_turn_active = True
 
         def _commit_abort(snapshot, message: str) -> bool:
-            # Revalidate and interrupt under the lock `_touch_activity` uses,
-            # so a turn that resumed since the sample is never aborted.
+            # Revalidate and record the abort under the lock `_touch_activity`
+            # uses, so a turn that resumed since the sample is never aborted.
+            # interrupt() runs after the lock is released on purpose: it calls
+            # arbitrary callbacks and the lock is not reentrant (see the
+            # agent/turn_liveness.py docstring).
             with lock:
                 if not self._turn_liveness_turn_active or stop_event.is_set():
                     return False
