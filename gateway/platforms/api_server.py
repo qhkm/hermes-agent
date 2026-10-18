@@ -4865,6 +4865,30 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_statuses[run_id] = current
         return current
 
+    @staticmethod
+    def _merge_late_steer(agent: Any, result: Any) -> Optional[str]:
+        """Return the run's undelivered steer text, including late arrivals.
+
+        Combines ``result["pending_steer"]`` (drained by the turn finalizer on
+        the worker thread) with anything accepted since.
+        """
+        existing = result.get("pending_steer") if isinstance(result, dict) else None
+        if not isinstance(existing, str) or not existing.strip():
+            existing = None
+        late = None
+        drain = getattr(agent, "_drain_pending_steer", None)
+        if callable(drain):
+            try:
+                drained = drain()
+            except Exception:
+                logger.debug("[api_server] late steer drain failed", exc_info=True)
+                drained = None
+            if isinstance(drained, str) and drained.strip():
+                late = drained
+        if existing and late:
+            return existing + "\n" + late
+        return existing or late
+
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
         def _push(event: Dict[str, Any]) -> None:
@@ -5206,6 +5230,12 @@ class APIServerAdapter(BasePlatformAdapter):
                             + str(agent._turn_liveness_aborted)
                         )
                 result, usage = _run_future.result()
+                # The run is still "running" until this point, so a steer can
+                # have been accepted after the finalizer's own drain on the
+                # worker thread. Drain again here, on the loop and before any
+                # terminal status is written, and carry it on the terminal
+                # event so the client can replay it as the next turn.
+                pending_steer = self._merge_late_steer(agent, result)
                 if run_id in self._stopping_run_ids:
                     _put_event_if_active({
                         "event": "run.cancelled",
@@ -5229,12 +5259,14 @@ class APIServerAdapter(BasePlatformAdapter):
                         "run_id": run_id,
                         "timestamp": time.time(),
                         "error": error_msg,
+                        **({"pending_steer": pending_steer} if pending_steer else {}),
                     })
                     self._set_run_status(
                         run_id,
                         "failed",
                         error=error_msg,
                         last_event="run.failed",
+                        **({"pending_steer": pending_steer} if pending_steer else {}),
                     )
                 else:
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
@@ -5242,7 +5274,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     # into result["pending_steer"] by the turn finalizer; carry
                     # it on the terminal event/status so clients can replay it
                     # as the next user turn instead of losing it.
-                    pending_steer = result.get("pending_steer") if isinstance(result, dict) else None
                     completed_event = {
                         "event": "run.completed",
                         "run_id": run_id,

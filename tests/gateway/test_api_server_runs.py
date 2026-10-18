@@ -995,6 +995,46 @@ class TestSteerRun:
         assert "run.completed" in body and "tighten the ending" in body
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "result, expected_status, expected_steer",
+        [
+            ({"final_response": "done"}, "completed", "late one"),
+            ({"final_response": "done", "pending_steer": "early"}, "completed", "early\nlate one"),
+            ({"failed": True, "error": "boom"}, "failed", "late one"),
+            ({"failed": True, "error": "boom", "pending_steer": "early"}, "failed", "early\nlate one"),
+        ],
+    )
+    async def test_steer_after_finalizer_drain_reaches_terminal_status(
+        self, adapter, result, expected_status, expected_steer
+    ):
+        """A steer accepted after the finalizer's drain (the run is still
+        'running') is drained on the loop and carried on the terminal state."""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_agent.run_conversation.return_value = result
+                mock_agent._drain_pending_steer.return_value = "late one"
+                mock_create.return_value = mock_agent
+
+                start_resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await start_resp.json())["run_id"]
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+                for _ in range(40):
+                    if adapter._run_statuses.get(run_id, {}).get("status") == expected_status:
+                        break
+                    await asyncio.sleep(0.05)
+
+        status = adapter._run_statuses[run_id]
+        assert status["status"] == expected_status
+        assert status["pending_steer"] == expected_steer
+        assert "late one" in body
+
+    @pytest.mark.asyncio
     async def test_completed_run_without_leftover_has_no_pending_steer(self, adapter):
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:
