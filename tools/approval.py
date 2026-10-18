@@ -602,6 +602,62 @@ def _sudo_stdin_block_result(description: str) -> dict:
 
 
 # =========================================================================
+# Cloud metadata endpoint (IMDS) detection
+# =========================================================================
+
+# 169.254.169.254 (AWS/Azure/GCP/OpenStack/DO/Oracle), its AWS IPv6 form
+# fd00:ec2::254, Alibaba Cloud's 100.100.100.200, and the GCP hostname.
+_IMDS_PATTERN = (
+    r'(?<![\d.])(?:169\.254\.169\.254|100\.100\.100\.200)(?![\d.])'
+    r'|(?<![\w.-])metadata\.google\.internal(?![\w.-])'
+    r'|fd00:ec2::254'
+)
+_IMDS_DESCRIPTION = "cloud metadata endpoint access (instance credentials)"
+_IMDS_RE = re.compile(_IMDS_PATTERN, re.IGNORECASE)
+
+
+def _imds_deny_enabled() -> bool:
+    """True when ``security.imds`` is ``deny`` in config.yaml.
+
+    Jentera: a Hermes approval becomes a card shown to a non-technical business
+    owner, who cannot judge a "cloud metadata credential fetch". ``deny`` refuses
+    it outright with no approval request; the default ``approve`` keeps upstream's
+    behaviour (flag it for approval).
+    """
+    try:
+        from hermes_cli.config import load_config
+        security = (load_config() or {}).get("security", {}) or {}
+        return str(security.get("imds", "approve")).strip().lower() == "deny"
+    except Exception:
+        return False
+
+
+def _imds_deny_block_result() -> dict:
+    """Build the block result for an IMDS match under ``security.imds: deny``."""
+    return {
+        "approved": False,
+        "imds_deny": True,
+        "message": (
+            "blocked: cloud metadata endpoint. Fetching instance-metadata "
+            "addresses (169.254.169.254, metadata.google.internal and the like) "
+            "is not allowed. Do not retry or rephrase it; use a different approach."
+        ),
+    }
+
+
+def _check_imds_deny(command: str) -> Optional[dict]:
+    """Return a block result when ``security.imds`` is ``deny`` and *command*
+    touches a cloud metadata endpoint, else None. Fires before the yolo bypass."""
+    if not _imds_deny_enabled():
+        return None
+    for command_variant in _command_detection_variants(command):
+        if _IMDS_RE.search(command_variant):
+            logger.warning("IMDS deny: blocked command: %s", command[:200])
+            return _imds_deny_block_result()
+    return None
+
+
+# =========================================================================
 # Dangerous command patterns
 # =========================================================================
 
@@ -653,6 +709,15 @@ DANGEROUS_PATTERNS = [
     # Remote content executed via command substitution: eval/source/. $(curl ...)
     # or `wget ...`. Equivalent to piping remote content to a shell.
     (r'(?:\beval\b|\bsource\b|\.)\s*(?:\$\(\s*|`\s*)(?:curl|wget)\b', "execute remote content via command substitution"),
+    # Cloud instance-metadata (IMDS) credential endpoints (upstream 24692ee790).
+    # On a cloud VM these serve live IAM/service-account credentials to ANY local
+    # process with no auth, so a fetch is credential exfiltration unless the operator
+    # expects it. The host literals have no other use, so their appearance ANYWHERE in
+    # the command (any HTTP client, env assignment, script argument) is the signal;
+    # lookarounds keep other 169.254.x.x link-local addresses and longer dotted strings
+    # out. This prompts for approval by default; security.imds: deny (Jentera) blocks
+    # it outright instead — see _imds_deny_enabled().
+    (_IMDS_PATTERN, _IMDS_DESCRIPTION),
     # Decode-and-execute: encoded/transformed content piped to a shell. Without
     # these, `echo <base64> | base64 -d | bash` silently runs `rm -rf /` or any
     # other command because the raw text carries no dangerous keywords.
@@ -3073,6 +3138,10 @@ def check_dangerous_command(command: str, env_type: str,
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
 
+    imds_block = _check_imds_deny(command)
+    if imds_block is not None:
+        return imds_block
+
     # --yolo: bypass all approval prompts. Gateway /yolo is session-scoped;
     # CLI --yolo remains process-scoped via the env var for local use.
     if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
@@ -3383,6 +3452,10 @@ def check_all_command_guards(command: str, env_type: str,
         logger.warning("User deny rule %r blocked command: %s",
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
+
+    imds_block = _check_imds_deny(command)
+    if imds_block is not None:
+        return imds_block
 
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
@@ -3827,6 +3900,11 @@ def check_execute_code_guard(code: str, env_type: str,
         return {"approved": True, "message": None}
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return {"approved": True, "message": None}
+
+    # security.imds: deny — a script naming a metadata endpoint is refused outright.
+    if _imds_deny_enabled() and _IMDS_RE.search(code):
+        logger.warning("IMDS deny: blocked execute_code script")
+        return _imds_deny_block_result()
 
     # --yolo or approvals.mode=off: bypass (session- or process-scoped).
     approval_mode = _get_approval_mode()

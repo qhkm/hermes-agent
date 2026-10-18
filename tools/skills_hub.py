@@ -291,8 +291,22 @@ def _resolve_lock_install_path(install_path: str, skill_name: str) -> Path:
     return target
 
 
-def _guarded_http_get(url: str, *, timeout: int = 20) -> Optional[httpx.Response]:
-    """Fetch a URL with SSRF and redirect-target validation."""
+def _ssrf_safe_http_get(url: str, *, timeout: int = 20,
+                        headers: Optional[Dict[str, str]] = None) -> httpx.Response:
+    """Fetch one URL with connect-time SSRF validation and no automatic redirects."""
+    from tools.url_safety import create_ssrf_safe_client
+
+    with create_ssrf_safe_client(timeout=timeout, follow_redirects=False) as client:
+        return client.get(url, headers=headers)
+
+
+def _guarded_http_get(url: str, *, timeout: int = 20,
+                      headers: Optional[Dict[str, str]] = None) -> Optional[httpx.Response]:
+    """Fetch a URL with SSRF and redirect-target validation (each hop re-checked).
+
+    *headers* are plain request headers (no credentials) and are sent on every hop."""
+    from tools.url_safety import SSRFConnectionBlocked
+
     current_url = url
 
     for _ in range(_MAX_SKILL_FETCH_REDIRECTS + 1):
@@ -310,8 +324,8 @@ def _guarded_http_get(url: str, *, timeout: int = 20) -> Optional[httpx.Response
             return None
 
         try:
-            resp = httpx.get(current_url, timeout=timeout, follow_redirects=False)
-        except httpx.HTTPError as exc:
+            resp = _ssrf_safe_http_get(current_url, timeout=timeout, headers=headers)
+        except (SSRFConnectionBlocked, httpx.HTTPError) as exc:
             logger.debug("Skills Hub fetch failed for %s: %s", current_url, exc)
             return None
 
@@ -1728,13 +1742,10 @@ class SkillsShSource(SkillSource):
         # Step 1: fetch the sitemap index → list of skill-sitemap URLs.
         skill_sitemap_urls: List[str] = []
         try:
-            resp = httpx.get(
-                self.SITEMAP_INDEX_URL,
-                timeout=20,
-                follow_redirects=True,
-                headers=sitemap_headers,
-            )
-            if resp.status_code != 200:
+            # Sitemap hops go through the guarded GET: the index may redirect and its
+            # <loc> entries are remote-party-controlled (upstream 3933fdf63b).
+            resp = _guarded_http_get(self.SITEMAP_INDEX_URL, timeout=20, headers=sitemap_headers)
+            if resp is None or resp.status_code != 200:
                 return self._featured_skills(limit)
             for match in self._SITEMAP_LOC_RE.finditer(resp.text):
                 loc = match.group(1).strip()
@@ -1752,13 +1763,8 @@ class SkillsShSource(SkillSource):
         results: List[SkillMeta] = []
         for sitemap_url in skill_sitemap_urls:
             try:
-                resp = httpx.get(
-                    sitemap_url,
-                    timeout=30,
-                    follow_redirects=True,
-                    headers=sitemap_headers,
-                )
-                if resp.status_code != 200:
+                resp = _guarded_http_get(sitemap_url, timeout=30, headers=sitemap_headers)
+                if resp is None or resp.status_code != 200:
                     continue
             except httpx.HTTPError:
                 continue

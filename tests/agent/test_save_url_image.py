@@ -77,13 +77,19 @@ class _TinyImageHandler(http.server.BaseHTTPRequestHandler):
 def http_server(tmp_path, monkeypatch):
     """Spin up a localhost HTTP server and isolate HERMES_HOME under tmp_path."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    # save_url_image refuses private targets by default; this opts the loopback
+    # test server in, as a LAN-hosted provider would via security.allow_private_urls.
+    monkeypatch.setenv("HERMES_ALLOW_PRIVATE_URLS", "1")
+    from tools import url_safety
+    url_safety._reset_allow_private_cache()
     (tmp_path / ".hermes").mkdir()
 
     # Force the constants/image cache helpers to re-read HERMES_HOME.
     import sys
+    saved_modules = {}
     for mod in list(sys.modules):
         if mod.startswith("hermes_constants") or mod.startswith("agent.image_gen_provider"):
-            sys.modules.pop(mod, None)
+            saved_modules[mod] = sys.modules.pop(mod)
 
     httpd = socketserver.TCPServer(("127.0.0.1", 0), _TinyImageHandler)
     port = httpd.server_address[1]
@@ -91,6 +97,12 @@ def http_server(tmp_path, monkeypatch):
     thread.start()
     yield f"http://127.0.0.1:{port}", httpd
     httpd.shutdown()
+    # Put the original modules back so later tests keep one hermes_constants.
+    for mod in [m for m in sys.modules if m.startswith("hermes_constants") or m.startswith("agent.image_gen_provider")]:
+        sys.modules.pop(mod, None)
+    sys.modules.update(saved_modules)
+    monkeypatch.delenv("HERMES_ALLOW_PRIVATE_URLS", raising=False)
+    url_safety._reset_allow_private_cache()
 
 
 class TestSaveUrlImage:
@@ -133,9 +145,9 @@ class TestSaveUrlImage:
         """HTTP errors must propagate — caller decides whether to fall back."""
         base, _ = http_server
         from agent.image_gen_provider import save_url_image
-        import requests as req_lib
+        import httpx
 
-        with pytest.raises(req_lib.HTTPError):
+        with pytest.raises(httpx.HTTPStatusError):
             save_url_image(f"{base}/404")
 
     def test_empty_body_raises_without_writing_file(self, http_server):
