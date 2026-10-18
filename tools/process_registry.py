@@ -137,6 +137,8 @@ class ProcessSession:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
+    deadline_seconds: Optional[float] = None    # Hard kill deadline (seconds after start); None = none
+    _deadline_timer: Optional[threading.Timer] = field(default=None, repr=False)
 
 
 class ProcessRegistry:
@@ -1070,6 +1072,42 @@ class ProcessRegistry:
             session.completion_reason = "exited"
         self._move_to_finished(session)
 
+    def set_deadline(self, session: ProcessSession, seconds: float) -> None:
+        """Kill ``session`` (and its process tree) ``seconds`` from now.
+
+        Used for a foreground command promoted to the background: the caller
+        asked for a bounded run, so the bound still applies. The kill goes
+        through ``kill_process`` so output, completion notification and
+        bookkeeping behave as for any other kill (``termination_source`` is
+        ``timeout``). Not persisted across a crash recovery.
+        """
+        if not seconds or seconds <= 0:
+            return
+        session.deadline_seconds = float(seconds)
+
+        def _expire() -> None:
+            if session.exited:
+                return
+            logger.warning(
+                "Process %s exceeded its %ss deadline; killing it", session.id, seconds
+            )
+            try:
+                # Mark first so the reader thread, which can see the exit
+                # before kill_process records it, reports a kill not an exit.
+                with session._lock:
+                    if session.exited:
+                        return
+                    session.completion_reason = "killed"
+                    session.termination_source = "timeout"
+                self.kill_process(session.id, source="timeout", consume_output=False)
+            except Exception:
+                logger.exception("Deadline kill failed for %s", session.id)
+
+        timer = threading.Timer(float(seconds), _expire)
+        timer.daemon = True
+        session._deadline_timer = timer
+        timer.start()
+
     def _move_to_finished(self, session: ProcessSession):
         """Move a session from running to finished.
 
@@ -1081,6 +1119,9 @@ class ProcessRegistry:
             was_running = self._running.pop(session.id, None) is not None
             self._finished[session.id] = session
         session._completion_event.set()
+        _timer = session._deadline_timer
+        if _timer is not None:
+            _timer.cancel()
         self._write_checkpoint()
 
         # Only enqueue completion notification on the FIRST move.  Without

@@ -56,6 +56,57 @@ class TestForegroundTimeoutCap:
         time.sleep(0.3)
         assert marker.read_text().count("x") == 1  # ran exactly once, in the background
 
+    def test_promoted_command_is_killed_at_its_requested_timeout(self, tmp_path, monkeypatch):
+        """The requested timeout stays a hard deadline after promotion."""
+        import time
+        import tools.terminal_tool as tt
+        from tools.process_registry import process_registry
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hh"))
+        monkeypatch.setattr(tt, "FOREGROUND_MAX_TIMEOUT", 1)
+        with patch("tools.terminal_tool._get_env_config", return_value=_make_env_config(cwd=str(tmp_path))), \
+             patch("tools.terminal_tool._start_cleanup_thread"), \
+             patch("gateway.session_context.async_delivery_supported", return_value=True), \
+             patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
+            result = json.loads(tt.terminal_tool(command="sleep 60", timeout=2))
+
+        assert result.get("error") is None
+        assert "killed if it runs longer" in result["promoted_from_foreground"]
+        session = process_registry.get(result["session_id"])
+        assert session is not None and session.deadline_seconds == 2
+        try:
+            time.sleep(0.5)
+            assert not session.exited  # not killed early
+            end = time.time() + 8
+            while not session.exited and time.time() < end:
+                time.sleep(0.1)
+            assert session.exited
+            assert session.completion_reason == "killed"
+            assert session.termination_source == "timeout"
+            assert not process_registry._is_host_pid_alive(session.pid)
+        finally:
+            process_registry.kill_process(result["session_id"])
+
+    def test_deadline_timer_is_cancelled_when_process_finishes(self, tmp_path, monkeypatch):
+        import time
+        import tools.terminal_tool as tt
+        from tools.process_registry import process_registry
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hh"))
+        monkeypatch.setattr(tt, "FOREGROUND_MAX_TIMEOUT", 1)
+        with patch("tools.terminal_tool._get_env_config", return_value=_make_env_config(cwd=str(tmp_path))), \
+             patch("tools.terminal_tool._start_cleanup_thread"), \
+             patch("gateway.session_context.async_delivery_supported", return_value=True), \
+             patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
+            result = json.loads(tt.terminal_tool(command="true", timeout=300))
+        session = process_registry.get(result["session_id"])
+        end = time.time() + 5
+        while not session.exited and time.time() < end:
+            time.sleep(0.05)
+        time.sleep(0.2)
+        assert session.completion_reason == "exited"
+        assert not session._deadline_timer.is_alive()
+
     def test_promotion_without_async_delivery_tells_model_to_poll(self, tmp_path, monkeypatch):
         """Stateless sessions (API server) cannot receive a completion; the note must say poll."""
         from tools.terminal_tool import terminal_tool

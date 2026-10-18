@@ -2019,6 +2019,7 @@ def _promoted_note(requested: int, notify: bool) -> str:
         f"Requested foreground timeout {requested}s exceeds the "
         f"{FOREGROUND_MAX_TIMEOUT}s cap, so this command was started as a "
         "tracked background process instead of being refused. Do NOT re-run it. "
+        f"It is still limited to {requested}s and is killed if it runs longer. "
     )
     if notify:
         return head + (
@@ -2503,6 +2504,12 @@ def terminal_tool(
                         task_id=effective_task_id,
                         session_key=session_key,
                     )
+
+                # A command promoted from the foreground keeps the timeout the
+                # caller asked for as a hard deadline; the registry kills the
+                # whole process tree when it passes.
+                if promoted_from_foreground:
+                    process_registry.set_deadline(proc_session, promoted_from_foreground)
 
                 result_data = {
                     "output": "Background process started",
