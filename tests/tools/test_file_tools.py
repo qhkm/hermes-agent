@@ -871,3 +871,53 @@ class TestSilentFileMisplacementE2E:
             "file silently misplaced into config default (the #26211 bug)"
 
         tt.clear_session_cwd(task_id)
+
+
+class TestSecretFileReadRedaction:
+    """Upstream #110567/#111422: read_file / search_files classify the resolved path and mask
+    opaque credentials in secret-bearing files only."""
+
+    SYNTH = "3JcQ1UqZ8mNp4Rt6vWx2Yb9Ad0Ef7Gh5Ij2kS"
+
+    @patch("tools.file_tools._get_file_ops")
+    def _read(self, name, tmp_path, mock_get):
+        f = tmp_path / name
+        f.write_text("x")
+        result_obj = MagicMock()
+        content = f"1|ADS_API_TOKEN: {self.SYNTH}"
+        result_obj.content = content
+        result_obj.to_dict.return_value = {"content": content, "total_lines": 1}
+        mock_get.return_value.read_file.return_value = result_obj
+        from tools.file_tools import read_file_tool
+        return json.loads(read_file_tool(str(f)))
+
+    def test_shell_rc_is_masked(self, tmp_path):
+        out = self._read(".zshrc", tmp_path)
+        assert self.SYNTH not in out["content"]
+
+    def test_source_file_is_untouched(self, tmp_path):
+        out = self._read("settings.py", tmp_path)
+        assert self.SYNTH in out["content"]
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_search_masks_only_secret_files(self, mock_get, tmp_path):
+        class M:
+            def __init__(self, path):
+                self.path = path
+                self.content = f"3:ADS_API_TOKEN: {TestSecretFileReadRedaction.SYNTH}"
+
+        class R:
+            def __init__(self, matches):
+                self.matches = matches
+                self.files = []
+                self.counts = {}
+
+            def to_dict(self, densify=False):
+                return {"matches": [{"path": m.path, "content": m.content} for m in self.matches]}
+
+        mock_get.return_value.search.return_value = R([M(str(tmp_path / ".bashrc")), M(str(tmp_path / "a.py"))])
+        from tools.file_tools import search_tool
+        out = json.loads(search_tool("TOKEN", path=str(tmp_path)))
+        by_path = {m["path"].rsplit("/", 1)[-1]: m["content"] for m in out["matches"]}
+        assert self.SYNTH not in by_path[".bashrc"]
+        assert self.SYNTH in by_path["a.py"]

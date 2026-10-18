@@ -329,7 +329,48 @@ def _build_provider_env_blocklist() -> frozenset:
     return frozenset(blocked)
 
 
-_HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist()
+# Secrets Hermes' own surfaces read in code that no OPTIONAL_ENV_VARS / plugin manifest declares
+# (upstream #125755): gateway env-override rows and adapter-only reads. Declared names only -- a
+# user's own ``SLACK_USER_TOKEN`` or ``LOCAL_LLM_API_KEY`` is not Hermes's and stays visible.
+# ``tests/tools/test_child_env_secrets.py`` scans gateway/config.py and the platform adapters
+# for secret-named reads so a new one cannot slip past this list.
+_CODE_ONLY_ADAPTER_SECRET_ENV = frozenset({
+    "FEISHU_ENCRYPT_KEY", "FEISHU_VERIFICATION_TOKEN", "WEIXIN_TOKEN",
+    "WHATSAPP_CLOUD_ACCESS_TOKEN", "WHATSAPP_CLOUD_APP_SECRET", "WHATSAPP_CLOUD_VERIFY_TOKEN",
+    "YUANBAO_APP_KEY", "YUANBAO_APP_SECRET",
+    "PHOTON_SIDECAR_TOKEN", "TELEGRAM_WEBHOOK_SECRET", "TEAMS_GRAPH_ACCESS_TOKEN",
+    "TEAMS_INCOMING_WEBHOOK_URL",
+    "MSGRAPH_CLIENT_SECRET", "MSGRAPH_WEBHOOK_CLIENT_STATE", "QQ_STT_API_KEY",
+})
+
+# Hermes' own secrets read in code: the anonymous-inference secret, dashboard auth (basic, OIDC,
+# drain) and the Google Meet realtime key. They let a holder mint or forge dashboard sessions;
+# no child, credentialed CLIs included, consumes them.
+_HERMES_OWN_SECRET_ENV = frozenset({
+    "HERMES_ANON_API_SECRET", "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD",
+    "HERMES_DASHBOARD_BASIC_AUTH_SECRET", "HERMES_DASHBOARD_DRAIN_SECRET",
+    "HERMES_DASHBOARD_OIDC_CLIENT_SECRET", "HERMES_MEET_REALTIME_KEY",
+})
+
+
+def _build_adapter_secret_env() -> frozenset:
+    """Secrets the messaging adapters declare: the ``password`` messaging entries of
+    OPTIONAL_ENV_VARS (core entries plus the platform plugin manifests injected into it) and the
+    code-only list above. These are Tier 1: stripped from every child, ``inherit_credentials``
+    or not, and never re-allowed by skill or config passthrough."""
+    names: set[str] = set(_CODE_ONLY_ADAPTER_SECRET_ENV)
+    try:
+        from hermes_cli.config import OPTIONAL_ENV_VARS
+        names.update(name for name, meta in OPTIONAL_ENV_VARS.items()
+                     if meta.get("category") == "messaging" and meta.get("password"))
+    except ImportError:
+        pass
+    return frozenset(names)
+
+
+_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist()
+_ADAPTER_SECRET_ENV = _build_adapter_secret_env()
+_HERMES_PROVIDER_ENV_BLOCKLIST = _PROVIDER_ENV_BLOCKLIST | _ADAPTER_SECRET_ENV | _HERMES_OWN_SECRET_ENV
 
 # Active-virtualenv markers that must NOT leak into terminal subprocesses.
 # The gateway runs inside its own venv, so its process environment carries
@@ -448,6 +489,29 @@ def _inject_session_context_env(env: dict) -> None:
             env.pop(var_name, None)
 
 
+# JENTERA: names the agent's terminal children must keep seeing even though they are Tier-2
+# provider/tool credentials. Jentera's ``jentera-calendar`` / ``jentera-bukku`` / ``jentera-threads``
+# tools reach the connector API with OPENROUTER_API_KEY + OPENROUTER_BASE_URL from their own
+# environment, and the rest are the runtime variables the sprite's commands rely on. Extend with
+# ``HERMES_CHILD_ENV_KEEP`` (comma-separated names, read from the Hermes process environment).
+# The keep-list can only rescue Tier-2 blocklist entries: Tier-1 secrets (``_ALWAYS_STRIP_KEYS``,
+# which includes every declared adapter secret) are never kept, whatever the list says.
+# OPENROUTER_API_KEY / OPENROUTER_BASE_URL are deliberately absent: the model key stays
+# out of the agent's terminal, as before this port. Jentera's connector tools read both
+# from $HERMES_HOME/.env themselves (runner/bin/jentera-calendar.mjs loadRuntimeEnv).
+_JENTERA_CHILD_ENV_KEEP_DEFAULT = frozenset({
+    "JENTERA_RUN_ID", "HERMES_HOME", "HOME", "PATH", "DISPLAY", "PLAYWRIGHT_BROWSERS_PATH",
+})
+
+
+def _child_env_keep() -> frozenset:
+    """Jentera keep-list in effect: defaults plus ``HERMES_CHILD_ENV_KEEP``, minus Tier 1."""
+    names = set(_JENTERA_CHILD_ENV_KEEP_DEFAULT)
+    extra = os.environ.get("HERMES_CHILD_ENV_KEEP", "")
+    names.update(n.strip() for n in extra.split(",") if n.strip())
+    return frozenset(names - _ALWAYS_STRIP_KEYS)
+
+
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
     """Filter Hermes-managed secrets from a subprocess environment."""
     try:
@@ -456,13 +520,14 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
         _is_passthrough = lambda _: False  # noqa: E731
 
     sanitized: dict[str, str] = {}
+    keep = _child_env_keep()  # JENTERA keep-list (Tier-2 only)
 
     for key, value in (base_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             continue
         if _is_hermes_internal_secret(key):
             continue
-        if key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
+        if key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key) or key in keep:
             sanitized[key] = value
 
     for key, value in (extra_env or {}).items():
@@ -473,7 +538,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
             sanitized[real_key] = value
         elif _is_hermes_internal_secret(key):
             continue
-        elif key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
+        elif key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key) or key in keep:
             sanitized[key] = value
 
     _inject_context_hermes_home(sanitized)
@@ -533,7 +598,7 @@ _ALWAYS_STRIP_KEYS: frozenset[str] = frozenset({
     "MODAL_TOKEN_ID",
     "MODAL_TOKEN_SECRET",
     "DAYTONA_API_KEY",
-})
+}) | _ADAPTER_SECRET_ENV | _HERMES_OWN_SECRET_ENV  # every declared adapter secret is Tier 1, like the bot tokens above
 
 
 def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str]:
@@ -1132,6 +1197,7 @@ def _make_run_env(env: dict) -> dict:
     except Exception:
         _is_passthrough = lambda _: False  # noqa: E731
 
+    keep = _child_env_keep()  # JENTERA keep-list (Tier-2 only)
     merged = dict(os.environ | env)
     run_env = {}
     for k, v in merged.items():
@@ -1142,7 +1208,7 @@ def _make_run_env(env: dict) -> dict:
             run_env[real_key] = v
         elif _is_hermes_internal_secret(k):
             continue
-        elif k not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(k):
+        elif k not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(k) or k in keep:
             run_env[k] = v
     path_key = _path_env_key(run_env)
     if path_key is not None:

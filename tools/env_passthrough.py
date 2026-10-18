@@ -165,16 +165,24 @@ def is_env_passthrough(var_name: str) -> bool:
     """Check whether *var_name* is allowed to pass through to sandboxes.
 
     Returns ``True`` if the variable was registered by a skill or listed in
-    the user's ``tools.env_passthrough`` config.
+    the user's ``tools.env_passthrough`` config and is not a Hermes-managed
+    credential NOW. Ownership can change after acceptance (a platform plugin
+    registered later may declare the name), so the refusal applied at
+    registration is re-applied here, where every child builder consumes the
+    allowlist (upstream #125755).
     """
-    if var_name in _get_allowed():
-        return True
-    return var_name in _load_config_passthrough()
+    if var_name in _get_allowed() or var_name in _load_config_passthrough():
+        return not _is_hermes_provider_credential(var_name)
+    return False
 
 
 def get_all_passthrough() -> frozenset[str]:
-    """Return the union of skill-registered and config-based passthrough vars."""
-    return frozenset(_get_allowed()) | _load_config_passthrough()
+    """Return the union of skill-registered and config-based passthrough vars,
+    minus names that have become Hermes-managed credentials since acceptance."""
+    return frozenset(
+        name for name in frozenset(_get_allowed()) | _load_config_passthrough()
+        if not _is_hermes_provider_credential(name)
+    )
 
 
 def clear_env_passthrough() -> None:

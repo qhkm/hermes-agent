@@ -139,6 +139,10 @@ _ENV_ASSIGN_RE = re.compile(
 #      mid-sentence is left alone.
 # The colon-form URL guard (skip when ``://`` present) lives at the call site.
 _SECRET_CFG_NAMES = r"(?:api[ _.\-]?key|token|secret|passwd|password|credential|auth)"
+# Rendered line-number prefix: ``5|line`` (read_file), ``6:line`` (grep -n), ``7-line`` (grep -A/-B/-C
+# context lines) and ``     8\tline`` (cat -n / nl). Callers put the ONLY leading ``[ \t]*`` in front of
+# it -- stacking a second whitespace run around an optional gutter made the anchored passes quadratic.
+_LINE_NUMBER_GUTTER = r"(?:[0-9]+(?:[|:\-]|\t)[ \t]*)?"
 _CFG_VALUE = r"(['\"]?)([^\s&]+?)\2(?=[\s&]|$)"
 
 # Programmatic env lookups (``os.getenv(...)``, ``os.environ[...]``,
@@ -157,7 +161,7 @@ _CFG_DOTTED_RE = re.compile(
 )
 # Line-anchored bare key: ``password=…`` / ``export api_key=…`` at start of line.
 _CFG_ANCHORED_RE = re.compile(
-    rf"(^[ \t]*(?:export[ \t]+)?[A-Za-z0-9_\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_\-]*)={_CFG_VALUE}",
+    rf"(^[ \t]*{_LINE_NUMBER_GUTTER}(?:export[ \t]+)?[A-Za-z0-9_\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_\-]*)={_CFG_VALUE}",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -171,7 +175,7 @@ _CFG_ANCHORED_RE = re.compile(
 # the ``token`` keyword. Quoted values defer to _JSON_FIELD_RE via the lookahead.
 _YAML_CFG_NAMES = r"(?:api[ _.\-]?key|token|secret|passwd|password|credential)"
 _YAML_ASSIGN_RE = re.compile(
-    rf"(^[ \t]*[A-Za-z0-9_.\-]*{_YAML_CFG_NAMES}[A-Za-z0-9_.\-]*)(:[ \t]*)(?!['\"])([^\s&]+)",
+    rf"(^[ \t]*{_LINE_NUMBER_GUTTER}[A-Za-z0-9_.\-]*{_YAML_CFG_NAMES}[A-Za-z0-9_.\-]*)(:[ \t]*)(?!['\"])([^\s&]+)",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -540,12 +544,30 @@ def _mask_token_nonreusable(token: str) -> str:
     return f"«redacted:{label}…»" if label else "«redacted-secret»"
 
 
+_PASSWORD_KEY_RE = re.compile(r"passwd|password|pass|pw", re.IGNORECASE)
+_PATH_OR_VAR_VALUE_RE = re.compile(r"[$/~]")
+
+
+def _keep_secret_file_value(key: str, value: str) -> bool:
+    """True when a secret-file assignment value must be left as it is.
+
+    Already-masked values (``***`` / the ``«redacted…»`` sentinel) keep the vendor
+    label an earlier pass produced. A value that starts like ``$HOME/...``, ``/usr/...``
+    or ``~/...`` is a variable or path reference, not a credential
+    (``SSH_AUTH_SOCK=$HOME/.ssh/agent.sock``) -- only password-class keys mask those.
+    """
+    if value == "***" or value.startswith("«redacted"):
+        return True
+    return bool(_PATH_OR_VAR_VALUE_RE.match(value)) and not _PASSWORD_KEY_RE.search(key)
+
+
 def redact_sensitive_text(
     text: str,
     *,
     force: bool = False,
     code_file: bool = False,
     file_read: bool = False,
+    secret_file: bool = False,
     redact_url_credentials: bool = False,
 ) -> str:
     """Apply all redaction patterns to a block of text.
@@ -576,6 +598,16 @@ def redact_sensitive_text(
     usable key or written back as one. Implies code_file=True (config/data
     files shouldn't trigger the source-code ENV/JSON false-positive paths).
 
+    Set secret_file=True when the caller has classified the SOURCE as
+    secret-bearing (``_is_secret_file_arg``: ``.env``-style files, shell rc
+    files, Hermes' ``config.yaml``). It re-enables the ENV/JSON/YAML assignment
+    passes that file_read would otherwise skip, so an opaque prefix-less
+    credential on a credential-shaped key is masked instead of returned in
+    cleartext (upstream #110567/#111422). With file_read=True those assignments
+    use the non-reusable sentinel too, so the #35519 write-back hazard stays
+    closed. secret_file wins over code_file/file_read. Ordinary source and
+    project config files are unaffected (``MAX_TOKENS: 100`` fixtures stay).
+
     Performance: each regex pattern is gated behind a cheap substring
     pre-check (e.g. ``"=" in text`` for ENV assignments, ``"://" in text``
     for URLs, ``"eyJ" in text`` for JWTs). On a typical hermes log line
@@ -596,8 +628,14 @@ def redact_sensitive_text(
 
     # file_read content shouldn't hit the source-code ENV/JSON false-positive
     # paths either (it's config/data, not log lines).
+    # ``secret_file`` is authoritative: a caller that classified the source as
+    # secret-bearing must not be made fail-open by code_file/file_read.
     if file_read:
         code_file = True
+    if secret_file:
+        code_file = False
+    # Non-reusable sentinel for assignments read from a file (see #35519).
+    _assign_mask = _mask_token_nonreusable if file_read else _mask_token
 
     # Known prefixes (sk-, ghp_, etc.) — gate on substring presence
     if _has_known_prefix_substring(text):
@@ -614,7 +652,9 @@ def redact_sensitive_text(
                 # prose/log contexts (issue #2852): ``KEY=os.getenv('X')``.
                 if _ENV_LOOKUP_VALUE_RE.match(value):
                     return m.group(0)
-                return f"{name}={quote}{_mask_token(value)}{quote}"
+                if secret_file and _keep_secret_file_value(name, value):
+                    return m.group(0)
+                return f"{name}={quote}{_assign_mask(value)}{quote}"
             text = _ENV_ASSIGN_RE.sub(_redact_env, text)
             # Lowercase/dotted config keys (issue #16413). Skip URLs entirely —
             # web-URL query params are intentionally passed through (see note
@@ -633,7 +673,9 @@ def redact_sensitive_text(
                 # not a leaked secret value.
                 if _ENV_LOOKUP_VALUE_RE.match(value):
                     return m.group(0)
-                return f'{key}: "{_mask_token(value)}"'
+                if secret_file and _keep_secret_file_value(key, value):
+                    return m.group(0)
+                return f'{key}: "{_assign_mask(value)}"'
             text = _JSON_FIELD_RE.sub(_redact_json, text)
 
         # Unquoted YAML / colon config: password: ***  (after JSON so quoted
@@ -647,7 +689,9 @@ def redact_sensitive_text(
                 # not a leaked secret value.
                 if _ENV_LOOKUP_VALUE_RE.match(value):
                     return m.group(0)
-                return f"{key}{sep}{_mask_token(value)}"
+                if secret_file and _keep_secret_file_value(key, value):
+                    return m.group(0)
+                return f"{key}{sep}{_assign_mask(value)}"
             text = _YAML_ASSIGN_RE.sub(_redact_yaml, text)
 
     # Authorization headers — _AUTH_HEADER_RE matches any scheme after
@@ -751,6 +795,52 @@ def redact_sensitive_text(
 # legitimate source/config dumps (``MAX_TOKENS=100``, ``"apiKey": "x"``
 # fixtures, ``postgresql://{user}`` f-string templates). See issue #43025.
 _ENV_DUMP_COMMANDS = frozenset({"env", "printenv", "set", "export", "declare"})
+
+
+# Source classification for file reads (upstream #110567/#111422). A secret-bearing target
+# (``.env``-style file, shell rc/profile, Hermes' own ``config.yaml`` where tokens are
+# written) is a credential dump, so the ENV/YAML assignment pass must run on its content.
+# Arbitrary ``config.yaml`` / source files stay on the code_file path (``MAX_TOKENS: 100``).
+_SHELL_RC_BASENAMES = frozenset({
+    ".bashrc", ".bash_profile", ".bash_login", ".profile",
+    ".zshrc", ".zprofile", ".zlogin", ".zshenv",
+})
+
+
+def _is_under_hermes_home(path: str) -> bool:
+    """True when ``path`` sits under the active Hermes home or root (resolved)."""
+    from agent.file_safety import _hermes_home_path, _hermes_root_path
+
+    try:
+        target = os.path.normcase(os.path.realpath(os.path.expanduser(path)))
+        homes = (_hermes_home_path(), _hermes_root_path())
+    except (OSError, ValueError, RuntimeError):
+        return False
+    for home in homes:
+        try:
+            base = os.path.normcase(os.path.realpath(str(home)))
+        except (OSError, ValueError):
+            continue
+        if target == base or target.startswith(base + os.sep):
+            return True
+    return False
+
+
+def _is_secret_file_arg(arg: str) -> bool:
+    """``.env``-style or shell rc basename anywhere; ``config.yaml`` (and its
+    ``config.yaml.good.<stamp>`` / ``.corrupt.<stamp>`` backups) only under a ``.hermes``
+    directory or the resolved Hermes home -- never arbitrary YAML."""
+    from agent.file_safety import _BLOCKED_PROJECT_ENV_BASENAMES
+
+    path = arg.strip("\"'").replace("\\", "/")
+    parts = [part.lower() for part in path.split("/") if part]
+    if not parts:
+        return False
+    if parts[-1] in _BLOCKED_PROJECT_ENV_BASENAMES or parts[-1] in _SHELL_RC_BASENAMES:
+        return True
+    if parts[-1] != "config.yaml" and not parts[-1].startswith(("config.yaml.good.", "config.yaml.corrupt.")):
+        return False
+    return ".hermes" in parts[:-1] or _is_under_hermes_home(path)
 
 
 def is_env_dump_command(command: str | None) -> bool:

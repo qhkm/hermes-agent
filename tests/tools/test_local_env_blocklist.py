@@ -66,7 +66,7 @@ class TestProviderEnvBlocklist:
         leaked_vars = {
             "OPENAI_BASE_URL": "http://localhost:8000/v1",
             "OPENAI_API_KEY": "sk-fake-key",
-            "OPENROUTER_API_KEY": "or-fake-key",
+            "OPENROUTER_API_KEY": "sk-or-fake-key",
             "ANTHROPIC_API_KEY": "ant-fake-key",
             "LLM_MODEL": "anthropic/claude-opus-4-6",
         }
