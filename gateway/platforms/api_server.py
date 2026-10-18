@@ -987,6 +987,11 @@ except Exception:  # pragma: no cover - scanner is optional hardening
     _scan_cron_prompt = None
 
 
+# Total characters of undelivered steer text a run may hold (all pending
+# steers joined). A steer that would pass it is refused with 413.
+_STEER_MAX_PENDING_CHARS = 8000
+
+
 class APIServerAdapter(BasePlatformAdapter):
     """
     OpenAI-compatible HTTP API server adapter.
@@ -5610,6 +5615,20 @@ class APIServerAdapter(BasePlatformAdapter):
                     code="run_not_accepting_steer",
                 ),
                 status=409,
+            )
+
+        # Bound the text waiting for the next tool boundary. It is injected
+        # into a tool result, so unbounded growth would bloat the context.
+        waiting = getattr(agent, "_pending_steer", None)
+        waiting_len = len(waiting) + 1 if isinstance(waiting, str) and waiting else 0
+        if waiting_len + len(steer_text) > _STEER_MAX_PENDING_CHARS:
+            return web.json_response(
+                _openai_error(
+                    f"Steer text would exceed the {_STEER_MAX_PENDING_CHARS}-character "
+                    f"limit for guidance waiting on this run: {run_id}",
+                    code="steer_too_large",
+                ),
+                status=413,
             )
 
         try:

@@ -876,6 +876,46 @@ class TestSteerRun:
         assert adapter._run_statuses["run_ok"]["last_event"] == "run.steered"
 
     @pytest.mark.asyncio
+    async def test_steer_over_pending_cap_returns_413(self, adapter):
+        from gateway.platforms.api_server import _STEER_MAX_PENDING_CHARS
+
+        app = _create_runs_app(adapter)
+        agent = MagicMock()
+        agent.steer.return_value = True
+        agent._pending_steer = "x" * (_STEER_MAX_PENDING_CHARS - 10)
+        adapter._active_run_agents["run_big"] = agent
+        adapter._set_run_status("run_big", "running")
+
+        async with TestClient(TestServer(app)) as cli:
+            too_big = await cli.post("/v1/runs/run_big/steer", json={"input": "y" * 50})
+            payload = await too_big.json()
+            fits_text = "z" * 8
+            agent._pending_steer = "x" * (_STEER_MAX_PENDING_CHARS - 10)
+            ok = await cli.post("/v1/runs/run_big/steer", json={"input": fits_text})
+
+        assert too_big.status == 413
+        assert payload["error"]["code"] == "steer_too_large"
+        assert ok.status == 200
+        agent.steer.assert_called_once_with(fits_text)
+        assert adapter._run_statuses["run_big"]["status"] == "running"
+
+    @pytest.mark.asyncio
+    async def test_single_steer_over_cap_returns_413(self, adapter):
+        from gateway.platforms.api_server import _STEER_MAX_PENDING_CHARS
+
+        app = _create_runs_app(adapter)
+        agent = MagicMock()
+        agent._pending_steer = None
+        adapter._active_run_agents["run_one"] = agent
+        adapter._set_run_status("run_one", "running")
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/runs/run_one/steer", json={"input": "a" * (_STEER_MAX_PENDING_CHARS + 1)}
+            )
+        assert resp.status == 413
+        agent.steer.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_steer_queued_run_returns_409(self, adapter):
         app = _create_runs_app(adapter)
         adapter._set_run_status("run_q", "queued")
