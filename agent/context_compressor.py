@@ -392,6 +392,12 @@ _ACTIVE_TASK_MAX_CHARS = 1400
 # high for small/light tails, but using all 20 as a hard floor here would bring
 # back the old large-tool-output case where nothing can be compacted.
 _MAX_TAIL_MESSAGE_FLOOR = 8
+# Hard share of the context window the verbatim tail may occupy, applied to
+# the tail budget and to its 1.5x soft ceiling. Without it a high
+# ``summary_target_ratio`` (or the soft-ceiling overrun alone) lets the
+# "protected" tail be most of the request on a small window, so every
+# compaction pass reclaims nothing.
+TAIL_MAX_CONTEXT_FRACTION = 0.20
 
 # Models with context windows below this get their compression threshold
 # floored at ``_SMALL_CTX_THRESHOLD_PERCENT`` (raise-only — an explicitly
@@ -1431,7 +1437,9 @@ class ContextCompressor(ContextEngine):
         self._apply_threshold_tokens_cap()
         # Recalculate token budgets for the new context length so the
         # compressor stays calibrated after a model switch (e.g. 200K → 32K).
-        target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
+        target_tokens = self._capped_tail_budget(
+            int(self.threshold_tokens * self.summary_target_ratio), context_length,
+        )
         self.tail_token_budget = target_tokens
         self.max_summary_tokens = min(
             int(context_length * 0.05), _SUMMARY_TOKENS_CEILING,
@@ -1675,7 +1683,9 @@ class ContextCompressor(ContextEngine):
         self.compression_count = 0
 
         # Derive token budgets: ratio is relative to the threshold, not total context
-        target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
+        target_tokens = self._capped_tail_budget(
+            int(self.threshold_tokens * self.summary_target_ratio), self.context_length,
+        )
         self.tail_token_budget = target_tokens
         self.max_summary_tokens = min(
             int(self.context_length * 0.05), _SUMMARY_TOKENS_CEILING,
@@ -3964,6 +3974,23 @@ This compaction should PRIORITISE preserving all information related to the focu
             idx += 1
         return idx
 
+    @staticmethod
+    def _capped_tail_budget(budget: int, context_length: int) -> int:
+        """Cap the tail budget at ``TAIL_MAX_CONTEXT_FRACTION`` of the window."""
+        if context_length and context_length > 0:
+            budget = min(budget, int(context_length * TAIL_MAX_CONTEXT_FRACTION))
+        return max(1, budget)
+
+    def _tail_soft_ceiling(self, token_budget: int) -> int:
+        """Optional tail rows may overrun the budget by 1.5x so whole rows are
+        kept, but never past ``TAIL_MAX_CONTEXT_FRACTION`` of the window.
+        Required anchors and atomic tool groups may still exceed it."""
+        ceiling = int(token_budget * 1.5)
+        ctx = getattr(self, "context_length", 0) or 0
+        if ctx > 0:
+            ceiling = min(ceiling, int(ctx * TAIL_MAX_CONTEXT_FRACTION))
+        return max(ceiling, token_budget)
+
     def _find_tail_cut_by_tokens(
         self, messages: List[Dict[str, Any]], head_end: int,
         token_budget: int | None = None,
@@ -4001,7 +4028,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             min(min_tail_floor, compressible_tail_cap, available_tail)
             if available_tail > 1 else 0
         )
-        soft_ceiling = int(token_budget * 1.5)
+        soft_ceiling = self._tail_soft_ceiling(token_budget)
         accumulated = 0
         cut_idx = n  # start from beyond the end
 

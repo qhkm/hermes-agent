@@ -184,3 +184,56 @@ class TestTailBudgetProportionality:
         assert comp.tail_token_budget == int(comp.threshold_tokens * comp.summary_target_ratio)
         # Sanity: tail protection stays a modest slice of the window (<= 20%).
         assert comp.tail_token_budget <= comp.context_length * 0.20
+
+
+class TestTailWindowShareCap:
+    """upstream NousResearch/hermes-agent#117957"""
+
+    def test_tail_budget_never_exceeds_window_share(self):
+        from agent.context_compressor import TAIL_MAX_CONTEXT_FRACTION
+
+        for ctx in (8_192, 16_384, 32_768, 128_000):
+            with patch.object(cc, "get_model_context_length", return_value=ctx):
+                comp = ContextCompressor(
+                    model="test/model", threshold_percent=0.85,
+                    summary_target_ratio=0.80, quiet_mode=True,
+                )
+            assert 0 < comp.tail_token_budget <= ctx * TAIL_MAX_CONTEXT_FRACTION, ctx
+
+    def test_update_model_reapplies_cap(self):
+        from agent.context_compressor import TAIL_MAX_CONTEXT_FRACTION
+
+        with patch.object(cc, "get_model_context_length", return_value=1_000_000):
+            comp = ContextCompressor(
+                model="big", threshold_percent=0.85, summary_target_ratio=0.80, quiet_mode=True,
+            )
+        comp.update_model("small", 32_768)
+        assert comp.tail_token_budget <= 32_768 * TAIL_MAX_CONTEXT_FRACTION
+
+    def test_soft_ceiling_is_capped_but_never_below_budget(self):
+        comp = _make(16_384)
+        assert comp._tail_soft_ceiling(3_000) == int(16_384 * 0.20)
+        assert comp._tail_soft_ceiling(1_000) == 1_500
+        assert comp._tail_soft_ceiling(5_000) == 5_000  # budget itself always wins
+
+    def test_small_window_compress_leaves_a_real_middle(self):
+        from agent.context_compressor import TAIL_MAX_CONTEXT_FRACTION, _estimate_msg_budget_tokens
+
+        ctx = 8_192
+        comp = _make(ctx)
+        msgs: list = [{"role": "system", "content": "sys"}]
+        for i in range(12):
+            msgs.append({"role": "user", "content": f"step {i}"})
+            msgs.append({
+                "role": "assistant", "content": "",
+                "tool_calls": [{"id": f"c{i}", "type": "function",
+                                "function": {"name": "terminal", "arguments": "{}"}}],
+            })
+            msgs.append({"role": "tool", "tool_call_id": f"c{i}", "content": "x" * 4_000})
+            msgs.append({"role": "assistant", "content": f"done {i}"})
+        head_end = comp.protect_first_n
+        cut = comp._find_tail_cut_by_tokens(msgs, head_end)
+        tail_tokens = sum(_estimate_msg_budget_tokens(m) for m in msgs[cut:])
+        one_turn = sum(_estimate_msg_budget_tokens(m) for m in msgs[-4:])
+        assert tail_tokens <= ctx * TAIL_MAX_CONTEXT_FRACTION + one_turn
+        assert cut - head_end >= (len(msgs) - head_end) // 2, (head_end, cut, len(msgs))

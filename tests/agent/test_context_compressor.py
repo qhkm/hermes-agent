@@ -2581,11 +2581,17 @@ class TestSummaryTargetRatio:
     """Verify that summary_target_ratio properly scales budgets with context window."""
 
     def test_tail_budget_scales_with_context(self):
-        """Tail token budget should be threshold_tokens * summary_target_ratio."""
+        """Tail token budget is threshold_tokens * summary_target_ratio, capped at
+        TAIL_MAX_CONTEXT_FRACTION (20%) of the window (upstream #117957)."""
         with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
             c = ContextCompressor(model="test", quiet_mode=True, summary_target_ratio=0.40)
-        # 200K < 512K → threshold floored at 75%: 150K * 0.40 ratio = 60K
-        assert c.tail_token_budget == 60_000
+        # 200K < 512K → threshold floored at 75%: 150K * 0.40 = 60K, capped to 20% of 200K
+        assert c.tail_token_budget == 40_000
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
+            c = ContextCompressor(model="test", quiet_mode=True, summary_target_ratio=0.20)
+        # 150K * 0.20 = 30K, under the cap
+        assert c.tail_token_budget == 30_000
 
         with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
             c = ContextCompressor(model="test", quiet_mode=True, summary_target_ratio=0.40)
