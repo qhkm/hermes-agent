@@ -1830,9 +1830,11 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        # Kept above gateway_session_key: Jentera's bootstrap patch anchors on
+        # the last two parameters of this signature exactly.
+        status_callback=None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
-        status_callback=None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
