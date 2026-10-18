@@ -287,7 +287,10 @@ class LSPClient:
         return cmd
 
     async def _spawn(self) -> None:
-        env = dict(os.environ)
+        # Language servers are third-party binaries a write_file can start: they get the scrubbed
+        # env (no gateway tokens, no provider keys) plus their own configured env (upstream #125755).
+        from tools.environments.local import hermes_subprocess_env
+        env = hermes_subprocess_env()
         if self._env:
             env.update(self._env)
 

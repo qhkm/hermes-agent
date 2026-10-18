@@ -255,6 +255,8 @@ def _install_npm(
         return None
     staging = hermes_lsp_bin_dir().parent  # <HERMES_HOME>/lsp/
     install_targets = [pkg] + list(extra_pkgs or [])
+    # Package install scripts are third-party code: scrubbed env, never Hermes' credentials.
+    from tools.environments.local import hermes_subprocess_env
     try:
         logger.info(
             "[install] npm install --prefix %s %s",
@@ -267,6 +269,7 @@ def _install_npm(
             capture_output=True,
             text=True,
             timeout=300,
+            env=hermes_subprocess_env(),
             stdin=subprocess.DEVNULL,
         )
         if proc.returncode != 0:
@@ -305,7 +308,8 @@ def _install_go(pkg: str, bin_name: str) -> Optional[str]:
         logger.info("[install] cannot install %s: go not on PATH", pkg)
         return None
     staging = hermes_lsp_bin_dir()
-    env = dict(os.environ)
+    from tools.environments.local import hermes_subprocess_env
+    env = hermes_subprocess_env()
     env["GOBIN"] = str(staging)
     try:
         logger.info("[install] go install %s (GOBIN=%s)", pkg, staging)
