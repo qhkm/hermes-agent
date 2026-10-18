@@ -1,14 +1,16 @@
-"""Tests for /v1/runs endpoints: start, status, events, and stop.
+"""Tests for /v1/runs endpoints: start, status, events, steer, and stop.
 
 Covers:
 - POST /v1/runs — start a run (202)
 - GET /v1/runs/{run_id} — poll run status
 - GET /v1/runs/{run_id}/events — SSE event stream
+- POST /v1/runs/{run_id}/steer — inject guidance into a running agent
 - POST /v1/runs/{run_id}/stop — interrupt a running agent
 - Auth, error handling, and cleanup
 """
 
 import asyncio
+import json
 import threading
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -69,6 +71,7 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
     app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
+    app.router.add_post("/v1/runs/{run_id}/steer", adapter._handle_steer_run)
     app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
     return app
 
@@ -723,6 +726,394 @@ class TestRunApproval:
 
         assert response.status == 400
         assert payload["error"]["code"] == "invalid_approval_request_id"
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/runs/{run_id}/steer — steer a running agent
+# ---------------------------------------------------------------------------
+
+
+def _chat_completion(content=None, tool_name=None):
+    message = {"role": "assistant", "content": content}
+    finish = "stop"
+    if tool_name:
+        message["tool_calls"] = [{
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": tool_name, "arguments": "{}"},
+        }]
+        finish = "tool_calls"
+    return {
+        "id": "chatcmpl-test",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "fake-model",
+        "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+    }
+
+
+class TestSteerRun:
+    @pytest.mark.asyncio
+    async def test_steer_running_agent(self, adapter):
+        app = _create_runs_app(adapter)
+        agent = MagicMock()
+        agent.steer.return_value = True
+        queue = asyncio.Queue()
+        adapter._active_run_agents["run_123"] = agent
+        adapter._run_streams["run_123"] = queue
+        adapter._set_run_status("run_123", "running")
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/runs/run_123/steer", json={"input": "tighten the ending"})
+            payload = await resp.json()
+
+        assert resp.status == 200
+        assert payload == {"object": "hermes.run.steer", "run_id": "run_123", "accepted": True}
+        agent.steer.assert_called_once_with("tighten the ending")
+        assert adapter._run_statuses["run_123"]["last_event"] == "run.steered"
+        assert adapter._run_statuses["run_123"]["status"] == "running"
+        event = queue.get_nowait()
+        assert event["event"] == "run.steered"
+        assert event["run_id"] == "run_123"
+        assert event["accepted"] is True
+
+    @pytest.mark.asyncio
+    async def test_steer_accepts_message_and_text_aliases(self, adapter):
+        app = _create_runs_app(adapter)
+        agent = MagicMock()
+        agent.steer.return_value = True
+        adapter._active_run_agents["run_123"] = agent
+        adapter._set_run_status("run_123", "running")
+        async with TestClient(TestServer(app)) as cli:
+            r1 = await cli.post("/v1/runs/run_123/steer", json={"message": "a"})
+            r2 = await cli.post("/v1/runs/run_123/steer", json={"text": "b"})
+        assert r1.status == 200 and r2.status == 200
+        assert [c.args[0] for c in agent.steer.call_args_list] == ["a", "b"]
+
+    @pytest.mark.asyncio
+    async def test_steer_nonexistent_run_returns_404(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/runs/run_missing/steer", json={"input": "hello"})
+            payload = await resp.json()
+
+        assert resp.status == 404
+        assert payload["error"]["code"] == "run_not_found"
+
+    @pytest.mark.asyncio
+    async def test_steer_finished_run_returns_409(self, adapter):
+        app = _create_runs_app(adapter)
+        agent = MagicMock()
+        # Even a retained agent ref must not make a terminal run steerable.
+        adapter._active_run_agents["run_done"] = agent
+        adapter._set_run_status("run_done", "completed")
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/runs/run_done/steer", json={"input": "hello"})
+            payload = await resp.json()
+
+        assert resp.status == 409
+        assert payload["error"]["code"] == "run_not_accepting_steer"
+        agent.steer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_steer_queued_run_returns_409(self, adapter):
+        app = _create_runs_app(adapter)
+        adapter._set_run_status("run_q", "queued")
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/runs/run_q/steer", json={"input": "hello"})
+        assert resp.status == 409
+
+    @pytest.mark.asyncio
+    async def test_steer_missing_input_returns_400(self, adapter):
+        app = _create_runs_app(adapter)
+        agent = MagicMock()
+        agent.steer.return_value = True
+        adapter._active_run_agents["run_123"] = agent
+        adapter._set_run_status("run_123", "running")
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/runs/run_123/steer", json={"input": ""})
+            payload = await resp.json()
+
+        assert resp.status == 400
+        assert payload["error"]["code"] == "invalid_steer_input"
+        agent.steer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_steer_not_accepted_by_agent_returns_409(self, adapter):
+        app = _create_runs_app(adapter)
+        agent = MagicMock()
+        agent.steer.return_value = False
+        adapter._active_run_agents["run_123"] = agent
+        adapter._set_run_status("run_123", "running")
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/runs/run_123/steer", json={"input": "x"})
+            payload = await resp.json()
+        assert resp.status == 409
+        assert payload["error"]["code"] == "steer_not_accepted"
+
+    @pytest.mark.asyncio
+    async def test_stop_then_steer_rejects_retained_agent_ref(self, adapter):
+        """Steer must reject a stopping run even if the executor thread is still live."""
+        app = _create_runs_app(adapter)
+        run_can_finish = threading.Event()
+        run_started = threading.Event()
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_agent.steer = MagicMock(return_value=True)
+
+                def _run_conversation(*_args, **_kwargs):
+                    run_started.set()
+                    run_can_finish.wait(timeout=5)
+                    return {"final_response": "late result"}
+
+                mock_agent.interrupt = MagicMock(return_value=None)
+                mock_agent.run_conversation.side_effect = _run_conversation
+                mock_create.return_value = mock_agent
+
+                start_resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await start_resp.json())["run_id"]
+                assert run_started.wait(timeout=3.0)
+
+                stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
+                assert stop_resp.status == 200
+                assert run_id in adapter._active_run_agents
+
+                steer_resp = await cli.post(
+                    f"/v1/runs/{run_id}/steer", json={"input": "tighten the ending"}
+                )
+                steer_data = await steer_resp.json()
+
+                assert steer_resp.status == 409
+                assert steer_data["error"]["code"] == "run_not_accepting_steer"
+                mock_agent.steer.assert_not_called()
+
+                run_can_finish.set()
+                for _ in range(40):
+                    if run_id not in adapter._active_run_tasks:
+                        break
+                    await asyncio.sleep(0.05)
+
+    @pytest.mark.asyncio
+    async def test_pending_steer_preserved_on_run_completed(self, adapter):
+        """A steer left over after the final response (drained by the turn
+        finalizer into result["pending_steer"]) surfaces on the terminal run
+        status and event instead of being dropped."""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_agent.run_conversation.return_value = {
+                    "final_response": "done",
+                    "pending_steer": "tighten the ending",
+                }
+                mock_create.return_value = mock_agent
+
+                start_resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await start_resp.json())["run_id"]
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+
+                for _ in range(40):
+                    if adapter._run_statuses.get(run_id, {}).get("status") == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+                status_resp = await cli.get(f"/v1/runs/{run_id}")
+                status = await status_resp.json()
+
+        assert status["status"] == "completed"
+        assert status["pending_steer"] == "tighten the ending"
+        assert "run.completed" in body and "tighten the ending" in body
+
+    @pytest.mark.asyncio
+    async def test_completed_run_without_leftover_has_no_pending_steer(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_create.return_value = mock_agent
+                start_resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await start_resp.json())["run_id"]
+                for _ in range(40):
+                    if adapter._run_statuses.get(run_id, {}).get("status") == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+        assert "pending_steer" not in adapter._run_statuses[run_id]
+
+    @pytest.mark.asyncio
+    async def test_steer_requires_auth(self, auth_adapter):
+        app = _create_runs_app(auth_adapter)
+        agent = MagicMock()
+        auth_adapter._active_run_agents["run_any"] = agent
+        auth_adapter._set_run_status("run_any", "running")
+        async with TestClient(TestServer(app)) as cli:
+            no_key = await cli.post("/v1/runs/run_any/steer", json={"input": "hello"})
+            wrong = await cli.post(
+                "/v1/runs/run_any/steer",
+                json={"input": "hello"},
+                headers={"Authorization": "Bearer sk-wrong"},
+            )
+        assert no_key.status == 401
+        assert wrong.status == 401
+        agent.steer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_steer_via_profile_prefixed_route(self, auth_adapter):
+        """The steer route is in the route table and mirrored under /p/<profile>/."""
+        rows = auth_adapter._http_route_table()
+        assert ("POST", "/v1/runs/{run_id}/steer", auth_adapter._handle_steer_run) in rows
+
+        app = web.Application()
+        for method, path, handler in rows:
+            if path == "/v1/runs/{run_id}/steer":
+                app.router.add_route(method, f"/p/{{profile}}{path}", handler)
+        agent = MagicMock()
+        agent.steer.return_value = True
+        auth_adapter._active_run_agents["run_p"] = agent
+        auth_adapter._set_run_status("run_p", "running")
+        headers = {"Authorization": "Bearer sk-secret"}
+        async with TestClient(TestServer(app)) as cli:
+            bad = await cli.post("/p/coder/v1/runs/run_p/steer", json={"input": "x"})
+            ok = await cli.post(
+                "/p/coder/v1/runs/run_p/steer", json={"input": "go left"}, headers=headers
+            )
+        assert bad.status == 401
+        assert ok.status == 200
+        agent.steer.assert_called_once_with("go left")
+
+    @pytest.mark.asyncio
+    async def test_steer_reaches_next_model_request_end_to_end(self, adapter, monkeypatch):
+        """Real AIAgent against a fake OpenAI-compatible server: a steer sent
+        while the first model call is in flight lands in the tool result that
+        the second model request carries."""
+        from run_agent import AIAgent
+
+        requests = []
+        first_seen = threading.Event()
+        release_first = threading.Event()
+
+        async def completions(request):
+            body = await request.json()
+            requests.append(body)
+            if len(requests) == 1:
+                first_seen.set()
+                while not release_first.is_set():
+                    await asyncio.sleep(0.01)
+                payload = _chat_completion(tool_name="no_such_tool")
+            else:
+                payload = _chat_completion(content="all done")
+            if not body.get("stream"):
+                return web.json_response(payload)
+            # The agent streams by default: replay the message as SSE chunks.
+            choice = payload["choices"][0]
+            delta = dict(choice["message"])
+            if delta.get("tool_calls"):
+                delta["tool_calls"] = [dict(tc, index=0) for tc in delta["tool_calls"]]
+            base = {"id": payload["id"], "object": "chat.completion.chunk",
+                    "created": 0, "model": "fake-model"}
+            frames = [
+                dict(base, choices=[{"index": 0, "delta": delta, "finish_reason": None}]),
+                dict(base, choices=[{"index": 0, "delta": {}, "finish_reason": choice["finish_reason"]}]),
+                dict(base, choices=[], usage=payload["usage"]),
+            ]
+            resp = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+            await resp.prepare(request)
+            for frame in frames:
+                await resp.write(f"data: {json.dumps(frame)}\n\n".encode())
+            await resp.write(b"data: [DONE]\n\n")
+            return resp
+
+        # The fake model runs on its own thread and loop: AIAgent makes
+        # blocking HTTP probes (model metadata) during init, which would
+        # deadlock against a server sharing the test's event loop.
+        server_ready = threading.Event()
+        server_state = {}
+
+        def _serve():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            model_app = web.Application()
+            model_app.router.add_post("/v1/chat/completions", completions)
+            runner = web.AppRunner(model_app)
+            loop.run_until_complete(runner.setup())
+            site = web.TCPSite(runner, "127.0.0.1", 0)
+            loop.run_until_complete(site.start())
+            server_state["port"] = site._server.sockets[0].getsockname()[1]
+            server_state["loop"] = loop
+            server_ready.set()
+            loop.run_forever()
+            loop.run_until_complete(runner.cleanup())
+            loop.close()
+
+        server_thread = threading.Thread(target=_serve, daemon=True)
+        server_thread.start()
+        assert server_ready.wait(timeout=10)
+
+        app = _create_runs_app(adapter)
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                base_url = f"http://127.0.0.1:{server_state['port']}/v1"
+
+                def _create_agent(**_kwargs):
+                    return AIAgent(
+                        base_url=base_url,
+                        api_key="sk-test",
+                        model="fake-model",
+                        provider="custom",
+                        quiet_mode=True,
+                        skip_context_files=True,
+                        skip_memory=True,
+                        enabled_toolsets=[],
+                        max_iterations=5,
+                    )
+
+                with patch.object(adapter, "_create_agent", side_effect=_create_agent):
+                    start = await cli.post("/v1/runs", json={"input": "hello"})
+                    run_id = (await start.json())["run_id"]
+                    assert await asyncio.get_running_loop().run_in_executor(None, first_seen.wait, 20)
+                    for _ in range(100):
+                        if run_id in adapter._active_run_agents:
+                            break
+                        await asyncio.sleep(0.02)
+
+                    steer = await cli.post(
+                        f"/v1/runs/{run_id}/steer", json={"input": "prefer the blue option"}
+                    )
+                    assert steer.status == 200
+                    release_first.set()
+
+                    for _ in range(200):
+                        if adapter._run_statuses[run_id]["status"] in {"completed", "failed"}:
+                            break
+                        await asyncio.sleep(0.05)
+        finally:
+            release_first.set()
+            server_state["loop"].call_soon_threadsafe(server_state["loop"].stop)
+            server_thread.join(timeout=5)
+
+        status = adapter._run_statuses[run_id]
+        assert status["status"] == "completed", status
+        assert len(requests) == 2
+        assert "prefer the blue option" not in json.dumps(requests[0])
+        second = requests[1]["messages"]
+        tool_msgs = [m for m in second if m.get("role") == "tool"]
+        assert tool_msgs and "prefer the blue option" in tool_msgs[-1]["content"]
+        assert "pending_steer" not in status
 
 
 # ---------------------------------------------------------------------------
