@@ -326,14 +326,24 @@ def _build_provider_env_blocklist() -> frozenset:
     # It arrives via the registry loop above (anthropic api_key_env_vars),
     # so remove it explicitly.
     blocked.discard("CLAUDE_CODE_OAUTH_TOKEN")
+    # JENTERA: the code-only adapter names (see _CODE_ONLY_ADAPTER_SECRET_ENV) are owner-pasted
+    # keys on a sprite, and the production pin passed all of them. The port's plugin manifests now
+    # declare some of them, which would feed them back in through OPTIONAL_ENV_VARS above.
+    blocked -= _CODE_ONLY_ADAPTER_SECRET_ENV
     return frozenset(blocked)
 
 
 # Secrets Hermes' own surfaces read in code that no OPTIONAL_ENV_VARS / plugin manifest declares
-# (upstream #125755): gateway env-override rows and adapter-only reads. Declared names only -- a
-# user's own ``SLACK_USER_TOKEN`` or ``LOCAL_LLM_API_KEY`` is not Hermes's and stays visible.
-# ``tests/tools/test_child_env_secrets.py`` scans gateway/config.py and the platform adapters
-# for secret-named reads so a new one cannot slip past this list.
+# (upstream #125755): gateway env-override rows and adapter-only reads.
+#
+# JENTERA: this list is deliberately NOT part of Tier 1 (upstream strips it). A Jentera sprite
+# never runs those platforms (no Feishu, WeChat, WhatsApp Cloud, Yuanbao, Teams, MS Graph, QQ), so
+# on a sprite such a name can only be a key the OWNER pasted for a tool the agent runs
+# (``MSGRAPH_CLIENT_SECRET``, ``WHATSAPP_CLOUD_ACCESS_TOKEN``, ...). Stripping it from the agent's
+# terminal would silently break that tool, and Tier 1 cannot be restored by any allow-list. They
+# therefore behave as on the production pin. The list is kept as data (and the scan in
+# ``tests/tools/test_child_env_secrets.py`` exempts it); declared adapter ``password`` entries and
+# Hermes' own secrets below stay Tier 1.
 _CODE_ONLY_ADAPTER_SECRET_ENV = frozenset({
     "FEISHU_ENCRYPT_KEY", "FEISHU_VERIFICATION_TOKEN", "WEIXIN_TOKEN",
     "WHATSAPP_CLOUD_ACCESS_TOKEN", "WHATSAPP_CLOUD_APP_SECRET", "WHATSAPP_CLOUD_VERIFY_TOKEN",
@@ -355,16 +365,18 @@ _HERMES_OWN_SECRET_ENV = frozenset({
 
 def _build_adapter_secret_env() -> frozenset:
     """Secrets the messaging adapters declare: the ``password`` messaging entries of
-    OPTIONAL_ENV_VARS (core entries plus the platform plugin manifests injected into it) and the
-    code-only list above. These are Tier 1: stripped from every child, ``inherit_credentials``
+    OPTIONAL_ENV_VARS (core entries plus the platform plugin manifests injected into it); the
+    code-only list above is excluded on Jentera. These are Tier 1: stripped from every child, ``inherit_credentials``
     or not, and never re-allowed by skill or config passthrough."""
-    names: set[str] = set(_CODE_ONLY_ADAPTER_SECRET_ENV)
+    names: set[str] = set()  # _CODE_ONLY_ADAPTER_SECRET_ENV is intentionally excluded (see above)
     try:
         from hermes_cli.config import OPTIONAL_ENV_VARS
         names.update(name for name, meta in OPTIONAL_ENV_VARS.items()
                      if meta.get("category") == "messaging" and meta.get("password"))
     except ImportError:
         pass
+    # Some code-only names are also declared by a plugin manifest; the Jentera exemption wins.
+    names -= _CODE_ONLY_ADAPTER_SECRET_ENV
     return frozenset(names)
 
 

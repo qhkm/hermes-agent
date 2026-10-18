@@ -408,8 +408,11 @@ class TestBlocklistCoverage:
     def test_optional_tool_and_messaging_vars_are_in_blocklist(self):
         """Tool/messaging vars from OPTIONAL_ENV_VARS should stay covered."""
         from hermes_cli.config import OPTIONAL_ENV_VARS
+        from tools.environments.local import _CODE_ONLY_ADAPTER_SECRET_ENV
 
         for name, metadata in OPTIONAL_ENV_VARS.items():
+            if name in _CODE_ONLY_ADAPTER_SECRET_ENV:
+                continue  # Jentera: owner-pasted keys on a sprite, passed as on the pin
             category = metadata.get("category")
             if category in {"tool", "messaging"}:
                 assert name in _HERMES_PROVIDER_ENV_BLOCKLIST, (
