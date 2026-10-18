@@ -992,6 +992,10 @@ DEFAULT_CONFIG = {
         # ending the turn. Interrupt stops the wait; auth/format/billing/policy errors never enter.
         # 0 disables.
         "auto_recovery_cycles": 5,
+        # JENTERA-ONLY (not in upstream): wall-clock cap, in seconds from the turn's start, on
+        # the ladder above. A cycle whose wait would end past it is not started and the turn
+        # fails normally. None (default) = no cap, i.e. upstream behaviour.
+        "auto_recovery_max_seconds": None,
         "service_tier": "",
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.

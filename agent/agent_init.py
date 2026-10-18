@@ -1755,6 +1755,12 @@ def init_agent(
         agent._auto_recovery_cycles = max(int(_agent_section.get("auto_recovery_cycles", 5)), 0)
     except (TypeError, ValueError):
         agent._auto_recovery_cycles = 5
+    # Jentera-only: optional cap on the whole ladder, from the turn's start (None = no cap).
+    try:
+        _cap = _agent_section.get("auto_recovery_max_seconds")
+        agent._auto_recovery_max_seconds = float(_cap) if _cap not in (None, "") else None
+    except (TypeError, ValueError):
+        agent._auto_recovery_max_seconds = None
 
     # Initialize context compressor for automatic context management
     # Compresses conversation when approaching model's context limit

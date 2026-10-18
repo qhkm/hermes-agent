@@ -172,3 +172,27 @@ def test_real_wait_stops_within_a_slice_on_interrupt(monkeypatch):
     started = time.time()
     assert ar._interruptible_wait(agent, 60, "x") is True
     assert time.time() - started < 1
+
+
+def test_max_seconds_cap_blocks_second_cycle(monkeypatch):
+    monkeypatch.setattr(ar, "ladder_wait_seconds", lambda cycle, err: 15.0 if cycle == 1 else 30.0)
+    agent = _Agent()
+    agent._auto_recovery_max_seconds = 40.0
+    agent._inflight_turn_started = time.time()
+    retry = TurnRetryState()
+    out, retry = _run(agent, _Err(503, "down"), retry=retry)
+    assert out == {"action": "continue"} and retry.auto_recovery_cycles_used == 1
+    agent._inflight_turn_started -= 15.0  # the first (mocked) wait elapsed
+    out, retry = _run(agent, _Err(503, "down"), retry=retry)  # now + 30 > start + 40: refused
+    assert out is None and retry.auto_recovery_cycles_used == 1
+    assert any("gave up" in s and "recovery budget" in s for s in agent.statuses)
+
+
+def test_absent_max_seconds_keeps_behaviour(monkeypatch):
+    monkeypatch.setattr(ar, "ladder_wait_seconds", lambda cycle, err: 60.0)
+    agent = _Agent()
+    agent._inflight_turn_started = time.time() - 100000  # ancient turn, but no cap configured
+    retry = TurnRetryState()
+    for expected in (1, 2, 3):
+        out, retry = _run(agent, _Err(503, "down"), retry=retry)
+        assert out == {"action": "continue"} and retry.auto_recovery_cycles_used == expected
