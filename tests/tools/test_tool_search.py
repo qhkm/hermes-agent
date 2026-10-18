@@ -569,7 +569,14 @@ class TestCoreToolDeferral:
     def test_default_set_excludes_every_protected_tool(self):
         from tools.tool_search import _DEFAULT_DEFERRED_TOOLS
         assert not (_DEFAULT_DEFERRED_TOOLS & self.PROTECTED)
-        assert {"computer_use", "session_search", "image_generate", "cronjob"} <= _DEFAULT_DEFERRED_TOOLS
+        assert {"read_terminal", "session_search", "image_generate", "cronjob"} <= _DEFAULT_DEFERRED_TOOLS
+
+    def test_computer_use_is_not_deferred_by_default(self):
+        """Jentera's desktop pilot calls it on every screen action; a search step each time costs."""
+        from tools.tool_search import _DEFAULT_DEFERRED_TOOLS, ToolSearchConfig
+        assert "computer_use" not in _DEFAULT_DEFERRED_TOOLS
+        assert "computer_use" not in ToolSearchConfig.from_raw({}).effective_defer_tools
+        assert "computer_use" in ToolSearchConfig.from_raw({"defer": ["computer_use"]}).effective_defer_tools
 
     def test_default_set_defers_event_triggered_tools_below_threshold(self):
         """Core deferral is not volume-triggered: tiny schemas still defer."""
@@ -577,7 +584,7 @@ class TestCoreToolDeferral:
 
         assembled = assemble_tool_defs(
             [_td("terminal", "Run"), _td("memory", "Remember"),
-             _td("computer_use", "Drive the desktop"), _td("session_search", "Search old chats"),
+             _td("read_terminal", "Read a terminal pane"), _td("session_search", "Search old chats"),
              _td("image_generate", "Make an image"), _td("todo", "Track tasks")],
             context_length=1_000_000,
             config=ToolSearchConfig.from_raw({"enabled": "auto"}),
@@ -590,7 +597,7 @@ class TestCoreToolDeferral:
     def test_off_defers_nothing(self):
         from tools.tool_search import ToolSearchConfig, assemble_tool_defs
 
-        defs = [_td("terminal", "Run"), _td("computer_use", "Drive the desktop")]
+        defs = [_td("terminal", "Run"), _td("read_terminal", "Read a terminal pane")]
         assembled = assemble_tool_defs(
             defs, context_length=200_000, config=ToolSearchConfig.from_raw({"enabled": "off"}),
         )
@@ -600,7 +607,7 @@ class TestCoreToolDeferral:
     def test_empty_defer_list_restores_everything_eager(self):
         from tools.tool_search import ToolSearchConfig, assemble_tool_defs
 
-        defs = [_td("terminal", "Run"), _td("computer_use", "Drive the desktop")]
+        defs = [_td("terminal", "Run"), _td("read_terminal", "Read a terminal pane")]
         assembled = assemble_tool_defs(
             defs, context_length=200_000,
             config=ToolSearchConfig.from_raw({"enabled": "auto", "defer": []}),
@@ -614,11 +621,11 @@ class TestCoreToolDeferral:
         cfg = ToolSearchConfig.from_raw({"defer": ["image_generate", "todo_list"]})
         assert cfg.effective_defer_tools == {"image_generate", "todo"}
         assembled = assemble_tool_defs(
-            [_td("computer_use", "Drive"), _td("image_generate", "Draw"), _td("todo", "Plan")],
+            [_td("read_terminal", "Drive"), _td("image_generate", "Draw"), _td("todo", "Plan")],
             context_length=200_000, config=cfg,
         )
         names = {td["function"]["name"] for td in assembled.tool_defs}
-        assert "computer_use" in names
+        assert "read_terminal" in names
         assert not ({"image_generate", "todo"} & names)
 
     def test_jentera_toolset_never_defers_even_when_named_or_when_the_gate_opens(self):
@@ -627,45 +634,45 @@ class TestCoreToolDeferral:
         self._register("zz_jentera_probe_tool", "jentera")
         self._register("zz_other_plugin_tool", "zz_other_plugin")
         defs = [_td("zz_jentera_probe_tool", "x" * 400), _td("zz_other_plugin_tool", "y" * 400),
-                _td("computer_use", "Drive")]
+                _td("read_terminal", "Drive")]
         # Threshold 0 forces the MCP/plugin gate open; "defer" names the jentera tool too.
         cfg = ToolSearchConfig.from_raw({
             "enabled": "on", "threshold_pct": 0,
-            "defer": ["computer_use", "zz_jentera_probe_tool"],
+            "defer": ["read_terminal", "zz_jentera_probe_tool"],
         })
         names = {td["function"]["name"] for td in assemble_tool_defs(
             defs, context_length=200_000, config=cfg).tool_defs}
         assert "zz_jentera_probe_tool" in names
         assert "zz_other_plugin_tool" not in names
-        assert "computer_use" not in names
+        assert "read_terminal" not in names
 
     def test_never_defer_config_can_protect_a_named_core_tool(self):
         from tools.tool_search import ToolSearchConfig, assemble_tool_defs
 
-        cfg = ToolSearchConfig.from_raw({"never_defer": ["computer_use"]})
+        cfg = ToolSearchConfig.from_raw({"never_defer": ["read_terminal"]})
         assembled = assemble_tool_defs(
-            [_td("computer_use", "Drive"), _td("session_search", "Search")],
+            [_td("read_terminal", "Drive"), _td("session_search", "Search")],
             context_length=200_000, config=cfg,
         )
         names = {td["function"]["name"] for td in assembled.tool_defs}
-        assert "computer_use" in names and "session_search" not in names
+        assert "read_terminal" in names and "session_search" not in names
 
     def test_plugin_tools_still_follow_the_threshold(self):
         from tools.tool_search import ToolSearchConfig, assemble_tool_defs
 
         self._register("zz_gate_plugin_tool", "zz_gate_plugin")
-        defs = [_td("zz_gate_plugin_tool", "tiny"), _td("computer_use", "Drive")]
+        defs = [_td("zz_gate_plugin_tool", "tiny"), _td("read_terminal", "Drive")]
         assembled = assemble_tool_defs(
             defs, context_length=1_000_000, config=ToolSearchConfig.from_raw({"enabled": "auto"}),
         )
         names = {td["function"]["name"] for td in assembled.tool_defs}
         assert "zz_gate_plugin_tool" in names  # below threshold: stays direct
-        assert "computer_use" not in names     # curated set defers regardless
+        assert "read_terminal" not in names     # curated set defers regardless
 
     def test_bridge_lists_deferred_tools_deterministically(self):
         from tools.tool_search import ToolSearchConfig, assemble_tool_defs
 
-        defs = [_td("computer_use", "Drive the desktop. Long second sentence."),
+        defs = [_td("read_terminal", "Read a terminal pane. Long second sentence."),
                 _td("session_search", "Search past conversations."),
                 _td("terminal", "Run")]
         cfg = ToolSearchConfig.from_raw({})
@@ -673,9 +680,9 @@ class TestCoreToolDeferral:
         second = assemble_tool_defs(list(reversed(defs[:2])) + defs[2:], context_length=200_000, config=cfg).tool_defs
         search = next(t for t in first if t["function"]["name"] == "tool_search")
         desc = search["function"]["description"]
-        assert "computer_use (Drive the desktop)" in desc
+        assert "read_terminal (Read a terminal pane)" in desc
         assert "second sentence" not in desc
-        assert desc.index("computer_use") < desc.index("session_search")
+        assert desc.index("read_terminal") < desc.index("session_search")
         # Same deferred set, different input order -> identical bridge bytes.
         assert json.dumps(search, sort_keys=False) == json.dumps(
             next(t for t in second if t["function"]["name"] == "tool_search"), sort_keys=False)
@@ -687,16 +694,16 @@ class TestCoreToolDeferral:
 
         discover_builtin_tools()
         monkeypatch.setattr(ts, "load_config_readonly", lambda: ts.ToolSearchConfig.from_raw({}))
-        defs = [_td("computer_use", "Drive the desktop"), _td("terminal", "Run")]
-        assert ts.scoped_deferrable_names(defs) == {"computer_use"}
-        name, args, err = ts.resolve_underlying_call({"name": "computer_use", "arguments": {"a": 1}})
-        assert (name, args, err) == ("computer_use", {"a": 1}, None)
+        defs = [_td("read_terminal", "Read a terminal pane"), _td("terminal", "Run")]
+        assert ts.scoped_deferrable_names(defs) == {"read_terminal"}
+        name, args, err = ts.resolve_underlying_call({"name": "read_terminal", "arguments": {"a": 1}})
+        assert (name, args, err) == ("read_terminal", {"a": 1}, None)
         described = json.loads(ts.dispatch_tool_describe(
-            {"name": "computer_use"}, current_tool_defs=defs, config=ts.ToolSearchConfig.from_raw({})))
-        assert described["name"] == "computer_use"
+            {"name": "read_terminal"}, current_tool_defs=defs, config=ts.ToolSearchConfig.from_raw({})))
+        assert described["name"] == "read_terminal"
         found = json.loads(ts.dispatch_tool_search(
-            {"query": "desktop"}, current_tool_defs=defs, config=ts.ToolSearchConfig.from_raw({})))
-        assert [m["name"] for m in found["matches"]] == ["computer_use"]
+            {"query": "terminal pane"}, current_tool_defs=defs, config=ts.ToolSearchConfig.from_raw({})))
+        assert [m["name"] for m in found["matches"]] == ["read_terminal"]
         # terminal is the working set: not reachable via tool_call.
         assert ts.resolve_underlying_call({"name": "terminal", "arguments": {}})[2]
 
@@ -705,4 +712,4 @@ class TestCoreToolDeferral:
 
         monkeypatch.setattr(ts, "load_config_readonly",
                             lambda: ts.ToolSearchConfig.from_raw({"defer": []}))
-        assert ts.resolve_underlying_call({"name": "computer_use", "arguments": {}})[2]
+        assert ts.resolve_underlying_call({"name": "read_terminal", "arguments": {}})[2]

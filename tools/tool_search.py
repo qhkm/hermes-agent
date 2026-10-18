@@ -73,9 +73,11 @@ CHARS_PER_TOKEN = 4.0
 # ask-the-user usage fell from 18/18 to 7/18 when deferred), process (terminal's
 # own instructions tell the model to poll it by name), and everything in the
 # working set (terminal, file tools, execute_code, web, memory, browser_*,
-# delegate_task, skills, vision).
+# delegate_task, skills, vision). computer_use is left out too, unlike upstream:
+# it drives Jentera's desktop pilot, where a search step before each screen
+# action costs time. A config ``defer`` list can still name it.
 _DEFAULT_DEFERRED_TOOLS = frozenset({
-    "computer_use", "session_search", "image_generate", "todo", "cronjob",
+    "session_search", "image_generate", "todo", "cronjob",
     # Desktop GUI affordances (hidden outside the desktop client anyway).
     "read_terminal", "close_terminal", "open_preview", "focus_pane",
 })
