@@ -185,6 +185,10 @@ _JSON_FIELD_RE = re.compile(
     rf'("{_JSON_KEY_NAMES}")\s*:\s*"([^"]+)"',
     re.IGNORECASE,
 )
+# The same field inside a JSON-encoded string (``{"output": "{\\"api_key\\": \\"...\\"}"}``): every tool result
+# that wraps a config dump in JSON escapes the quotes, so the rule above never saw the value (#115104).
+# The backreference keeps the key's and value's escape depth equal.
+_JSON_FIELD_ESCAPED_RE = re.compile(rf'((\\+)"{_JSON_KEY_NAMES}\2")\s*:\s*\2"([^"\\]+)\2"', re.IGNORECASE)
 
 # Authorization headers — any scheme (Bearer, Basic, Token, Digest, …) plus the
 # bare-credential form, and Proxy-Authorization. The credential token is masked
@@ -714,6 +718,15 @@ def redact_sensitive_text(
                     return m.group(0)
                 return f'{key}: "{_assign_mask(value)}"'
             text = _JSON_FIELD_RE.sub(_redact_json, text)
+            if '\\"' in text:
+                def _redact_json_escaped(m):
+                    key, esc, value = m.group(1), m.group(2), m.group(3)
+                    if _ENV_LOOKUP_VALUE_RE.match(value):
+                        return m.group(0)
+                    if secret_file and _keep_secret_file_value(key, value):
+                        return m.group(0)
+                    return f'{key}: {esc}"{_assign_mask(value)}{esc}"'
+                text = _JSON_FIELD_ESCAPED_RE.sub(_redact_json_escaped, text)
 
         # Unquoted YAML / colon config: password: ***  (after JSON so quoted
         # values are handled there; the lookahead in _YAML_ASSIGN_RE skips
@@ -997,3 +1010,25 @@ class RedactingFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         original = super().format(record)
         return redact_sensitive_text(original)
+
+
+REDACTION_UNAVAILABLE = "[redaction-unavailable]"
+# The opaque branch needs a 20-char floor: without it the English word "bearer" turns "the bearer of
+# bad news" into "Bearer [redacted] bad news". The bracket branch folds an already-masked residue
+# ("Bearer [redacted-jwt]") to one marker.
+_BEARER_RESIDUE_RE = re.compile(r"\bBearer\s+(?:\[[^\]]+\]|[A-Za-z0-9._~+/-]{20,}=*)", re.IGNORECASE)
+
+
+def redact_for_egress(text: str) -> str:
+    """The one scrub for text leaving the process for a remote reader (e.g. an external memory
+    provider). ``redact_sensitive_text(force=True)`` plus a bearer sweep, because a
+    ``Bearer <opaque>`` value with no vendor prefix carries no shape the prefix matcher can key on.
+    Fails CLOSED: if the redactor raises, the raw text is never returned."""
+    text = str(text or "")
+    try:
+        text = redact_sensitive_text(text, force=True)
+    except Exception:
+        return REDACTION_UNAVAILABLE
+    if "earer" in text:
+        text = _BEARER_RESIDUE_RE.sub("Bearer [redacted]", text)
+    return text
