@@ -2765,6 +2765,11 @@ DEFAULT_CONFIG = {
         "tirith_path": "tirith",
         "tirith_timeout": 5,
         "tirith_fail_open": True,
+        # Cloud metadata endpoint (IMDS) commands — 169.254.169.254, fd00:ec2::254,
+        # 100.100.100.200, metadata.google.internal. "approve" (default) asks the user
+        # first; "deny" blocks them outright with no approval request. Jentera sets
+        # "deny": its approvals reach non-technical owners who cannot judge them.
+        "imds": "approve",
         "website_blocklist": {
             "enabled": False,
             "domains": [],
