@@ -1581,6 +1581,20 @@ def _mark_verification_stale(
         logger.debug("verification stale marker failed", exc_info=True)
 
 
+_REDACTION_SENTINEL = "\u00abredacted"
+_SENTINEL_WRITE_ERROR = (
+    "Refusing to write: the content contains a redaction marker ('\u00abredacted\u2026'), which means "
+    "it was copied from a masked read of a file that holds secrets. Writing it back would replace "
+    "the real value with the marker. Edit only the lines you mean to change (use patch with a "
+    "small old_string/new_string that does not include the masked value), or ask the user for "
+    "the real value."
+)
+
+
+def _contains_redaction_sentinel(*texts) -> bool:
+    return any(isinstance(t, str) and _REDACTION_SENTINEL in t for t in texts)
+
+
 def write_file_tool(path: str, content: str, task_id: str = "default",
                     cross_profile: bool = False,
                     session_id: str | None = None) -> str:
@@ -1592,6 +1606,8 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     Pass ``True`` after explicit user direction — same shape as ``force``
     on the terminal tool.
     """
+    if _contains_redaction_sentinel(content):
+        return tool_error(_SENTINEL_WRITE_ERROR)
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
@@ -1674,6 +1690,8 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
     targets under another profile's skills/plugins/cron/memories
     directory. Same shape as ``write_file``'s flag.
     """
+    if _contains_redaction_sentinel(new_string, patch):
+        return tool_error(_SENTINEL_WRITE_ERROR)
     # Check sensitive paths for both replace (explicit path) and V4A patch (extract paths)
     _paths_to_check = []
     if path:

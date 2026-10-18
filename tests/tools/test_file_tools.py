@@ -921,3 +921,24 @@ class TestSecretFileReadRedaction:
         by_path = {m["path"].rsplit("/", 1)[-1]: m["content"] for m in out["matches"]}
         assert self.SYNTH not in by_path[".bashrc"]
         assert self.SYNTH in by_path["a.py"]
+
+
+class TestRedactionSentinelWriteGuard:
+    """Content copied from a masked read must never be written back."""
+
+    SENT = "api_key: «redacted-secret»\n"
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_write_file_refuses_sentinel(self, mock_get):
+        from tools.file_tools import write_file_tool
+        result = json.loads(write_file_tool("/tmp/cfg.yaml", self.SENT))
+        assert "masked read" in result["error"]
+        mock_get.assert_not_called()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_patch_refuses_sentinel_in_new_string_and_v4a(self, mock_get):
+        from tools.file_tools import patch_tool
+        r1 = json.loads(patch_tool(path="/tmp/cfg.yaml", old_string="a", new_string=self.SENT))
+        r2 = json.loads(patch_tool(mode="patch", patch="*** Begin Patch\n+" + self.SENT))
+        assert "masked read" in r1["error"] and "masked read" in r2["error"]
+        mock_get.assert_not_called()

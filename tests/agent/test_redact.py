@@ -1168,3 +1168,58 @@ class TestSecretFileAssignmentRedaction:
     ])
     def test_classifier(self, arg, expected):
         assert _is_secret_file_arg(arg) is expected
+
+
+class TestSecretFileKeysAndUrls:
+    """secret_file masks credential-named keys only, and a URL on one line never switches off
+    masking for the others."""
+
+    OPAQUE = "abcd3JcQ1UqZ8mNp4Rt6vWx2Yb9Ad0Ef7Gh5Ij2kSopaque"
+
+    def _mask(self, text):
+        return redact_sensitive_text(text, force=True, file_read=True, secret_file=True)
+
+    def test_jentera_shaped_yaml(self):
+        text = (
+            "model:\n"
+            "  base_url: https://api.jentera.ai/v1/model\n"
+            f"  api_key: {self.OPAQUE}\n"
+            "agent:\n"
+            "  max_tokens: 8192\n"
+            "compression:\n"
+            "  target_tokens: 20000\n"
+            "  token_budget: 4000\n"
+        )
+        out = self._mask(text)
+        assert self.OPAQUE not in out
+        assert "https://api.jentera.ai/v1/model" in out
+        for kept in ("max_tokens: 8192", "target_tokens: 20000", "token_budget: 4000"):
+            assert kept in out
+
+    def test_bashrc(self):
+        out = self._mask(
+            f"export NPM_TOKEN={self.OPAQUE}\n"
+            "export PASSWORD_STORE_DIR=/home/x/.pw\n"
+            "export PASSWORD_STORE_X=plainvalue\n"
+        )
+        assert self.OPAQUE not in out
+        assert "PASSWORD_STORE_DIR=/home/x/.pw" in out
+        assert "PASSWORD_STORE_X=plainvalue" in out
+
+    @pytest.mark.parametrize("line", [
+        "max_tokens=8192", "export MAX_TOKENS=4096", "tokens_used: 123456",
+        "output_tokens: abcdefgh", "token_budget: 3000",
+    ])
+    def test_token_counters_are_kept(self, line):
+        assert self._mask(line) == line
+
+    @pytest.mark.parametrize("key", [
+        "api_key", "apiKey", "apikey", "NPM_TOKEN", "client-secret", "DB_PASSWORD", "db_passwd",
+        "aws_credential", "accessToken",
+    ])
+    def test_credential_suffixes_are_masked(self, key):
+        out = self._mask(f"{key}: {self.OPAQUE}")
+        assert self.OPAQUE not in out, key
+
+    def test_numeric_value_of_secret_key_is_kept(self):
+        assert self._mask("api_key: 123456789012") == "api_key: 123456789012"

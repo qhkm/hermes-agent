@@ -548,17 +548,55 @@ _PASSWORD_KEY_RE = re.compile(r"passwd|password|pass|pw", re.IGNORECASE)
 _PATH_OR_VAR_VALUE_RE = re.compile(r"[$/~]")
 
 
+# Under ``secret_file`` only a key whose NAME ENDS in one of these words is a credential key.
+# ``max_tokens`` / ``target_tokens`` / ``token_budget`` / ``PASSWORD_STORE_DIR`` merely contain one.
+_SECRET_KEY_SUFFIX_RE = re.compile(
+    r"(?:^|[_\-])(?:key|token|secret|password|passwd|pat|credential)$"
+    r"|^(?:api|access|auth|private|bearer|refresh|client)(?:key|token|secret)$",
+    re.IGNORECASE,
+)
+_SECRET_KEY_CAMEL_RE = re.compile(r"[a-z0-9](?:Key|Token|Secret|Password|Passwd|Pat|Credential)$")
+_NUMERIC_VALUE_RE = re.compile(r"[+-]?[\d_,.]+")
+
+
+def _is_secret_key_name(key: str) -> bool:
+    """True when the last name in a (possibly indented / line-numbered / dotted) key ends in a
+    credential word, separated by ``_``/``-``/``.``, camelCase, or a known ``apikey``-style compound."""
+    names = re.findall(r"[A-Za-z0-9_\-]+", key.rsplit(".", 1)[-1])
+    if not names:
+        return False
+    name = names[-1]
+    return bool(_SECRET_KEY_SUFFIX_RE.search(name) or _SECRET_KEY_CAMEL_RE.search(name))
+
+
 def _keep_secret_file_value(key: str, value: str) -> bool:
     """True when a secret-file assignment value must be left as it is.
 
     Already-masked values (``***`` / the ``«redacted…»`` sentinel) keep the vendor
-    label an earlier pass produced. A value that starts like ``$HOME/...``, ``/usr/...``
-    or ``~/...`` is a variable or path reference, not a credential
-    (``SSH_AUTH_SOCK=$HOME/.ssh/agent.sock``) -- only password-class keys mask those.
+    label an earlier pass produced. Purely numeric values and keys that do not END in a
+    credential word (``max_tokens: 8192``, ``PASSWORD_STORE_DIR=...``) are config, not
+    secrets. A value that starts like ``$HOME/...``, ``/usr/...`` or ``~/...`` is a variable
+    or path reference, not a credential (``SSH_AUTH_SOCK=$HOME/.ssh/agent.sock``) -- only
+    password-class keys mask those.
     """
     if value == "***" or value.startswith("«redacted"):
         return True
+    if _NUMERIC_VALUE_RE.fullmatch(value) or not _is_secret_key_name(key):
+        return True
     return bool(_PATH_OR_VAR_VALUE_RE.match(value)) and not _PASSWORD_KEY_RE.search(key)
+
+
+def _sub_lines_without_url(text: str, sub) -> str:
+    """Apply *sub* to *text*, leaving every line that contains ``://`` untouched.
+
+    The URL skip is per line: one ``base_url: https://...`` line must not switch off masking of
+    ``api_key: <opaque>`` on the next line of the same file.
+    """
+    if "://" not in text:
+        return sub(text)
+    return "".join(
+        line if "://" in line else sub(line) for line in text.splitlines(keepends=True)
+    )
 
 
 def redact_sensitive_text(
@@ -660,9 +698,8 @@ def redact_sensitive_text(
             # web-URL query params are intentionally passed through (see note
             # near the bottom of this function); _DB_CONNSTR_RE still guards
             # connection-string passwords.
-            if "://" not in text:
-                text = _CFG_DOTTED_RE.sub(_redact_env, text)
-                text = _CFG_ANCHORED_RE.sub(_redact_env, text)
+            text = _sub_lines_without_url(
+                text, lambda t: _CFG_ANCHORED_RE.sub(_redact_env, _CFG_DOTTED_RE.sub(_redact_env, t)))
 
         # JSON fields: "apiKey": "***"  (skip for code files — false positives)
         if ":" in text and '"' in text:
@@ -681,7 +718,7 @@ def redact_sensitive_text(
         # Unquoted YAML / colon config: password: ***  (after JSON so quoted
         # values are handled there; the lookahead in _YAML_ASSIGN_RE skips
         # quotes). Skip URLs — web-URL query params pass through by design.
-        if ":" in text and "://" not in text:
+        if ":" in text:
             def _redact_yaml(m):
                 key, sep, value = m.group(1), m.group(2), m.group(3)
                 # Same programmatic-env-lookup exception as _redact_env above
@@ -692,7 +729,7 @@ def redact_sensitive_text(
                 if secret_file and _keep_secret_file_value(key, value):
                     return m.group(0)
                 return f"{key}{sep}{_assign_mask(value)}"
-            text = _YAML_ASSIGN_RE.sub(_redact_yaml, text)
+            text = _sub_lines_without_url(text, lambda t: _YAML_ASSIGN_RE.sub(_redact_yaml, t))
 
     # Authorization headers — _AUTH_HEADER_RE matches any scheme after
     # "[Proxy-]Authorization:" case-insensitively, so "uthorization" is the
