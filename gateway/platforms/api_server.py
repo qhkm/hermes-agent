@@ -5535,25 +5535,12 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
-        status = self._run_statuses.get(run_id)
-        if status is None:
+        if self._run_statuses.get(run_id) is None:
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
-        # /stop keeps the agent ref during cooperative shutdown, so the status
-        # gate (not the mere presence of an agent) rejects stop-then-steer.
-        agent = self._active_run_agents.get(run_id)
-        if (
-            status.get("status") != "running"
-            or run_id in self._stopping_run_ids
-            or not hasattr(agent, "steer")
-        ):
-            return web.json_response(
-                _openai_error(
-                    f"Run is not currently accepting steer input: {run_id}",
-                    code="run_not_accepting_steer",
-                ),
-                status=409,
-            )
 
+        # Read and validate the body first: it awaits, and the run can finish
+        # or be stopped meanwhile. The state check below must follow it with
+        # no await in between.
         body, err = await self._read_json_body(request)
         if err:
             return err
@@ -5568,6 +5555,25 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
+        # --- No await from here to the end of the state change. ---
+        status = self._run_statuses.get(run_id)
+        # /stop keeps the agent ref during cooperative shutdown, so the status
+        # gate (not the mere presence of an agent) rejects stop-then-steer.
+        agent = self._active_run_agents.get(run_id)
+        if (
+            status is None
+            or status.get("status") != "running"
+            or run_id in self._stopping_run_ids
+            or not hasattr(agent, "steer")
+        ):
+            return web.json_response(
+                _openai_error(
+                    f"Run is not currently accepting steer input: {run_id}",
+                    code="run_not_accepting_steer",
+                ),
+                status=409,
+            )
+
         try:
             accepted = bool(agent.steer(steer_text))
         except Exception as exc:
@@ -5579,7 +5585,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=409,
             )
 
-        self._set_run_status(run_id, "running", last_event="run.steered")
+        # Keep whatever status the run has; only the last event changes.
+        self._set_run_status(
+            run_id,
+            self._run_statuses.get(run_id, {}).get("status", "running"),
+            last_event="run.steered",
+        )
         q = self._run_streams.get(run_id)
         if q is not None:
             try:

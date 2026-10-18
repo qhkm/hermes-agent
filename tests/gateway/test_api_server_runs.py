@@ -818,6 +818,64 @@ class TestSteerRun:
         agent.steer.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_steer_run_completing_during_body_read_returns_409(self, adapter):
+        """A run that finishes while the body is read must not be resurrected."""
+        app = _create_runs_app(adapter)
+        agent = MagicMock()
+        agent.steer.return_value = True
+        adapter._active_run_agents["run_race"] = agent
+        adapter._set_run_status("run_race", "running")
+        real_read = adapter._read_json_body
+
+        async def _read_then_complete(request):
+            result = await real_read(request)
+            adapter._set_run_status("run_race", "completed", last_event="run.completed")
+            return result
+
+        with patch.object(adapter, "_read_json_body", _read_then_complete):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post("/v1/runs/run_race/steer", json={"input": "late"})
+                payload = await resp.json()
+
+        assert resp.status == 409
+        assert payload["error"]["code"] == "run_not_accepting_steer"
+        agent.steer.assert_not_called()
+        assert adapter._run_statuses["run_race"]["status"] == "completed"
+        assert adapter._run_statuses["run_race"]["last_event"] == "run.completed"
+
+    @pytest.mark.asyncio
+    async def test_steer_keeps_stopping_status_after_stop(self, adapter):
+        app = _create_runs_app(adapter)
+        agent = MagicMock()
+        agent.steer.return_value = True
+        adapter._active_run_agents["run_stop"] = agent
+        adapter._set_run_status("run_stop", "stopping", last_event="run.stopping")
+        adapter._stopping_run_ids.add("run_stop")
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/runs/run_stop/steer", json={"input": "late"})
+
+        assert resp.status == 409
+        agent.steer.assert_not_called()
+        assert adapter._run_statuses["run_stop"]["status"] == "stopping"
+
+    @pytest.mark.asyncio
+    async def test_successful_steer_keeps_current_status(self, adapter):
+        """Only last_event changes; the status is whatever it currently is."""
+        app = _create_runs_app(adapter)
+        agent = MagicMock()
+        agent.steer.return_value = True
+        adapter._active_run_agents["run_ok"] = agent
+        adapter._set_run_status("run_ok", "running")
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/runs/run_ok/steer", json={"input": "go"})
+
+        assert resp.status == 200
+        assert adapter._run_statuses["run_ok"]["status"] == "running"
+        assert adapter._run_statuses["run_ok"]["last_event"] == "run.steered"
+
+    @pytest.mark.asyncio
     async def test_steer_queued_run_returns_409(self, adapter):
         app = _create_runs_app(adapter)
         adapter._set_run_status("run_q", "queued")
