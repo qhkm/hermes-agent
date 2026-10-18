@@ -951,6 +951,16 @@ DEFAULT_CONFIG = {
         # tools or receiving API responses.  Only fires when the agent has
         # been completely idle for this duration.  0 = unlimited.
         "gateway_timeout": 1800,
+        # Turn liveness watchdog (upstream #99758): a turn that shows no
+        # observable progress (activity-clock idle) for `timeout_s` seconds is
+        # logged loudly and force-interrupted so its session is freed and the
+        # run ends as a failure. `timeout_s` <= 0 disables the watchdog;
+        # `poll_s` is the sampling interval. Invalid values warn and fall back
+        # to the defaults. See agent/turn_liveness.py.
+        "turn_liveness": {
+            "timeout_s": 600.0,
+            "poll_s": 15.0,
+        },
         # Graceful drain timeout for gateway stop/restart (seconds).
         # The gateway stops accepting new work, waits for running agents
         # to finish, then interrupts any remaining runs after the timeout.

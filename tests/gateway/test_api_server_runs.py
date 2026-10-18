@@ -1099,3 +1099,63 @@ class TestStopRun:
                 body = await events_resp.text()
                 # Stream should have received run.failed and closed
                 assert "run.failed" in body or "stream closed" in body
+
+
+# ---------------------------------------------------------------------------
+# Turn liveness watchdog (upstream #99758) — stalled run ends as run.failed
+# ---------------------------------------------------------------------------
+
+
+class TestTurnLivenessRun:
+    @pytest.mark.asyncio
+    async def test_stalled_run_fails_and_next_run_completes(self, adapter):
+        from run_agent import AIAgent
+
+        agent = AIAgent.__new__(AIAgent)
+        agent.session_id = "sess-liveness"
+        agent._interrupt_requested = False
+        agent._interrupt_message = None
+        agent._pending_redirect = None
+        agent._last_activity_ts = time.time()
+        agent._last_activity_desc = "idle"
+        agent.api_mode = "chat_completions"
+        agent._emit_warning = lambda *_a, **_k: None
+        agent._conversation_root_id = lambda: "root"
+        agent.session_prompt_tokens = 0
+        agent.session_completion_tokens = 0
+        agent.session_total_tokens = 0
+
+        turns = {"n": 0}
+
+        def _loop(agent_, user_message, *a, **k):
+            turns["n"] += 1
+            agent_._interrupt_requested = False
+            if turns["n"] == 1:
+                deadline = time.time() + 10
+                while not agent_._interrupt_requested and time.time() < deadline:
+                    time.sleep(0.01)
+                return {"final_response": "Operation interrupted.", "interrupted": True}
+            return {"final_response": "second ok", "completed": True}
+
+        cfg = {"agent": {"turn_liveness": {"timeout_s": 0.2, "poll_s": 0.02}}}
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", return_value=agent), patch(
+                "agent.conversation_loop.run_conversation", _loop
+            ), patch("hermes_cli.config.load_config", return_value=cfg):
+                bodies = []
+                for text in ("stall", "again"):
+                    resp = await cli.post("/v1/runs", json={"input": text})
+                    assert resp.status == 202
+                    run_id = (await resp.json())["run_id"]
+                    events = await cli.get(f"/v1/runs/{run_id}/events")
+                    bodies.append(await events.text())
+                    status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                    bodies[-1] = (bodies[-1], status)
+
+        (first_body, first_status), (second_body, second_status) = bodies
+        assert "run.failed" in first_body and "run.completed" not in first_body
+        assert "no progress" in first_body
+        assert first_status["status"] == "failed"
+        assert "run.completed" in second_body and "run.failed" not in second_body
+        assert second_status["status"] == "completed"
