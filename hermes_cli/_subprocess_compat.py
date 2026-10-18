@@ -313,6 +313,20 @@ _GIT_CONFIG_OVERRIDES = {
     # ssh bypasses stdin=DEVNULL/GIT_TERMINAL_PROMPT and opens /dev/tty directly; BatchMode makes
     # it fail instead of prompting. Config layer, so an explicit GIT_SSH_COMMAND still wins.
     "core.sshCommand": "ssh -o BatchMode=yes",
+    # Signature verification / signing runs a program the repo config names. ``log.showSignature``
+    # (or ``--show-signature`` in a log/show) verifies any commit with a ``gpgsig`` header through
+    # ``gpg.program`` (and the openpgp/x509/ssh variants); ``commit.gpgSign`` etc. sign through it.
+    # ``false`` is a program that exits non-zero without side effects; the sign/verify switches are
+    # also forced off so the program is rarely even reached.
+    "gpg.program": "false",
+    "gpg.openpgp.program": "false",
+    "gpg.x509.program": "false",
+    "gpg.ssh.program": "false",
+    "gpg.ssh.defaultKeyCommand": "",
+    "log.showSignature": "false",
+    "commit.gpgSign": "false",
+    "tag.gpgSign": "false",
+    "push.gpgSign": "false",
 }
 
 

@@ -36,7 +36,7 @@ pytestmark = pytest.mark.skipif(
 
 _CLEAN_GIT_ENV = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
                   "GIT_CONFIG_NOSYSTEM": "1"}
-_SINKS = ("fsmonitor", "hook", "extdiff", "textconv", "smudge", "clean", "ssh")
+_SINKS = ("fsmonitor", "hook", "extdiff", "textconv", "smudge", "clean", "ssh", "gpg")
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -226,3 +226,71 @@ def test_cli_worktree_setup_refuses_when_filters_undiscoverable(tmp_path):
     assert cli._setup_worktree(str(repo), sync_base=False) is None
     assert cli._worktree_is_dirty(str(repo)) is True  # fails safe toward "keep"
     assert _fired(Path(marker)) == []
+
+
+# --- signing config and remote-chosen programs -------------------------------------------------
+
+def _program(path: Path, marker_file: str, body: str = "") -> str:
+    path.write_text(f"#!/bin/sh\ntouch '{marker_file}'\n{body}\nexit 1\n")
+    path.chmod(0o755)
+    return str(path)
+
+
+def _signed_commit_repo(tmp: Path) -> tuple[Path, str]:
+    """Repo whose HEAD carries a ``gpgsig`` header and whose config binds every gpg program (and the
+    sign/verify switches) to a script that touches a marker."""
+    repo, marker = _make_repo(tmp, "", armed=False)
+    raw = _git(repo, "cat-file", "commit", "HEAD")
+    head, _, msg = raw.partition("\n\n")
+    sig = "gpgsig -----BEGIN PGP SIGNATURE-----\n \n fake\n -----END PGP SIGNATURE-----"
+    forged = f"{head}\n{sig}\n\n{msg}"
+    blob = tmp / "forged-commit"
+    blob.write_text(forged)
+    new = _git(repo, "hash-object", "-t", "commit", "-w", "--literally", str(blob)).strip()
+    _git(repo, "update-ref", "refs/heads/main", new)
+    script = _program(tmp / "gpg.sh", f"{marker}.gpg")
+    for key in ("gpg.program", "gpg.openpgp.program", "gpg.x509.program", "gpg.ssh.program"):
+        _git(repo, "config", key, script)
+    _git(repo, "config", "log.showSignature", "true")
+    _git(repo, "config", "commit.gpgSign", "true")
+    _git(repo, "config", "tag.gpgSign", "true")
+    return repo, marker
+
+
+def test_control_raw_git_runs_gpg_program(tmp_path):
+    repo, marker = _signed_commit_repo(tmp_path)
+    subprocess.run(["git", "-C", str(repo), "log", "-1"], capture_output=True, env=_CLEAN_GIT_ENV)
+    assert "gpg" in _fired(Path(marker))
+
+
+def test_signing_config_never_runs_a_repo_program(tmp_path):
+    from agent.coding_context import build_coding_workspace_block
+    repo, marker = _signed_commit_repo(tmp_path)
+    # Per-turn workspace probe (``git log -3``).
+    assert "Root:" in build_coding_workspace_block(repo)
+    assert _fired(Path(marker)) == []
+    # ``harden_git_argv(['log', '-1'])`` under the repo-hardened env.
+    env = noninteractive_repo_git_env(repo)
+    assert env is not None
+    subprocess.run(["git", "-C", str(repo), *harden_git_argv(["log", "-1"])], env=env,
+                   capture_output=True, stdin=subprocess.DEVNULL)
+    subprocess.run(["git", "-C", str(repo), *harden_git_argv(["show", "--show-signature", "-s"])],
+                   env=env, capture_output=True, stdin=subprocess.DEVNULL)
+    assert _fired(Path(marker)) == []
+    # ``git commit`` with commit.gpgSign=true must not sign (and so not run the program).
+    (repo / "README").write_text("again\n")
+    done = subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.name=a", "-c", "user.email=a@b", "commit", "-aqm", "x"],
+        env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    assert done.returncode == 0, done.stderr
+    assert _fired(Path(marker)) == []
+
+
+def test_env_pins_signing_keys():
+    env = noninteractive_git_env({})
+    values = {env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"]
+              for i in range(int(env["GIT_CONFIG_COUNT"]))}
+    for key in ("gpg.program", "gpg.openpgp.program", "gpg.x509.program", "gpg.ssh.program",
+                "log.showSignature", "commit.gpgSign", "tag.gpgSign", "push.gpgSign"):
+        assert values[key] == "false", key
+    assert values["gpg.ssh.defaultKeyCommand"] == ""
