@@ -96,6 +96,58 @@ class TestOAuthFlagOnRefresh:
         assert agent._is_anthropic_oauth is True
 
 
+    @pytest.mark.parametrize("base_url", [
+        "https://llmbox.bytedance.net",
+        "http://127.0.0.1:8080/anthropic.com",  # substring spoof: the host is still foreign
+        "https://llmbox.bytedance.net/anthropic",  # accepted proxy shape, but holds a custom key
+    ])
+    def test_third_party_endpoint_skips_refresh(self, agent, base_url):
+        """provider == 'anthropic' on a foreign host holding a custom key must not refresh: the
+        refresh would swap in native Anthropic credentials the endpoint was never given (#120299)."""
+        agent.api_mode = "anthropic_messages"
+        agent.provider = "anthropic"
+        agent._anthropic_api_key = "custom-api-key"
+        agent._anthropic_base_url = base_url
+        agent._anthropic_client = MagicMock()
+        agent._is_anthropic_oauth = False
+
+        with (
+            patch("agent.anthropic_adapter.resolve_anthropic_token",
+                  return_value=_OAUTH_LIKE_TOKEN),
+            patch("agent.anthropic_adapter.build_anthropic_client",
+                  return_value=MagicMock()) as build,
+        ):
+            result = agent._try_refresh_anthropic_client_credentials()
+
+        assert result is False
+        build.assert_not_called()
+        assert agent._anthropic_api_key == "custom-api-key"
+        assert agent._is_anthropic_oauth is False
+
+    @pytest.mark.parametrize("base_url, current_key", [
+        ("https://api.claude.com", "sk-ant-old"),
+        ("https://llm.corp.example/anthropic", "sk-ant-old"),  # proxy already holding the vendor key
+    ])
+    def test_accepted_native_proxy_keeps_rotating_anthropic_token(self, agent, base_url, current_key):
+        agent.api_mode = "anthropic_messages"
+        agent.provider = "anthropic"
+        agent._anthropic_api_key = current_key
+        agent._anthropic_base_url = base_url
+        agent._anthropic_client = MagicMock()
+        agent._is_anthropic_oauth = False
+
+        with (
+            patch("agent.anthropic_adapter.resolve_anthropic_token",
+                  return_value="sk-ant-new"),
+            patch("agent.anthropic_adapter.build_anthropic_client",
+                  return_value=MagicMock()),
+        ):
+            result = agent._try_refresh_anthropic_client_credentials()
+
+        assert result is True
+        assert agent._anthropic_api_key == "sk-ant-new"
+
+
 class TestOAuthFlagOnCredentialSwap:
     """Site 4 — _swap_credential (credential pool rotation)."""
 

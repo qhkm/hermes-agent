@@ -1518,6 +1518,16 @@ def fetch_openrouter_models(
     return list(curated)
 
 
+def _openrouter_curated_ids() -> list[str]:
+    """Curated OpenRouter ids with no live catalog fetch (remote manifest, else the snapshot)."""
+    try:
+        from hermes_cli.model_catalog import get_curated_openrouter_models
+        remote = get_curated_openrouter_models()
+    except Exception:
+        remote = None
+    return [mid for mid, _ in (remote or OPENROUTER_MODELS)]
+
+
 def model_ids(*, force_refresh: bool = False) -> list[str]:
     """Return just the OpenRouter model-id strings."""
     return [mid for mid, _ in fetch_openrouter_models(force_refresh=force_refresh)]
@@ -2547,6 +2557,80 @@ def _merge_with_models_dev(provider: str, curated: list[str]) -> list[str]:
     return merged
 
 
+# Providers whose live catalog already resolves ``model.base_url`` itself (or authenticates
+# natively and is not relay-able); they are left to their own branches in provider_model_ids().
+_RELAY_AWARE_CATALOG_PROVIDERS = frozenset(
+    {"anthropic", "custom", "openai", "openai-api", "stepfun", "gmi", "openai-codex",
+     "xai-oauth", "nous", "copilot", "copilot-acp", "bedrock", "ollama-cloud", "deepinfra"}
+)
+
+
+def _static_catalog(normalized: str) -> list[str]:
+    """Local, no-egress catalog: curated static list (+ models.dev merge where preferred)."""
+    curated_static = list(_PROVIDER_MODELS.get(normalized, []))
+    if normalized in _MODELS_DEV_PREFERRED:
+        return _merge_with_models_dev(normalized, curated_static)
+    return curated_static
+
+
+def _configured_relay_base_url(normalized: str) -> str:
+    """``model.base_url`` when it points the *configured* provider at a relay/proxy, else "".
+
+    Discovery must probe the endpoint inference uses (#121387): with ``model.base_url`` set for
+    the configured provider to something other than the provider's own endpoint, the vendor's
+    canonical host is not the catalog to list, and the provider credential must not go there.
+    """
+    model_cfg = _get_model_config_dict()
+    cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
+    base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
+    if not cfg_provider or not base_url or normalize_provider(cfg_provider) != normalized:
+        return ""
+    canonical: set[str] = set()
+    if normalized == "openrouter":
+        from hermes_constants import OPENROUTER_BASE_URL
+
+        canonical.add(OPENROUTER_BASE_URL)
+    else:
+        try:
+            from hermes_cli.auth import PROVIDER_REGISTRY
+
+            pconfig = PROVIDER_REGISTRY.get(normalized)
+            if pconfig is None or pconfig.auth_type != "api_key":
+                return ""  # OAuth / unknown providers keep their native discovery
+            canonical.add(pconfig.inference_base_url)
+        except Exception:
+            return base_url  # lookup failed: stay a relay, never widen where credentials go
+    from hermes_cli.route_identity import normalize_route_base_url
+
+    if normalize_route_base_url(base_url) in {normalize_route_base_url(u) for u in canonical if u}:
+        return ""
+    return base_url
+
+
+def _relay_api_key(normalized: str, model_cfg: dict[str, Any]) -> str:
+    """Credential for the configured relay: the config's own key, else the provider's env key."""
+    cfg_key = str(model_cfg.get("api_key") or "").strip()
+    if cfg_key and not cfg_key.startswith("${"):
+        return cfg_key
+    if normalized == "openrouter":
+        return os.getenv("OPENROUTER_API_KEY", "").strip()
+    try:
+        from hermes_cli.auth import resolve_api_key_provider_credentials
+
+        return str(resolve_api_key_provider_credentials(normalized).get("api_key") or "").strip()
+    except Exception:
+        return ""
+
+
+def _relay_model_catalog(normalized: str, relay: str) -> Optional[list[str]]:
+    """Live ids from the configured relay's ``/models``, or None when it gives none."""
+    try:
+        live = fetch_api_models(_relay_api_key(normalized, _get_model_config_dict()), relay)
+        return [str(m) for m in (live or []) if m] or None
+    except Exception:
+        return None
+
+
 def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) -> list[str]:
     """Return the best known model catalog for a provider.
 
@@ -2557,6 +2641,18 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
     on the platform appear in ``/model`` without a Hermes release.
     """
     normalized = normalize_provider(provider)
+    # A configured `model.base_url` relay is TERMINAL for live catalog egress (#121387): list what
+    # that endpoint serves and never touch the vendor host. A failed or empty probe degrades to the
+    # local curated list -- falling through to the canonical fetchers would send the credential to
+    # exactly the host the user routed away from.
+    relay = "" if normalized in _RELAY_AWARE_CATALOG_PROVIDERS else _configured_relay_base_url(normalized)
+    if relay:
+        relayed = _relay_model_catalog(normalized, relay)
+        if relayed:
+            return relayed
+        if normalized == "openrouter":
+            return _openrouter_curated_ids()
+        return _static_catalog(normalized)
     if normalized == "openrouter":
         return model_ids(force_refresh=force_refresh)
     if normalized == "openai-codex":
@@ -2788,10 +2884,7 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
     except Exception:
         pass
 
-    curated_static = list(_PROVIDER_MODELS.get(normalized, []))
-    if normalized in _MODELS_DEV_PREFERRED:
-        return _merge_with_models_dev(normalized, curated_static)
-    return curated_static
+    return _static_catalog(normalized)
 
 
 # ---------------------------------------------------------------------------

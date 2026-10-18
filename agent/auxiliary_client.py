@@ -2038,12 +2038,43 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
 
 
 
-def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Optional[OpenAI], Optional[str]]:
+def _configured_openrouter_base_url() -> str:
+    """OpenRouter-compatible endpoint the user configured, else "".
+
+    ``model.base_url`` when ``model.provider`` is ``openrouter``, then
+    ``OPENROUTER_BASE_URL``. Without this, an OpenRouter-compatible relay/proxy
+    works for the main chat but auxiliary and fallback calls reach the hardcoded
+    vendor host carrying the relay's key (#121614).
+    """
+    try:
+        from hermes_cli.config import load_config
+        model_cfg = load_config().get("model")
+        if isinstance(model_cfg, dict):
+            cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
+            cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
+            if cfg_provider == "openrouter" and cfg_base_url:
+                return cfg_base_url
+    except Exception:
+        pass
+    return os.getenv("OPENROUTER_BASE_URL", "").strip().rstrip("/")
+
+
+def _try_openrouter(explicit_api_key: str = None, model: str = None,
+                    explicit_base_url: Optional[str] = None) -> Tuple[Optional[OpenAI], Optional[str]]:
+    # Endpoint precedence: caller-supplied (fallback_providers / custom_providers
+    # entry) > a pool row that names its own endpoint > the configured relay >
+    # the canonical host (#121359, #121614).
+    override_url = (explicit_base_url or "").strip().rstrip("/")
+    configured_url = "" if override_url else _configured_openrouter_base_url()
     pool_present, entry = _select_pool_entry("openrouter")
     if pool_present:
         or_key = explicit_api_key or _pool_runtime_api_key(entry)
         if or_key:
             base_url = _pool_runtime_base_url(entry, OPENROUTER_BASE_URL) or OPENROUTER_BASE_URL
+            if override_url:
+                base_url = override_url
+            elif configured_url and base_url.rstrip("/") == OPENROUTER_BASE_URL.rstrip("/"):
+                base_url = configured_url
             logger.debug("Auxiliary client: OpenRouter via pool")
             return _create_openai_client(api_key=or_key, base_url=base_url,
                            default_headers=build_or_headers()), model or _OPENROUTER_MODEL
@@ -2056,7 +2087,7 @@ def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Op
         _mark_provider_unhealthy("openrouter", ttl=60)
         return None, None
     logger.debug("Auxiliary client: OpenRouter")
-    return _create_openai_client(api_key=or_key, base_url=OPENROUTER_BASE_URL,
+    return _create_openai_client(api_key=or_key, base_url=override_url or configured_url or OPENROUTER_BASE_URL,
                    default_headers=build_or_headers()), model or _OPENROUTER_MODEL
 
 
@@ -2794,7 +2825,8 @@ def _try_azure_foundry(
     return client, final_model
 
 
-def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optional[str]]:
+def _try_anthropic(explicit_api_key: str = None,
+                   explicit_base_url: Optional[str] = None) -> Tuple[Optional[Any], Optional[str]]:
     try:
         from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
     except ImportError:
@@ -2842,6 +2874,22 @@ def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optiona
                     base_url = cfg_base_url
     except Exception:
         pass
+
+    # A caller-supplied endpoint (fallback_providers / custom_providers entry) wins over
+    # both the pool row and config.yaml, under the same Anthropic-compatible host rule the
+    # primary path applies. A foreign host is REFUSED outright rather than demoted to the
+    # canonical host: continuing would send the explicit credential somewhere the caller
+    # did not ask for (#121359).
+    override_url = (explicit_base_url or "").strip().rstrip("/")
+    if override_url:
+        if not _is_anthropic_compatible_host(override_url):
+            logger.warning(
+                "Auxiliary client: refusing anthropic explicit base_url %r — not an "
+                "Anthropic-compatible host; no client built and no request sent.",
+                override_url,
+            )
+            return None, None
+        base_url = override_url
 
     from agent.anthropic_adapter import _is_oauth_token
     is_oauth = _is_oauth_token(token)
@@ -4822,7 +4870,8 @@ def resolve_provider_client(
 
     # ── OpenRouter ───────────────────────────────────────────
     if provider == "openrouter":
-        client, default = _try_openrouter(explicit_api_key=explicit_api_key)
+        client, default = _try_openrouter(explicit_api_key=explicit_api_key,
+                                          explicit_base_url=explicit_base_url)
         if client is None:
             logger.warning(
                 "resolve_provider_client: openrouter requested but %s",
@@ -5154,7 +5203,8 @@ def resolve_provider_client(
 
     if pconfig.auth_type == "api_key":
         if provider == "anthropic":
-            client, default_model = _try_anthropic(explicit_api_key=explicit_api_key)
+            client, default_model = _try_anthropic(explicit_api_key=explicit_api_key,
+                                                   explicit_base_url=explicit_base_url)
             if client is None:
                 logger.warning("resolve_provider_client: anthropic requested but no Anthropic credentials found")
                 return None, None
