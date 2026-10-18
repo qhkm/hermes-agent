@@ -2770,6 +2770,10 @@ DEFAULT_CONFIG = {
         # first; "deny" blocks them outright with no approval request. Jentera sets
         # "deny": its approvals reach non-technical owners who cannot judge them.
         "imds": "approve",
+        # CIDR blocks a local TUN proxy (Mihomo/Clash fake-ip, Surge) answers DNS
+        # with, e.g. ["198.18.0.0/15"]. Declared blocks are dialable instead of
+        # blocked as private; empty by default. See tools/url_safety.py.
+        "fake_ip_ranges": [],
         "website_blocklist": {
             "enabled": False,
             "domains": [],
