@@ -34,7 +34,13 @@ _COMMIT_CONTEXT_UNTRACKED_MAX = 80
 _TRUNK_BRANCHES = ("main", "master")
 
 
-def _git(cwd: str, args: list[str], *, timeout: int = _GIT_TIMEOUT) -> tuple[int, str, str]:
+def _git(
+    cwd: str,
+    args: list[str],
+    *,
+    timeout: int = _GIT_TIMEOUT,
+    extra_env: "dict[str, str] | None" = None,
+) -> tuple[int, str, str]:
     """Run ``git`` in ``cwd``. Returns (returncode, stdout, stderr); never raises
     on a non-zero exit (callers decide what an error means).
 
@@ -45,6 +51,8 @@ def _git(cwd: str, args: list[str], *, timeout: int = _GIT_TIMEOUT) -> tuple[int
         env = noninteractive_repo_git_env(cwd)
         if env is None:
             return 1, "", "git filter discovery failed"
+        if extra_env:
+            env = {**env, **extra_env}
         proc = subprocess.run(
             ["git", *harden_git_argv(args)],
             cwd=cwd,
@@ -65,9 +73,9 @@ def _git_out(cwd: str, args: list[str]) -> str:
     return out if code == 0 else ""
 
 
-def _git_ok(cwd: str, args: list[str]) -> None:
+def _git_ok(cwd: str, args: list[str], *, extra_env: "dict[str, str] | None" = None) -> None:
     """Run a git mutation, raising RuntimeError with stderr on failure."""
-    code, _, err = _git(cwd, args)
+    code, _, err = _git(cwd, args, extra_env=extra_env)
     if code != 0:
         raise RuntimeError(err.strip() or f"git {' '.join(args)} failed")
 
@@ -375,12 +383,41 @@ def review_rev_parse(cwd: str, ref: str | None) -> str | None:
     return out or None
 
 
+def _review_commit_identity(cwd: str) -> dict[str, str]:
+    """The author/committer identity git would use in *cwd*, as ``GIT_*_NAME/EMAIL`` variables.
+
+    The hardened env blanks global/system config, which drops ``user.name`` / ``user.email``, so a
+    review-pane commit would fail with "Please tell me who you are". Git itself resolves the
+    identity (local and conditional config, ``GIT_AUTHOR_*`` precedence) in a read-only
+    ``git var`` probe under the NORMAL environment (``git var`` runs no repo-configured program);
+    the values are then passed explicitly to the hardened commit (upstream ``_review_commit_env``).
+    """
+    out: dict[str, str] = {}
+    for role in ("AUTHOR", "COMMITTER"):
+        try:
+            proc = subprocess.run(
+                ["git", "var", f"GIT_{role}_IDENT"],
+                cwd=cwd, capture_output=True, text=True, timeout=5,
+                stdin=subprocess.DEVNULL, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            )
+        except (OSError, subprocess.SubprocessError):
+            raise RuntimeError("git identity lookup failed") from None
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr.strip() or "git identity lookup failed")
+        ident = re.fullmatch(r"(.*) <([^<>]*)> -?\d+ [+-]\d{4}", proc.stdout.strip())
+        if ident is None:
+            raise RuntimeError("git returned an invalid commit identity")
+        out[f"GIT_{role}_NAME"], out[f"GIT_{role}_EMAIL"] = ident.groups()
+    return out
+
+
 def review_commit(cwd: str, message: str, push: bool) -> dict:
     """Commit the working tree; stage everything first when nothing is staged."""
+    identity = _review_commit_identity(cwd)
     _, raw, _ = _git(cwd, ["status", "--porcelain=v2", "-z"])
     if not any(_entry_staged(tag, xy) for tag, xy, _ in _walk_entries(raw)):
         _git_ok(cwd, ["add", "-A"])
-    _git_ok(cwd, ["commit", "-m", message])
+    _git_ok(cwd, ["commit", "-m", message], extra_env=identity)
     if push:
         _review_push(cwd)
     return {"ok": True}

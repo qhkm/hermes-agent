@@ -175,3 +175,39 @@ def test_git_endpoints_require_auth(repo):
 
     assert unauth.get("/api/git/status", params={"path": str(repo)}).status_code == 401
     assert unauth.post("/api/git/review/stage", json={"path": str(repo)}).status_code == 401
+
+
+def test_commit_keeps_global_identity_in_hardened_env(client, tmp_path, monkeypatch):
+    """The hardened env blanks global config; the identity git resolves must still reach the commit."""
+    gitconfig = tmp_path / "gitconfig"
+    gitconfig.write_text("[user]\n\tname = Global Person\n\temail = global@example.com\n"
+                         "\tuseConfigOnly = true\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(gitconfig))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for var in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
+                "EMAIL"):
+        monkeypatch.delenv(var, raising=False)
+    root = tmp_path / "noident"
+    root.mkdir()
+    _git(root, "init", "-q")
+    (root / "a.txt").write_text("x\n")
+
+    assert client.post(
+        "/api/git/review/commit", json={"path": str(root), "message": "first", "push": False}
+    ).json() == {"ok": True}
+    shown = subprocess.run(
+        ["git", "log", "-1", "--format=%an <%ae>|%cn <%ce>"], cwd=root, check=True,
+        capture_output=True, text=True).stdout.strip()
+    assert shown == "Global Person <global@example.com>|Global Person <global@example.com>"
+
+
+def test_commit_honours_author_environment_over_config(client, repo, monkeypatch):
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "Env Author")
+    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "env@example.com")
+    assert client.post(
+        "/api/git/review/commit", json={"path": str(repo), "message": "env", "push": False}
+    ).json() == {"ok": True}
+    shown = subprocess.run(
+        ["git", "log", "-1", "--format=%an <%ae>|%cn"], cwd=repo, check=True,
+        capture_output=True, text=True).stdout.strip()
+    assert shown == "Env Author <env@example.com>|Test"
