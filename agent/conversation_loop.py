@@ -621,6 +621,56 @@ def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
     return f"Tool '{name}' does not exist. Available tools: {available}"
 
 
+def _reroute_deferred_direct_calls(agent, tool_calls) -> int:
+    """Turn a direct call to a deferred tool into a ``tool_call`` bridge call.
+
+    Under tool search a deferred core tool (``session_search``…) is not in the
+    model's tool list, yet the prompt and the model's own memory still name
+    it. Treating such a call as a hallucinated name burns the invalid-tool
+    strike budget and ends the turn after three. Instead, when the name is a
+    deferrable tool in this session's scope and the bridge is active, rewrite
+    the call to ``tool_call {name, arguments}`` so it dispatches exactly as if
+    the model had gone through the bridge (scope, hooks and approvals apply).
+
+    Returns the number of calls rewritten.
+    """
+    valid = agent.valid_tool_names
+    try:
+        from tools.tool_search import TOOL_CALL_NAME
+    except Exception:
+        return 0
+    if TOOL_CALL_NAME not in valid:
+        return 0
+    rewritten = 0
+    scoped = None
+    for tc in tool_calls or []:
+        name = getattr(tc.function, "name", "")
+        if not name or name in valid:
+            continue
+        if scoped is None:
+            try:
+                from agent.tool_executor import _tool_search_scoped_names
+                scoped = _tool_search_scoped_names(agent)
+            except Exception:
+                scoped = frozenset()
+        if name not in scoped:
+            continue
+        raw_args = tc.function.arguments
+        if isinstance(raw_args, str):
+            try:
+                parsed = json.loads(raw_args) if raw_args.strip() else {}
+            except (ValueError, TypeError):
+                continue  # unparseable: leave it to the normal invalid path
+        else:
+            parsed = raw_args
+        if not isinstance(parsed, dict):
+            continue
+        tc.function.name = TOOL_CALL_NAME
+        tc.function.arguments = json.dumps({"name": name, "arguments": parsed}, ensure_ascii=False)
+        rewritten += 1
+    return rewritten
+
+
 def _content_policy_blocked_result(
     messages: List[Dict],
     api_call_count: int,
@@ -5010,6 +5060,9 @@ def run_conversation(
                         args_preview = raw_args[:200] if isinstance(raw_args, str) else repr(raw_args)[:200]
                         logging.debug("Tool call: %s with args: %s...", tc.function.name, args_preview)
                 
+                # A deferred tool called by its own name is not a hallucination:
+                # send it through the bridge (no strike).
+                _reroute_deferred_direct_calls(agent, assistant_message.tool_calls)
                 # Validate tool call names - detect model hallucinations
                 # Repair mismatched tool names before validating
                 for tc in assistant_message.tool_calls:
