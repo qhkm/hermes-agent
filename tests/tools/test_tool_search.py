@@ -657,6 +657,22 @@ class TestCoreToolDeferral:
         names = {td["function"]["name"] for td in assembled.tool_defs}
         assert "read_terminal" in names and "session_search" not in names
 
+    def test_explicit_never_defer_is_a_union_with_the_default(self):
+        from tools.tool_search import ToolSearchConfig, _DEFAULT_NEVER_DEFER
+
+        for raw in (["read_terminal"], [], ["toolset:other"]):
+            cfg = ToolSearchConfig.from_raw({"never_defer": raw})
+            assert _DEFAULT_NEVER_DEFER <= cfg.never_defer
+            assert set(raw) <= cfg.never_defer
+
+    def test_empty_never_defer_still_protects_the_jentera_toolset(self):
+        from tools.tool_search import ToolSearchConfig, is_deferrable_tool_name
+
+        self._register("zz_union_tool", "jentera")
+        cfg = ToolSearchConfig.from_raw({"never_defer": []})
+        assert not is_deferrable_tool_name(
+            "zz_union_tool", frozenset({"zz_union_tool"}), cfg.never_defer)
+
     def test_plugin_tools_still_follow_the_threshold(self):
         from tools.tool_search import ToolSearchConfig, assemble_tool_defs
 

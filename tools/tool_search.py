@@ -171,7 +171,11 @@ class ToolSearchConfig:
 
         never_raw = raw.get("never_defer")
         if isinstance(never_raw, (list, tuple, set)):
-            never_defer = frozenset(str(n).strip() for n in never_raw if str(n).strip())
+            # A union, never a replacement: config can add protection but
+            # cannot remove the Jentera toolset's.
+            never_defer = _DEFAULT_NEVER_DEFER | frozenset(
+                str(n).strip() for n in never_raw if str(n).strip()
+            )
         else:
             never_defer = _DEFAULT_NEVER_DEFER
 
