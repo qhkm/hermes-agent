@@ -2090,6 +2090,17 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 summary_response = agent._anthropic_messages_create(_ant_kw)
                 _summary_result = _tsum.normalize_response(summary_response, strip_tool_prefix=agent._is_anthropic_oauth)
                 final_response = (_summary_result.content or "").strip()
+            elif agent._has_stream_consumers() and not getattr(agent, "_disable_streaming", False):
+                # This summary is the turn's answer, so a listening consumer
+                # (the API server's SSE, a gateway bubble) gets it as it is
+                # written, as it would any final answer. The streaming call
+                # falls back to a plain request when the provider cannot
+                # stream. Jentera: as one request it reached the owner only
+                # whole, after the model had finished writing it.
+                agent._reset_stream_delivery_tracking()
+                summary_response = agent._interruptible_streaming_api_call(summary_kwargs)
+                _summary_result = agent._get_transport().normalize_response(summary_response)
+                final_response = (_summary_result.content or "").strip()
             else:
                 summary_response = agent._ensure_primary_openai_client(reason="iteration_limit_summary").chat.completions.create(**summary_kwargs)
                 _summary_result = agent._get_transport().normalize_response(summary_response)

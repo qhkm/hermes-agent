@@ -3861,6 +3861,40 @@ class TestMcpParallelToolBatch:
 
 
 class TestHandleMaxIterations:
+    def test_summary_streams_to_a_listening_consumer(self, agent):
+        """A run that reached its iteration limit answers through this summary.
+        With a stream consumer attached (the API server's SSE, a gateway
+        bubble) the summary must stream like any final answer; asked as one
+        non-streaming request it reached the consumer only as a whole, after
+        the model had finished writing it (Jentera, 18 Oct)."""
+        seen = []
+        agent.stream_delta_callback = seen.append
+        agent._cached_system_prompt = "You are helpful."
+
+        def streaming(api_kwargs, on_first_delta=None):
+            assert "tools" not in api_kwargs
+            for piece in ("Here is ", "what I ", "found."):
+                agent._fire_stream_delta(piece)
+            return _mock_response(content="Here is what I found.")
+
+        with patch.object(agent, "_interruptible_streaming_api_call", side_effect=streaming) as stream_call:
+            result = agent._handle_max_iterations([{"role": "user", "content": "do stuff"}], 2)
+
+        assert result == "Here is what I found."
+        assert stream_call.call_count == 1
+        assert "".join(seen) == "Here is what I found."
+        agent.client.chat.completions.create.assert_not_called()
+
+    def test_summary_without_a_consumer_stays_one_request(self, agent):
+        agent.stream_delta_callback = None
+        agent._stream_callback = None
+        agent.client.chat.completions.create.return_value = _mock_response(content="Summary")
+        agent._cached_system_prompt = "You are helpful."
+        with patch.object(agent, "_interruptible_streaming_api_call") as stream_call:
+            result = agent._handle_max_iterations([{"role": "user", "content": "do stuff"}], 2)
+        assert result == "Summary"
+        stream_call.assert_not_called()
+
     def test_returns_summary(self, agent):
         resp = _mock_response(content="Here is a summary of what I did.")
         agent.client.chat.completions.create.return_value = resp
