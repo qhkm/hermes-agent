@@ -18,7 +18,7 @@ from tools.file_operations import (
     normalize_search_pagination,
 )
 from tools import file_state
-from agent.redact import redact_sensitive_text
+from agent.redact import _is_secret_file_arg, redact_sensitive_text
 
 logger = logging.getLogger(__name__)
 
@@ -513,6 +513,14 @@ def _is_blocked_device(filepath: str, base_dir: str | Path | None = None) -> boo
     if _is_blocked_device_path(resolved):
         return True
     return False
+
+
+def _resolved_match_path(path: str, task_id: str = "default") -> str:
+    """Best-effort task-cwd resolution of a search hit's path (raw path if unresolvable)."""
+    try:
+        return str(_resolve_path_for_task(path, task_id))
+    except (OSError, ValueError, RuntimeError):
+        return path
 
 
 def _search_result_read_block_error(path: str, task_id: str = "default") -> str | None:
@@ -1181,7 +1189,9 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                             "retrievable via offset."
                         )
                 if result_dict["content"]:
-                    result_dict["content"] = redact_sensitive_text(result_dict["content"], file_read=True)
+                    result_dict["content"] = redact_sensitive_text(
+                        result_dict["content"], file_read=True,
+                        secret_file=_is_secret_file_arg(str(_resolved)))
                 return json.dumps(result_dict, ensure_ascii=False)
 
         # ── Binary file guard ─────────────────────────────────────────
@@ -1315,7 +1325,9 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
 
         # ── Redact secrets (after guard check to skip oversized content) ──
         if result.content:
-            result.content = redact_sensitive_text(result.content, file_read=True)
+            result.content = redact_sensitive_text(
+                result.content, file_read=True,
+                secret_file=_is_secret_file_arg(resolved_str))
             result_dict["content"] = result.content
 
         # Large-file hint: if the file is big and the caller didn't ask
@@ -1905,7 +1917,9 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
         if hasattr(result, 'matches'):
             for m in result.matches:
                 if hasattr(m, 'content') and m.content:
-                    m.content = redact_sensitive_text(m.content, file_read=True)
+                    m.content = redact_sensitive_text(
+                        m.content, file_read=True,
+                        secret_file=_is_secret_file_arg(_resolved_match_path(m.path, task_id)))
         result_dict = result.to_dict(densify=True)
 
         if omitted:

@@ -4,7 +4,12 @@ import logging
 
 import pytest
 
-from agent.redact import redact_cdp_url, redact_sensitive_text, RedactingFormatter
+from agent.redact import (
+    RedactingFormatter,
+    _is_secret_file_arg,
+    redact_cdp_url,
+    redact_sensitive_text,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -1097,3 +1102,69 @@ class TestRedactCdpUrl:
 
     def test_none_returns_empty(self):
         assert redact_cdp_url(None) == ""
+
+
+class TestSecretFileAssignmentRedaction:
+    """Upstream #110567/#111422: file_read used to imply code_file and skip the assignment
+    passes, so an opaque prefix-less credential in a secret-bearing file reached the model in
+    cleartext. secret_file=True re-enables them with the non-reusable sentinel (#35519)."""
+
+    SYNTH = "3JcQ1UqZ8mNp4Rt6vWx2Yb9Ad0Ef7Gh5Ij2kS"  # 40-char opaque, no vendor prefix
+    SENT = "\u00abredacted-secret\u00bb"
+
+    @pytest.mark.parametrize("template", [
+        "ADS_API_TOKEN: {tok}",
+        "export FOO_TOKEN='{tok}'",
+        "FOO_API_KEY={tok}",
+        '{{"api_key": "{tok}"}}',
+        "5|      ADS_API_TOKEN: {tok}",
+        "108:ADS_API_TOKEN: {tok}",
+        "108-      ADS_API_TOKEN: {tok}",
+        "   108\tADS_API_TOKEN: {tok}",
+        "   108\texport FOO_TOKEN={tok}",
+    ])
+    def test_secret_file_masks_with_sentinel(self, template):
+        text = template.format(tok=self.SYNTH)
+        out = redact_sensitive_text(text, force=True, file_read=True, secret_file=True)
+        assert self.SYNTH not in out
+        assert self.SENT in out
+        assert out.split(self.SENT)[0].rstrip(" ='\"") in text  # key and gutter survive
+
+    def test_prefix_label_survives(self):
+        out = redact_sensitive_text(
+            "GITHUB_TOKEN: ghp_S1abcdefghijklmnopqrstuvwxyz0Pn2T",
+            force=True, file_read=True, secret_file=True)
+        assert "ghp_S1" not in out
+        assert "\u00abredacted:ghp_\u2026\u00bb" in out
+
+    def test_unclassified_read_is_untouched(self):
+        for text in ("MAX_TOKENS: 100", '{"apiKey": "test"}', f"5|ADS_API_TOKEN: {self.SYNTH}"):
+            assert redact_sensitive_text(text, force=True, file_read=True) == text
+
+    def test_secret_file_wins_over_code_file(self):
+        out = redact_sensitive_text(
+            f"FOO_TOKEN={self.SYNTH}", force=True, code_file=True, file_read=True, secret_file=True)
+        assert self.SYNTH not in out
+
+    def test_path_and_variable_values_are_kept(self):
+        for text in ("export SSH_AUTH_SOCK=$HOME/.ssh/agent.sock", "DOCKER_AUTH_CONFIG=/home/u/.docker"):
+            assert redact_sensitive_text(text, force=True, file_read=True, secret_file=True) == text
+        out = redact_sensitive_text("DB_PASSWORD=/etc/hunter2", force=True, file_read=True, secret_file=True)
+        assert "hunter2" not in out
+
+    def test_gutter_regexes_stay_linear(self):
+        import time
+        text = " " * 20000 + "x"
+        start = time.perf_counter()
+        redact_sensitive_text(text, force=True, file_read=True, secret_file=True)
+        assert time.perf_counter() - start < 1.0
+
+    @pytest.mark.parametrize("arg, expected", [
+        (".env", True), ("/srv/app/.env.local", True), ("~/.zshrc", True),
+        ("/home/u/.hermes/config.yaml", True),
+        ("/home/u/.hermes/backups/config/config.yaml.good.20260101", True),
+        ("/srv/app/config.yaml", False), ("main.py", False), ("app.ts", False),
+        ("/srv/app/.env.example", False),
+    ])
+    def test_classifier(self, arg, expected):
+        assert _is_secret_file_arg(arg) is expected
