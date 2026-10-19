@@ -11,92 +11,46 @@ import logging
 import os
 import re
 import shlex
-import threading
 from urllib.parse import unquote_plus
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Private-form value registry (profile-scoped, bounded)
+# Private-form values (Jentera)
 # ---------------------------------------------------------------------------
 # Exact values the Jentera runner typed into a page for the owner (card number,
-# CVV, password). No generic regex can recognise them, so the plugin registers
-# the exact strings and every model-bound text is scrubbed against them, whether
-# or not general secret redaction is on. Memory only: never persisted or logged.
-# Keyed by profile home so a multiplex gateway never scrubs one profile's output
-# with another's values; bounded so a long session cannot grow it forever.
-_VAULT_REDACTION_MAX_PER_PROFILE = 64
-_VAULT_REDACTION_VALUES: dict = {}  # profile home -> ordered {value: None}
-_VAULT_REDACTION_LOCK = threading.Lock()
-_VAULT_REDACTION_MARKER = "[hidden]"
+# password). The runner keeps them; Hermes never does. A plugin installs a
+# scrubber that asks the runner to blank model-bound text, and every outgoing
+# model request goes through it (conversation_loop). Without a plugin nothing
+# changes. A scrubber that breaks fails closed: the text is withheld, never sent.
+MODEL_TEXT_CHECK_FAILED = "[hidden: could not check for private values]"
+_MODEL_TEXT_SCRUBBER = None
 
 
-def _vault_scope() -> str:
-    from hermes_constants import get_hermes_home
-    return str(get_hermes_home())
+def set_model_text_scrubber(scrubber) -> None:
+    """Install (or, with None, remove) the scrubber for model-bound text.
 
-
-def register_vault_redaction_value(value) -> None:
-    """Register an exact value for model-facing redaction.
-
-    Also registers the form a text input normalises it to (CR/LF stripped),
-    since that is what the page holds.
+    ``scrubber(texts: list[str]) -> list[str]`` returns the texts in the same
+    order, blanked; it decides itself whether a check is needed at all.
     """
-    if not isinstance(value, str) or not value:
-        return
-    normalized = value.replace("\r", "").replace("\n", "")
-    with _VAULT_REDACTION_LOCK:
-        bucket = _VAULT_REDACTION_VALUES.setdefault(_vault_scope(), {})
-        for v in (value, normalized):
-            if v:
-                bucket.pop(v, None)  # re-registering refreshes recency
-                bucket[v] = None
-        while len(bucket) > _VAULT_REDACTION_MAX_PER_PROFILE:
-            del bucket[next(iter(bucket))]
+    global _MODEL_TEXT_SCRUBBER
+    _MODEL_TEXT_SCRUBBER = scrubber
 
 
-def clear_vault_redaction_values() -> None:
-    """Drop the current profile's registered values."""
-    with _VAULT_REDACTION_LOCK:
-        _VAULT_REDACTION_VALUES.pop(_vault_scope(), None)
+def scrub_model_texts(texts):
+    """Every text as it may be sent to the model. Unchanged without a scrubber."""
+    texts = list(texts)
+    scrubber = _MODEL_TEXT_SCRUBBER
+    if scrubber is None or not texts:
+        return texts
+    try:
+        out = scrubber(texts)
+        if isinstance(out, list) and len(out) == len(texts) and all(isinstance(t, str) for t in out):
+            return out
+    except Exception:
+        pass
+    return [MODEL_TEXT_CHECK_FAILED if t else t for t in texts]
 
-
-def replace_vault_redaction_values(values) -> None:
-    """Swap the current profile's registered values for ``values`` in one step.
-
-    The new ordered set is built outside the lock and installed under a single
-    acquisition, so a parallel scrub never sees an empty or partial set.
-    """
-    bucket: dict = {}
-    for value in values or ():
-        if not isinstance(value, str) or not value:
-            continue
-        for v in (value, value.replace("\r", "").replace("\n", "")):
-            if v:
-                bucket.pop(v, None)
-                bucket[v] = None
-    while len(bucket) > _VAULT_REDACTION_MAX_PER_PROFILE:
-        del bucket[next(iter(bucket))]
-    scope = _vault_scope()
-    with _VAULT_REDACTION_LOCK:
-        if bucket:
-            _VAULT_REDACTION_VALUES[scope] = bucket
-        else:
-            _VAULT_REDACTION_VALUES.pop(scope, None)
-
-
-def redact_registered_vault_values(text: str) -> str:
-    """Exact-substring scrub of every value registered for the current profile."""
-    if not isinstance(text, str) or not text:
-        return text
-    with _VAULT_REDACTION_LOCK:
-        bucket = _VAULT_REDACTION_VALUES.get(_vault_scope())
-        # Longest first: a substring never shadows its superstring.
-        values = sorted(bucket, key=len, reverse=True) if bucket else ()
-    for value in values:
-        if value in text:
-            text = text.replace(value, _VAULT_REDACTION_MARKER)
-    return text
 
 # Sensitive query-string parameter names (case-insensitive exact match).
 # Ported from nearai/ironclaw#2529 — catches tokens whose values don't match
@@ -748,8 +702,6 @@ def redact_sensitive_text(
         text = str(text)
     if not text:
         return text
-    # Registered private-form values go first and regardless of the global switch.
-    text = redact_registered_vault_values(text)
     if not (force or _REDACT_ENABLED):
         return text
 
