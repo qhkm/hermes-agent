@@ -1104,20 +1104,23 @@ def run_conversation(
         # model: scrub every outgoing message, whichever path produced it.
         try:
             from agent.redact import redact_registered_vault_values as _scrub_registered
-            for _m in api_messages:
-                _c = _m.get("content")
+
+            def _scrub_content(_c):
                 if isinstance(_c, str):
-                    _m["content"] = _scrub_registered(_c)
-                elif isinstance(_c, list):
-                    _parts = []
-                    for _p in _c:
-                        if isinstance(_p, dict):
-                            _p = dict(_p)
-                            for _k in ("text", "content"):
-                                if isinstance(_p.get(_k), str):
-                                    _p[_k] = _scrub_registered(_p[_k])
-                        _parts.append(_p)
-                    _m["content"] = _parts
+                    return _scrub_registered(_c)
+                if isinstance(_c, list):
+                    return [_scrub_content(_p) for _p in _c]
+                if isinstance(_c, dict):
+                    _d = dict(_c)
+                    for _k in ("text", "content"):
+                        if _k in _d:
+                            _d[_k] = _scrub_content(_d[_k])
+                    return _d
+                return _c
+
+            for _m in api_messages:
+                if "content" in _m:
+                    _m["content"] = _scrub_content(_m["content"])
         except Exception:
             pass
 

@@ -9,19 +9,19 @@ never logged.
 from __future__ import annotations
 
 import json
-import urllib.error
 import urllib.request
 
-from agent.redact import (
-    clear_vault_redaction_values,
-    redact_registered_vault_values,
-    register_vault_redaction_value,
-)
+from agent.redact import redact_registered_vault_values, replace_vault_redaction_values
 from plugins.jentera.handoff import _runner_key, _runner_url
 
 REDACTIONS_PATH = "/v1/private-form/redactions"
 TIMEOUT_SECONDS = 1.0
 MAX_VALUES = 64
+# Shorter strings (a 3-digit CVV) would blank ordinary text everywhere.
+MIN_VALUE_LENGTH = 8
+
+# Loopback only: never route through an environment proxy.
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def refresh_values() -> bool:
@@ -29,25 +29,27 @@ def refresh_values() -> bool:
     key = _runner_key()
     if not key:
         return False
-    request = urllib.request.Request(
-        _runner_url() + REDACTIONS_PATH,
-        method="GET",
-        headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
-    )
     try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+        request = urllib.request.Request(
+            _runner_url() + REDACTIONS_PATH,
+            method="GET",
+            headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
+        )
+        with _OPENER.open(request, timeout=TIMEOUT_SECONDS) as response:
             if response.status != 200:
                 return False
             body = json.loads(response.read() or b"{}")
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        if not isinstance(body, dict) or body.get("ok") is not True:
+            return False
+        values = body.get("values")
+        if not isinstance(values, list):
+            return False
+        replace_vault_redaction_values(
+            [v for v in values[:MAX_VALUES] if isinstance(v, str) and len(v) >= MIN_VALUE_LENGTH]
+        )
+        return True
+    except Exception:
         return False
-    values = body.get("values") if isinstance(body, dict) else None
-    if body.get("ok") is not True or not isinstance(values, list):
-        return False
-    clear_vault_redaction_values()
-    for value in values[:MAX_VALUES]:
-        register_vault_redaction_value(value)
-    return True
 
 
 def _on_pre_llm_call(**_kwargs):
@@ -55,13 +57,9 @@ def _on_pre_llm_call(**_kwargs):
     return None
 
 
-def _on_pre_api_request(**_kwargs):
-    refresh_values()
-
-
 def _on_transform_tool_result(result=None, **_kwargs):
-    # A value is typed during a tool call; fetch again before its result (and
-    # the next model call) is built, and blank this very result.
+    # A value is typed during a tool call; fetch again so the next model call
+    # sees it, and blank this very result with whatever list we hold now.
     refresh_values()
     if isinstance(result, str):
         scrubbed = redact_registered_vault_values(result)
@@ -72,5 +70,7 @@ def _on_transform_tool_result(result=None, **_kwargs):
 
 def register_hooks(ctx) -> None:
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
-    ctx.register_hook("pre_api_request", _on_pre_api_request)
+    # First string returned wins across plugins, so a plugin ahead of this one
+    # can bypass the blank here; the send-time scrub in conversation_loop is
+    # the backstop.
     ctx.register_hook("transform_tool_result", _on_transform_tool_result)

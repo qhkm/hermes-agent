@@ -61,6 +61,30 @@ def clear_vault_redaction_values() -> None:
         _VAULT_REDACTION_VALUES.pop(_vault_scope(), None)
 
 
+def replace_vault_redaction_values(values) -> None:
+    """Swap the current profile's registered values for ``values`` in one step.
+
+    The new ordered set is built outside the lock and installed under a single
+    acquisition, so a parallel scrub never sees an empty or partial set.
+    """
+    bucket: dict = {}
+    for value in values or ():
+        if not isinstance(value, str) or not value:
+            continue
+        for v in (value, value.replace("\r", "").replace("\n", "")):
+            if v:
+                bucket.pop(v, None)
+                bucket[v] = None
+    while len(bucket) > _VAULT_REDACTION_MAX_PER_PROFILE:
+        del bucket[next(iter(bucket))]
+    scope = _vault_scope()
+    with _VAULT_REDACTION_LOCK:
+        if bucket:
+            _VAULT_REDACTION_VALUES[scope] = bucket
+        else:
+            _VAULT_REDACTION_VALUES.pop(scope, None)
+
+
 def redact_registered_vault_values(text: str) -> str:
     """Exact-substring scrub of every value registered for the current profile."""
     if not isinstance(text, str) or not text:

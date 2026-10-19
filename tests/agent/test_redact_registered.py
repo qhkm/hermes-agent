@@ -75,3 +75,39 @@ def test_snapshot_tool_result_is_blanked_in_the_request(monkeypatch):
     blob = repr(sent)
     assert CARD not in blob
     assert "[hidden]" in blob
+
+
+def test_values_of_another_profile_are_not_scrubbed(monkeypatch, tmp_path):
+    import os
+    original = os.environ.get("HERMES_HOME")
+    redact.register_vault_redaction_value(CARD)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "other"))
+    assert redact.redact_registered_vault_values(CARD) == CARD
+    if original is None:
+        monkeypatch.delenv("HERMES_HOME")
+    else:
+        monkeypatch.setenv("HERMES_HOME", original)
+    assert redact.redact_registered_vault_values(CARD) == "[hidden]"
+
+
+def test_nested_list_content_is_scrubbed_in_the_request(monkeypatch):
+    redact.register_vault_redaction_value(CARD)
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(api_key="test-key-1234567890", base_url="https://openrouter.ai/api/v1",
+                        quiet_mode=True, skip_context_files=True, skip_memory=True)
+    agent.client = MagicMock()
+    agent._cached_system_prompt = "x"
+    agent._use_prompt_caching = False
+    agent.client.chat.completions.create.return_value = _resp()
+    history = [{"role": "user", "content": [{"type": "text", "text": [{"type": "text", "text": CARD}]}]}]
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        agent.run_conversation("go", conversation_history=history)
+    assert CARD not in repr(agent.client.chat.completions.create.call_args.kwargs["messages"])
