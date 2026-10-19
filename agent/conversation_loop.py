@@ -1100,6 +1100,27 @@ def run_conversation(
             # The signature field helps maintain reasoning continuity
             api_messages.append(api_msg)
 
+        # Private-form values the runner typed for the owner never reach the
+        # model: scrub every outgoing message, whichever path produced it.
+        try:
+            from agent.redact import redact_registered_vault_values as _scrub_registered
+            for _m in api_messages:
+                _c = _m.get("content")
+                if isinstance(_c, str):
+                    _m["content"] = _scrub_registered(_c)
+                elif isinstance(_c, list):
+                    _parts = []
+                    for _p in _c:
+                        if isinstance(_p, dict):
+                            _p = dict(_p)
+                            for _k in ("text", "content"):
+                                if isinstance(_p.get(_k), str):
+                                    _p[_k] = _scrub_registered(_p[_k])
+                        _parts.append(_p)
+                    _m["content"] = _parts
+        except Exception:
+            pass
+
         # Build the final system message: cached prompt + ephemeral system prompt.
         # Ephemeral additions are API-call-time only (not persisted to session DB).
         # External recall context is injected into the user message, not the system

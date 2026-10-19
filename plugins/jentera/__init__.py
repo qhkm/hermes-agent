@@ -9,6 +9,7 @@ books.
 from __future__ import annotations
 
 from plugins.jentera.handoff import ASK_SPECIALIST_SCHEMA, check_handoff_available, handle_ask_specialist
+from plugins.jentera.private_form import register_hooks as register_private_form_hooks
 from plugins.jentera.site import (
     SITE_APPLY_SCHEMA,
     SITE_CODE_SCHEMA,
@@ -33,6 +34,7 @@ from plugins.jentera.tools import (
 
 def register(ctx) -> None:
     """Register the Jentera tools. Called once by the plugin loader."""
+    register_private_form_hooks(ctx)
     ctx.register_tool(
         name="business_records",
         toolset="jentera",

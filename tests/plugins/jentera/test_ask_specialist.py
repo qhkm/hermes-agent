@@ -139,6 +139,9 @@ def test_registered_beside_business_records():
         def register_tool(self, **kwargs):
             registered.append(kwargs["name"])
 
+        def register_hook(self, name, callback):
+            pass
+
     plugin.register(Ctx())
     assert registered == [
         "business_records",
