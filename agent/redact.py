@@ -7,6 +7,7 @@ Short tokens (< 18 chars) are fully masked. Longer tokens preserve
 the first 6 and last 4 characters for debuggability.
 """
 
+import json
 import logging
 import os
 import re
@@ -50,6 +51,83 @@ def scrub_model_texts(texts):
     except Exception:
         pass
     return [MODEL_TEXT_CHECK_FAILED if t else t for t in texts]
+
+
+def scrub_outgoing_messages(api_messages):
+    """Blank private-form values in every outgoing message, in place.
+
+    Every text (content strings, text parts, however nested) and every
+    tool-call argument goes through :func:`scrub_model_texts` in one batch.
+    Both model-request builders call this: the main loop and the
+    iteration-limit summary (``handle_max_iterations``), so no request reaches
+    the model without the check. Returns ``api_messages``.
+
+    ``api_messages`` must be the per-call copies (``msg.copy()``), never the
+    stored messages: the message dicts are edited in place. Lists and tool
+    calls are copied before they are replaced, so what the copies shared with
+    the stored messages is never rewritten. Tool-call arguments stay JSON when
+    the check could not be made. Without a scrubber nothing changes. A scrub
+    that cannot run withholds the text instead of sending it.
+    """
+    try:
+        slots = []  # (container, key, is_arguments)
+
+        def collect(holder, key):
+            content = holder[key]
+            if isinstance(content, str):
+                if content:
+                    slots.append((holder, key, False))
+            elif isinstance(content, list):
+                # Copy before an element is replaced: at any depth, the list
+                # is shared with the stored message.
+                content = holder[key] = list(content)
+                for i in range(len(content)):
+                    collect(content, i)
+            elif isinstance(content, dict):
+                part = dict(content)
+                holder[key] = part
+                for k in ("text", "content"):
+                    if k in part:
+                        collect(part, k)
+
+        for message in api_messages:
+            if "content" in message:
+                collect(message, "content")
+            calls = message.get("tool_calls")
+            if isinstance(calls, list):
+                message["tool_calls"] = calls = [dict(call) if isinstance(call, dict) else call for call in calls]
+                for call in calls:
+                    fn = call.get("function") if isinstance(call, dict) else None
+                    if isinstance(fn, dict) and isinstance(fn.get("arguments"), str) and fn["arguments"]:
+                        call["function"] = fn = dict(fn)
+                        slots.append((fn, "arguments", True))
+
+        if slots:
+            out = scrub_model_texts([holder[key] for holder, key, _ in slots])
+            for (holder, key, is_arguments), text in zip(slots, out):
+                # Arguments must stay JSON when the check could not be made.
+                holder[key] = (
+                    json.dumps({"hidden": MODEL_TEXT_CHECK_FAILED})
+                    if (is_arguments and text == MODEL_TEXT_CHECK_FAILED)
+                    else text
+                )
+    except Exception:
+        # A scrub that cannot run must not send the text unscrubbed. The
+        # stored messages are still protected: tool calls are rebuilt here,
+        # not edited, since the failure may have come before they were copied.
+        if _MODEL_TEXT_SCRUBBER is not None:
+            hidden_arguments = json.dumps({"hidden": MODEL_TEXT_CHECK_FAILED})
+            for message in api_messages:
+                if "content" in message and message["content"]:
+                    message["content"] = MODEL_TEXT_CHECK_FAILED
+                if isinstance(message.get("tool_calls"), list):
+                    message["tool_calls"] = [
+                        {**call, "function": {**call["function"], "arguments": hidden_arguments}}
+                        if isinstance(call, dict) and isinstance(call.get("function"), dict)
+                        else call
+                        for call in message["tool_calls"]
+                    ]
+    return api_messages
 
 
 # Sensitive query-string parameter names (case-insensitive exact match).

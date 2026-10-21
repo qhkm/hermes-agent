@@ -1959,6 +1959,16 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 agent._sanitize_tool_calls_for_strict_api(api_msg, model=agent.model)
             api_messages.append(api_msg)
 
+        # Private-form values the runner typed for the owner never reach the
+        # model on this request either: the same scrub, at the same point, as
+        # the main loop (after the turn notes, before the system message), and
+        # failing closed the same way. Every request below — the plain call,
+        # the streaming call, the Codex and Anthropic builders, and the retry —
+        # is built from these ``api_messages``.
+        from agent.redact import scrub_outgoing_messages
+
+        scrub_outgoing_messages(api_messages)
+
         effective_system = agent._cached_system_prompt or ""
         if agent.ephemeral_system_prompt:
             effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()

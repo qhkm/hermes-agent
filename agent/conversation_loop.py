@@ -1114,57 +1114,12 @@ def run_conversation(
         # Private-form values the runner typed for the owner never reach the
         # model: every outgoing text, whichever path produced it, and every
         # tool-call argument go through the scrubber in one batch. Without a
-        # scrubber (no Jentera plugin) nothing changes.
-        try:
-            from agent.redact import MODEL_TEXT_CHECK_FAILED as _check_failed, scrub_model_texts as _scrub_texts
+        # scrubber (no Jentera plugin) nothing changes. The iteration-limit
+        # summary (chat_completion_helpers.handle_max_iterations) calls the
+        # same function on its own request.
+        from agent.redact import scrub_outgoing_messages
 
-            _slots = []  # (container, key, is_arguments)
-
-            def _collect(_holder, _key):
-                _c = _holder[_key]
-                if isinstance(_c, str):
-                    if _c:
-                        _slots.append((_holder, _key, False))
-                elif isinstance(_c, list):
-                    for _i in range(len(_c)):
-                        _collect(_c, _i)
-                elif isinstance(_c, dict):
-                    _d = dict(_c)
-                    _holder[_key] = _d
-                    for _k in ("text", "content"):
-                        if _k in _d:
-                            _collect(_d, _k)
-
-            for _m in api_messages:
-                if "content" in _m:
-                    if isinstance(_m["content"], list):
-                        _m["content"] = list(_m["content"])
-                    _collect(_m, "content")
-                _calls = _m.get("tool_calls")
-                if isinstance(_calls, list):
-                    _m["tool_calls"] = _calls = [dict(_call) if isinstance(_call, dict) else _call for _call in _calls]
-                    for _call in _calls:
-                        _fn = _call.get("function") if isinstance(_call, dict) else None
-                        if isinstance(_fn, dict) and isinstance(_fn.get("arguments"), str) and _fn["arguments"]:
-                            _call["function"] = _fn = dict(_fn)
-                            _slots.append((_fn, "arguments", True))
-
-            if _slots:
-                _out = _scrub_texts([_h[_k] for _h, _k, _ in _slots])
-                for (_h, _k, _args), _text in zip(_slots, _out):
-                    # Arguments must stay JSON when the check could not be made.
-                    _h[_k] = json.dumps({"hidden": _check_failed}) if (_args and _text == _check_failed) else _text
-        except Exception:
-            # A scrub that cannot run must not send the text unscrubbed.
-            from agent.redact import MODEL_TEXT_CHECK_FAILED as _check_failed, _MODEL_TEXT_SCRUBBER
-            if _MODEL_TEXT_SCRUBBER is not None:
-                for _m in api_messages:
-                    if "content" in _m and _m["content"]:
-                        _m["content"] = _check_failed
-                    if isinstance(_m.get("tool_calls"), list):
-                        for _call in _m["tool_calls"]:
-                            if isinstance(_call, dict) and isinstance(_call.get("function"), dict):
-                                _call["function"] = {**_call["function"], "arguments": json.dumps({"hidden": _check_failed})}
+        scrub_outgoing_messages(api_messages)
 
         # Build the final system message: cached prompt + ephemeral system prompt.
         # Ephemeral additions are API-call-time only (not persisted to session DB).
