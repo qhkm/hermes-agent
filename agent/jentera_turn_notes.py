@@ -13,15 +13,31 @@ the ``api_content`` sidecar, so earlier turns replay without it and nothing
 stale piles up in the transcript. The notes text is never logged.
 """
 
+import re
 from typing import Any
 
 # Same bound as the control plane's ``instructions`` (20,000 characters).
 TURN_NOTES_MAX = 20_000
 
 
+# A block tag as the model could read it: any case, with spaces or newlines
+# around the slash and name, with or without its closing bracket.
+_BLOCK_TAG = re.compile(r"<\s*(/?)\s*(jentera-context)(\s*>)?", re.IGNORECASE)
+
+
+def _defang(match: "re.Match[str]") -> str:
+    return "\u2039" + match.group(1) + match.group(2) + ("\u203a" if match.group(3) else "")
+
+
 def wrap_turn_notes(notes: str) -> str:
-    """The marked block the notes travel in."""
-    return f"<jentera-context>\n{notes}\n</jentera-context>"
+    """The marked block the notes travel in.
+
+    The notes carry text outsiders submit (customer and card names from public
+    forms), so a block tag inside them is rewritten to a harmless form
+    (``</jentera-context>`` becomes ``\u2039/jentera-context\u203a``) and cannot close
+    or reopen the block early. Notes without one come out unchanged.
+    """
+    return f"<jentera-context>\n{_BLOCK_TAG.sub(_defang, notes)}\n</jentera-context>"
 
 
 def with_turn_notes(content: Any, notes: Any) -> Any:
