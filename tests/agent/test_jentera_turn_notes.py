@@ -139,3 +139,13 @@ def test_with_turn_notes_neutralises_for_strings_and_parts():
     as_parts = with_turn_notes([{"type": "text", "text": "hello"}], notes)
     assert len(_REAL_CLOSE.findall(as_parts[0]["text"])) == 1
     assert len(_REAL_OPEN.findall(as_parts[0]["text"])) == 1
+
+
+def test_a_long_run_of_spaces_after_a_bracket_is_quick():
+    import time
+
+    for notes in ("<" + " " * 20000 + "x", "<" + " " * 20000 + "/" + " " * 20000 + "x"):
+        started = time.perf_counter()
+        wrapped = wrap_turn_notes(notes)
+        assert time.perf_counter() - started < 0.2
+        assert wrapped == f"<jentera-context>\n{notes}\n</jentera-context>"

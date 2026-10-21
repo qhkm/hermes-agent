@@ -21,12 +21,15 @@ TURN_NOTES_MAX = 20_000
 
 
 # A block tag as the model could read it: any case, with spaces or newlines
-# around the slash and name, with or without its closing bracket.
-_BLOCK_TAG = re.compile(r"<\s*(/?)\s*(jentera-context)(\s*>)?", re.IGNORECASE)
+# around the slash and name, with or without its closing bracket. The slash and
+# the whitespace after it are one optional group: two whitespace runs with only
+# an optional slash between them made the engine try every split of a long run
+# of spaces after a "<" (seconds on 20,000 of them).
+_BLOCK_TAG = re.compile(r"<\s*(?:(/)\s*)?(jentera-context)(\s*>)?", re.IGNORECASE)
 
 
 def _defang(match: "re.Match[str]") -> str:
-    return "\u2039" + match.group(1) + match.group(2) + ("\u203a" if match.group(3) else "")
+    return "\u2039" + (match.group(1) or "") + match.group(2) + ("\u203a" if match.group(3) else "")
 
 
 def wrap_turn_notes(notes: str) -> str:
