@@ -91,6 +91,7 @@ from gateway.platforms.base import (
     is_network_accessible,
     validate_media_delivery_path,
 )
+from agent.jentera_turn_notes import TURN_NOTES_MAX
 from agent.redact import redact_sensitive_text
 from gateway.readiness import collect_runtime_readiness
 
@@ -98,6 +99,15 @@ logger = logging.getLogger(__name__)
 
 # Seconds a run may keep going after the turn liveness watchdog interrupted it.
 _TURN_LIVENESS_UNWIND_GRACE_S = 30.0
+
+# What this build offers the Jentera runner beyond stock Hermes, reported on
+# /health so the runner asks for a feature only when it is there. ``turn_notes``
+# is the /v1/runs field; ``warm`` is POST /v1/jentera/warm.
+_JENTERA_FEATURES = ("turn_notes", "warm")
+
+# A warm builds the tool list ahead of a run. The availability probes it
+# refreshes stay fresh for 30 s, so asking again inside this window is skipped.
+_JENTERA_WARM_INTERVAL_S = 20.0
 
 
 def _hermes_version() -> str:
@@ -1088,6 +1098,8 @@ class APIServerAdapter(BasePlatformAdapter):
         # Shutdown counts this reservation so the request cannot slip through
         # the drain between its first await and _run_agent()/task registration.
         self._pending_agent_requests: int = 0
+        # When each profile's tool list was last warmed (monotonic seconds).
+        self._jentera_warm_at: Dict[Optional[str], float] = {}
 
     def active_agent_work_count(self) -> int:
         """Return all live agent work owned by this API adapter.
@@ -1597,6 +1609,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
             ("POST", "/v1/runs", self._handle_runs),
+            ("POST", "/v1/jentera/warm", self._handle_jentera_warm),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
@@ -1838,6 +1851,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        turn_notes: Optional[str] = None,
         # Kept above gateway_session_key: Jentera's bootstrap patch anchors on
         # the last two parameters of this signature exactly.
         status_callback=None,
@@ -1953,6 +1967,7 @@ class APIServerAdapter(BasePlatformAdapter):
             quiet_mode=True,
             verbose_logging=False,
             ephemeral_system_prompt=ephemeral_system_prompt or None,
+            turn_notes=turn_notes or None,
             enabled_toolsets=enabled_toolsets,
             session_id=session_id,
             platform="api_server",
@@ -1975,8 +1990,60 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
         return web.json_response(
-            {"status": "ok", "platform": "hermes-agent", "version": _hermes_version()}
+            {
+                "status": "ok",
+                "platform": "hermes-agent",
+                "version": _hermes_version(),
+                "jentera_features": list(_JENTERA_FEATURES),
+            }
         )
+
+    async def _handle_jentera_warm(self, request: "web.Request") -> "web.Response":
+        """POST /v1/jentera/warm — build the agent's tool list ahead of a run.
+
+        Hermes caches built tool definitions, but each tool's availability
+        probe only for 30 s, and an owner's messages are minutes apart, so the
+        first message after a quiet spell pays for every probe. The Jentera
+        runner calls this when the app wakes the computer, a few seconds before
+        the message arrives. Same call, same cache, same tools; it only moves
+        the work earlier. At most once per window per profile (a profile's
+        config decides its toolsets); ``warmed`` is false when skipped or when
+        the build failed — a warm is best effort and never an error.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        profile = _api_request_profile.get()
+        now = time.monotonic()
+        last = self._jentera_warm_at.get(profile)
+        if last is not None and now - last < _JENTERA_WARM_INTERVAL_S:
+            return web.json_response({"ok": True, "warmed": False})
+        # Stamped before the build so a slow or failing one is not started twice.
+        self._jentera_warm_at[profile] = now
+
+        def _build() -> None:
+            from gateway.run import _load_gateway_config
+            from hermes_cli.tools_config import _get_platform_tools
+            from model_tools import get_tool_definitions
+
+            user_config = _load_gateway_config()
+            get_tool_definitions(
+                enabled_toolsets=sorted(_get_platform_tools(user_config, "api_server")),
+                quiet_mode=True,
+            )
+
+        try:
+            # Probes and config reads are blocking I/O: off the event loop,
+            # inside the request's profile scope (executor threads do not
+            # inherit it).
+            await asyncio.get_running_loop().run_in_executor(
+                None, self._call_in_profile_scope, profile, _build
+            )
+        except Exception as exc:
+            logger.debug("jentera warm failed: %s", type(exc).__name__)
+            return web.json_response({"ok": True, "warmed": False})
+        return web.json_response({"ok": True, "warmed": True})
 
     async def _handle_health_detailed(self, request: "web.Request") -> "web.Response":
         """GET /health/detailed — rich status for cross-container dashboard probing.
@@ -4983,6 +5050,17 @@ class APIServerAdapter(BasePlatformAdapter):
         if not user_message:
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
+        # Per-turn notes for the current user message (see
+        # agent/jentera_turn_notes.py). Never logged.
+        turn_notes = body.get("turn_notes")
+        if turn_notes is not None and (
+            not isinstance(turn_notes, str) or len(turn_notes) > TURN_NOTES_MAX
+        ):
+            return web.json_response(
+                _openai_error(f"'turn_notes' must be a string of at most {TURN_NOTES_MAX} characters"),
+                status=400,
+            )
+
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
 
@@ -5120,6 +5198,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     functools.partial(
                         self._create_agent,
                         ephemeral_system_prompt=ephemeral_system_prompt,
+                        turn_notes=turn_notes,
                         session_id=session_id,
                         stream_delta_callback=_text_cb,
                         tool_progress_callback=event_cb,

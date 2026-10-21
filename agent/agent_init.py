@@ -427,6 +427,7 @@ def init_agent(
     quiet_mode: bool = False,
     tool_progress_mode: str = "all",
     ephemeral_system_prompt: str = None,
+    turn_notes: str = None,
     log_prefix_chars: int = 100,
     log_prefix: str = "",
     providers_allowed: List[str] = None,
@@ -498,6 +499,7 @@ def init_agent(
         verbose_logging (bool): Enable verbose logging for debugging (default: False)
         quiet_mode (bool): Suppress progress output for clean CLI experience (default: False)
         ephemeral_system_prompt (str): System prompt used during agent execution but NOT saved to trajectories (optional)
+        turn_notes (str): Text put in front of the current turn's user message on every API call, NOT saved to the transcript (optional)
         log_prefix_chars (int): Number of characters to show in log previews for tool calls/responses (default: 100)
         log_prefix (str): Prefix to add to all log messages for identification in parallel processing (default: "")
         providers_allowed (List[str]): OpenRouter providers to allow (optional)
@@ -543,6 +545,9 @@ def init_agent(
     agent.quiet_mode = quiet_mode
     agent.tool_progress_mode = tool_progress_mode
     agent.ephemeral_system_prompt = ephemeral_system_prompt
+    # Per-turn text for the current user message, API-call-time only (never
+    # persisted, never logged): see agent/jentera_turn_notes.py.
+    agent.turn_notes = turn_notes
     agent.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
     agent._user_id = user_id  # Platform user identifier (gateway sessions)
     agent._user_id_alt = user_id_alt  # Optional stable alternate platform identifier

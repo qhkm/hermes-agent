@@ -31,6 +31,7 @@ from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import FailoverReason
 from agent.errors import EmptyStreamError
 from agent.turn_context import substitute_api_content
+from agent.jentera_turn_notes import with_turn_notes
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint
 from agent.message_content import flatten_message_text
@@ -1919,8 +1920,12 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         # Build API messages, stripping internal-only fields
         # (finish_reason, reasoning) that strict APIs like Mistral reject with 422
         _needs_sanitize = agent._should_sanitize_tool_calls()
+        # The turn's notes ride on this request too, on the same user message
+        # the loop put them on (see agent/jentera_turn_notes.py).
+        _turn_notes = getattr(agent, "turn_notes", None)
+        _turn_user_idx = getattr(agent, "_persist_user_message_idx", None) if _turn_notes else None
         api_messages = []
-        for msg in messages:
+        for idx, msg in enumerate(messages):
             api_msg = msg.copy()
             agent._copy_reasoning_content_for_api(msg, api_msg)
             for internal_field in ("reasoning", "finish_reason", "_thinking_prefill"):
@@ -1948,6 +1953,8 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             substitute_api_content(api_msg)
             for internal_key in [k for k in api_msg if isinstance(k, str) and k.startswith("_")]:
                 api_msg.pop(internal_key, None)
+            if idx == _turn_user_idx and api_msg.get("role") == "user":
+                api_msg["content"] = with_turn_notes(api_msg.get("content", ""), _turn_notes)
             if _needs_sanitize:
                 agent._sanitize_tool_calls_for_strict_api(api_msg, model=agent.model)
             api_messages.append(api_msg)

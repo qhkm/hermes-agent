@@ -45,6 +45,7 @@ from agent.usage_anchor import (
 )
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
+from agent.jentera_turn_notes import with_turn_notes
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
     build_turn_context,
@@ -1061,6 +1062,16 @@ def run_conversation(
                     )
                     if _composed is not None:
                         api_msg["content"] = _composed
+                # Per-turn notes from the control plane go in front of the
+                # current message AFTER the composition above, on the API
+                # copy only: never into ``msg`` or the ``api_content``
+                # sidecar, so earlier turns replay without them and the
+                # system message stays byte-stable across turns.
+                _turn_notes = getattr(agent, "turn_notes", None)
+                if _turn_notes:
+                    api_msg["content"] = with_turn_notes(
+                        api_msg.get("content", ""), _turn_notes
+                    )
             elif (
                 isinstance(_api_content, str)
                 and _api_content
