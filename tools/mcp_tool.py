@@ -465,6 +465,8 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
             env[key] = value
     if user_env:
         env.update(user_env)
+    # JENTERA: MCP servers are long-lived and shared across runs; never mark them as one run's.
+    env.pop("JENTERA_RUN_ID", None)
     return env
 
 

@@ -93,6 +93,14 @@ _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", defaul
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
 
+# JENTERA: the id of the Jentera run this agent turn belongs to, bridged onto every
+# command the run starts (terminal, background processes, execute_code) as
+# ``JENTERA_RUN_ID`` so the runner can find a run's leftover processes. It flows exactly
+# like HERMES_SESSION_ID (task-local, so concurrent runs never see each other's), with
+# one difference: when there is no marker the variable is absent from the child env,
+# never empty (see ``tools/environments/local.py::_inject_session_context_env``).
+_JENTERA_RUN_ID: ContextVar = ContextVar("JENTERA_RUN_ID", default=_UNSET)
+
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
 #
@@ -133,6 +141,7 @@ _VAR_MAP = {
     "HERMES_UI_SESSION_ID": _SESSION_UI_SESSION_ID,
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
     "HERMES_SESSION_PROFILE": _SESSION_PROFILE,
+    "JENTERA_RUN_ID": _JENTERA_RUN_ID,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
@@ -169,6 +178,7 @@ def set_session_vars(
     cwd: str = "",
     async_delivery: bool = True,
     ui_session_id: str = "",
+    run_marker: str = "",
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -203,6 +213,7 @@ def set_session_vars(
         _SESSION_UI_SESSION_ID.set(ui_session_id),
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_PROFILE.set(profile),
+        _JENTERA_RUN_ID.set(run_marker or ""),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
     ]
     try:
@@ -238,6 +249,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_UI_SESSION_ID,
         _SESSION_MESSAGE_ID,
         _SESSION_PROFILE,
+        _JENTERA_RUN_ID,
     ):
         var.set("")
     # Reset async-delivery capability to the "never set" sentinel rather than a
@@ -325,6 +337,16 @@ def get_session_env(name: str, default: str = "") -> str:
             return value
     # Fall back to os.environ for CLI, cron, and test compatibility
     return os.getenv(name, default)
+
+
+def get_run_marker() -> str:
+    """The Jentera run marker bound for THIS context, or ``""``.
+
+    Never falls back to ``os.environ``: a marker the process happens to hold
+    globally belongs to no particular run.
+    """
+    value = _JENTERA_RUN_ID.get()
+    return value if isinstance(value, str) else ""
 
 
 def declare_stateless_channel() -> None:

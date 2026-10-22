@@ -322,14 +322,14 @@ class TestTurnNotesLimits:
 
 class TestHealthAndWarm:
     @pytest.mark.asyncio
-    async def test_health_lists_both_features(self, monkeypatch, tmp_path, provider):
+    async def test_health_lists_the_features(self, monkeypatch, tmp_path, provider):
         adapter, db = _wire_adapter(monkeypatch, tmp_path, provider)
         try:
             async with TestClient(TestServer(_app(adapter))) as cli:
                 for path in ("/health", "/v1/health"):
                     data = await (await cli.get(path)).json()
                     assert data["status"] == "ok"
-                    assert data["jentera_features"] == ["turn_notes", "warm"]
+                    assert data["jentera_features"] == ["turn_notes", "warm", "run_marker"]
         finally:
             db.close()
 

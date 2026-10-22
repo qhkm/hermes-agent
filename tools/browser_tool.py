@@ -99,6 +99,9 @@ def _build_browser_env() -> dict:
     from tools.environments.local import hermes_subprocess_env
 
     env = hermes_subprocess_env(inherit_credentials=False)
+    # JENTERA: the browser daemon outlives any one run and is shared; it must never carry a
+    # run's process marker (the runner would treat it as that run's leftover and stop it).
+    env.pop("JENTERA_RUN_ID", None)
     for _key in _BROWSER_PASSTHROUGH_KEYS:
         if _key in os.environ:
             env[_key] = os.environ[_key]

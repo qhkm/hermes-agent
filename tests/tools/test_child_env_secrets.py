@@ -59,6 +59,13 @@ def child_environ(monkeypatch):
     monkeypatch.delenv("HERMES_CHILD_ENV_KEEP", raising=False)
     for k, v in {**JENTERA_ENV, **MODEL_ENV, **HERMES_SECRETS, **OWNER_PASTED_KEYS}.items():
         monkeypatch.setenv(k, v)
+    # The run marker comes from the run's context, not the process environment (a
+    # gateway that has served a run strips an inherited copy); bind the same value.
+    from gateway.session_context import _JENTERA_RUN_ID
+
+    token = _JENTERA_RUN_ID.set(JENTERA_ENV["JENTERA_RUN_ID"])
+    yield
+    _JENTERA_RUN_ID.reset(token)
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")

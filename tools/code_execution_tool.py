@@ -1341,6 +1341,16 @@ def execute_code(
         # passed through — without those, the child can't create a socket
         # or spawn a subprocess.  See ``_scrub_child_env`` for the rules.
         child_env = _scrub_child_env(os.environ)
+        # JENTERA: stamp the script with this run's marker (absent, never empty, without one).
+        child_env.pop("JENTERA_RUN_ID", None)
+        try:
+            from gateway.session_context import get_run_marker
+
+            _run_marker = get_run_marker()
+        except Exception:
+            _run_marker = ""
+        if _run_marker:
+            child_env["JENTERA_RUN_ID"] = _run_marker
         child_env["HERMES_RPC_SOCKET"] = rpc_endpoint
         child_env["HERMES_RPC_TOKEN"] = rpc_token
         child_env["PYTHONDONTWRITEBYTECODE"] = "1"

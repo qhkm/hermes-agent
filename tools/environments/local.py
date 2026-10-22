@@ -492,6 +492,16 @@ def _inject_session_context_env(env: dict) -> None:
     _engaged = session_context_engaged()
     for var_name, var in _VAR_MAP.items():
         value = var.get()
+        if var_name == "JENTERA_RUN_ID":
+            # JENTERA: the run marker is present only when this task carries one; a
+            # missing or cleared marker removes the variable (never leaves it ""),
+            # including a stale copy that came in through the child-env keep-list. A
+            # process that never engaged session context keeps what it inherited.
+            if isinstance(value, str) and value:
+                env[var_name] = value
+            elif _engaged or value is not _UNSET:
+                env.pop(var_name, None)
+            continue
         if value is not _UNSET:
             # Explicitly bound (including "") — authoritative for this task.
             env[var_name] = "" if value is None else str(value)

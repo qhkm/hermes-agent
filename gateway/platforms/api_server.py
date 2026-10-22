@@ -100,10 +100,12 @@ logger = logging.getLogger(__name__)
 # Seconds a run may keep going after the turn liveness watchdog interrupted it.
 _TURN_LIVENESS_UNWIND_GRACE_S = 30.0
 
+_JENTERA_RUN_MARKER_RE = re.compile(r"[0-9a-f-]{36}")
+
 # What this build offers the Jentera runner beyond stock Hermes, reported on
 # /health so the runner asks for a feature only when it is there. ``turn_notes``
 # is the /v1/runs field; ``warm`` is POST /v1/jentera/warm.
-_JENTERA_FEATURES = ("turn_notes", "warm")
+_JENTERA_FEATURES = ("turn_notes", "warm", "run_marker")
 
 # A warm builds the tool list ahead of a run. The availability probes it
 # refreshes stay fresh for 30 s, so asking again inside this window is skipped.
@@ -4793,6 +4795,7 @@ class APIServerAdapter(BasePlatformAdapter):
         chat_id: str = "",
         session_key: str = "",
         session_id: str = "",
+        run_marker: str = "",
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
@@ -4817,6 +4820,7 @@ class APIServerAdapter(BasePlatformAdapter):
             session_key=session_key,
             session_id=session_id,
             async_delivery=False,
+            run_marker=run_marker,
         )
 
     async def _run_agent(
@@ -5061,6 +5065,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
+        # JENTERA: the top-level run this turn belongs to; stamped onto every command the
+        # run starts as JENTERA_RUN_ID. Optional; absent means the commands carry none.
+        run_marker = body.get("jentera_run_id")
+        if run_marker is not None and (
+            not isinstance(run_marker, str) or not _JENTERA_RUN_MARKER_RE.fullmatch(run_marker)
+        ):
+            return web.json_response(
+                _openai_error("'jentera_run_id' must be a 36-character id of hex digits and dashes"),
+                status=400,
+            )
+        run_marker = run_marker or ""
+
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
 
@@ -5273,6 +5289,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             approval_token = set_current_session_key(approval_session_key)
                             session_tokens = self._bind_api_server_session(
                                 session_key=approval_session_key,
+                                run_marker=run_marker,
                             )
                             register_gateway_notify(approval_session_key, _approval_notify)
                             r = agent.run_conversation(
