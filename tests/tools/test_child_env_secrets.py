@@ -90,7 +90,7 @@ def test_terminal_child_sees_jentera_vars_and_not_hermes_secrets(child_environ, 
 
 
 def test_background_process_env_matches(child_environ):
-    env = _sanitize_subprocess_env(dict(os.environ))
+    env = _sanitize_subprocess_env(dict(os.environ), stamp_run_marker=True)
     for name in (*JENTERA_ENV, *OWNER_PASTED_KEYS):
         assert name in env
     for name in (*HERMES_SECRETS, "OPENROUTER_API_KEY"):

@@ -349,6 +349,25 @@ def get_run_marker() -> str:
     return value if isinstance(value, str) else ""
 
 
+def apply_run_marker(env: dict) -> None:
+    """Stamp ``env`` with this context's run marker, for the agent's OWN commands.
+
+    Only the agent's command paths call this (foreground terminal, background
+    terminal, execute_code). Every other spawn (language servers, MCP servers, the
+    browser daemon, computer-use, the Codex transport) is long-lived and shared across
+    runs and must never carry a run's marker.
+
+    A bound marker is set. Without one the variable is removed (never ``""``) once
+    session context is engaged in this process or the var was explicitly cleared; a
+    process that never engaged it keeps what it inherited, like the other session vars.
+    """
+    value = _JENTERA_RUN_ID.get()
+    if isinstance(value, str) and value:
+        env["JENTERA_RUN_ID"] = value
+    elif _session_context_engaged or value is not _UNSET:
+        env.pop("JENTERA_RUN_ID", None)
+
+
 def declare_stateless_channel() -> None:
     """Declare that this session cannot receive an async background completion.
 

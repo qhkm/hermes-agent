@@ -454,6 +454,14 @@ def _inject_context_hermes_home(env: dict) -> None:
         pass
 
 
+def _apply_run_marker(env: dict) -> None:
+    try:
+        from gateway.session_context import apply_run_marker
+    except Exception:
+        return
+    apply_run_marker(env)
+
+
 def _inject_session_context_env(env: dict) -> None:
     """Bridge gateway session ContextVars into a subprocess environment dict.
 
@@ -493,14 +501,12 @@ def _inject_session_context_env(env: dict) -> None:
     for var_name, var in _VAR_MAP.items():
         value = var.get()
         if var_name == "JENTERA_RUN_ID":
-            # JENTERA: the run marker is present only when this task carries one; a
-            # missing or cleared marker removes the variable (never leaves it ""),
-            # including a stale copy that came in through the child-env keep-list. A
-            # process that never engaged session context keeps what it inherited.
-            if isinstance(value, str) and value:
-                env[var_name] = value
-            elif _engaged or value is not _UNSET:
-                env.pop(var_name, None)
+            # JENTERA: this injector serves every Hermes-internal spawn (language servers,
+            # browser, computer-use, the Codex transport), all long-lived and shared across
+            # runs, so it never stamps the run marker and drops any inherited copy (it is on
+            # the child-env keep-list). The agent's own command paths stamp it with
+            # ``apply_run_marker`` after calling this.
+            env.pop(var_name, None)
             continue
         if value is not _UNSET:
             # Explicitly bound (including "") — authoritative for this task.
@@ -541,8 +547,13 @@ def _is_tier1_or_internal_secret(key: str) -> bool:
     return key in _ALWAYS_STRIP_KEYS or _is_hermes_internal_secret(key)
 
 
-def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
-    """Filter Hermes-managed secrets from a subprocess environment."""
+def _sanitize_subprocess_env(
+    base_env: dict | None, extra_env: dict | None = None, *, stamp_run_marker: bool = False
+) -> dict:
+    """Filter Hermes-managed secrets from a subprocess environment.
+
+    ``stamp_run_marker`` is for the agent's own background commands only (JENTERA).
+    """
     try:
         from tools.env_passthrough import is_env_passthrough as _is_passthrough
     except Exception:
@@ -578,6 +589,8 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     # Same cross-session leak guard as _make_run_env, for the background/PTY
     # spawn path (process_registry.spawn_local builds env via this function).
     _inject_session_context_env(sanitized)
+    if stamp_run_marker:
+        _apply_run_marker(sanitized)
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         sanitized.pop(_marker, None)
@@ -1263,6 +1276,8 @@ def _make_run_env(env: dict) -> dict:
     # cross-session leak guard — strips _UNSET vars when a concurrent host is
     # engaged so a sibling session's os.environ mirror can't leak in).
     _inject_session_context_env(run_env)
+    # JENTERA: foreground terminal command: the agent's own, so it carries the run marker.
+    _apply_run_marker(run_env)
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         run_env.pop(_marker, None)

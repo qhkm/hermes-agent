@@ -629,14 +629,17 @@ class BaseEnvironment(ABC):
         # includes the previous run's JENTERA_RUN_ID. The marker belongs to THIS run
         # (or to none): restate it after the snapshot so it always wins.
         try:
-            from gateway.session_context import get_run_marker
+            from gateway.session_context import apply_run_marker
 
-            _marker = get_run_marker()
+            _stamp: dict = {"JENTERA_RUN_ID": "\0"}  # sentinel: left alone = inherited
+            apply_run_marker(_stamp)
+            _marker = _stamp.get("JENTERA_RUN_ID")
         except Exception:
-            _marker = ""
-        if _marker:
+            _marker = "\0"
+        if _marker and _marker != "\0":
             parts.append(f"export JENTERA_RUN_ID={shlex.quote(_marker)}")
-        else:
+        elif _marker is None:
+            # Same rule as the env builders: unset only where session context is engaged.
             parts.append("unset JENTERA_RUN_ID")
 
         # Preserve bare ``~`` expansion, but rewrite ``~/...`` through

@@ -100,7 +100,7 @@ logger = logging.getLogger(__name__)
 # Seconds a run may keep going after the turn liveness watchdog interrupted it.
 _TURN_LIVENESS_UNWIND_GRACE_S = 30.0
 
-_JENTERA_RUN_MARKER_RE = re.compile(r"[0-9a-f-]{36}")
+_JENTERA_RUN_MARKER_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 # What this build offers the Jentera runner beyond stock Hermes, reported on
 # /health so the runner asks for a feature only when it is there. ``turn_notes``
@@ -5072,7 +5072,7 @@ class APIServerAdapter(BasePlatformAdapter):
             not isinstance(run_marker, str) or not _JENTERA_RUN_MARKER_RE.fullmatch(run_marker)
         ):
             return web.json_response(
-                _openai_error("'jentera_run_id' must be a 36-character id of hex digits and dashes"),
+                _openai_error("'jentera_run_id' must be a lowercase UUID"),
                 status=400,
             )
         run_marker = run_marker or ""

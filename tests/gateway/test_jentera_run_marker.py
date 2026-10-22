@@ -171,7 +171,7 @@ class TestMarkerReachesCommands:
 
 class TestValidation:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("bad", ["not-a-uuid", "", "A" * 36, RUN_A + "x", RUN_A[:-1], 123, ["x"], True])
+    @pytest.mark.parametrize("bad", ["not-a-uuid", "", "A" * 36, "-" * 36, "0" * 36, RUN_A + "x", RUN_A[:-1], 123, ["x"], True])
     async def test_invalid_marker_400(self, monkeypatch, tmp_path, provider, bad):
         adapter, db = _wire_adapter(monkeypatch, tmp_path, provider)
         try:
@@ -217,6 +217,57 @@ class TestExemptLaunches:
             assert "JENTERA_RUN_ID" not in _build_safe_env(None)
         finally:
             clear_session_vars(tokens)
+
+
+class TestInternalSpawnsUnmarked:
+    """Long-lived Hermes-internal children are shared across runs; none may carry a marker."""
+
+    @pytest.fixture()
+    def marked(self, monkeypatch):
+        from gateway.session_context import clear_session_vars, set_session_vars
+
+        monkeypatch.setenv("JENTERA_RUN_ID", RUN_A)
+        tokens = set_session_vars(platform="api_server", run_marker=RUN_A)
+        yield
+        clear_session_vars(tokens)
+
+    @pytest.mark.parametrize("inherit", [False, True])
+    def test_generic_subprocess_env_unmarked(self, marked, inherit):
+        # agent/lsp/client.py _spawn (language servers) and the Codex app-server
+        # transport both build their env with this helper.
+        from tools.environments.local import hermes_subprocess_env
+
+        assert "JENTERA_RUN_ID" not in hermes_subprocess_env(inherit_credentials=inherit)
+
+    def test_lsp_spawn_env_unmarked(self, marked):
+        import inspect
+
+        from agent.lsp import client
+        from tools.environments.local import hermes_subprocess_env
+
+        assert "hermes_subprocess_env()" in inspect.getsource(client.LSPClient._spawn)
+        assert "JENTERA_RUN_ID" not in hermes_subprocess_env()
+
+    def test_cua_driver_env_unmarked(self, marked):
+        from tools.computer_use.cua_backend import cua_driver_child_env
+        from tools.environments.local import _sanitize_subprocess_env
+
+        assert "JENTERA_RUN_ID" not in _sanitize_subprocess_env(cua_driver_child_env())
+        assert "JENTERA_RUN_ID" not in _sanitize_subprocess_env({"JENTERA_RUN_ID": RUN_A})
+
+    def test_codex_transport_env_unmarked(self, marked):
+        import inspect
+
+        from agent.transports import codex_app_server
+        from tools.environments.local import hermes_subprocess_env
+
+        assert "hermes_subprocess_env(inherit_credentials=True)" in inspect.getsource(codex_app_server)
+        assert "JENTERA_RUN_ID" not in hermes_subprocess_env(inherit_credentials=True)
+
+    def test_agents_own_background_command_is_the_only_stamped_sanitize(self, marked):
+        from tools.environments.local import _sanitize_subprocess_env
+
+        assert _sanitize_subprocess_env({}, stamp_run_marker=True)["JENTERA_RUN_ID"] == RUN_A
 
 
 class TestSessionContext:

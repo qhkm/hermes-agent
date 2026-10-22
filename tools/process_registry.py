@@ -724,7 +724,7 @@ class ProcessRegistry:
                 else:
                     from ptyprocess import PtyProcess as _PtyProcessCls
                 user_shell = _find_shell()
-                pty_env = _sanitize_subprocess_env(os.environ, env_vars)
+                pty_env = _sanitize_subprocess_env(os.environ, env_vars, stamp_run_marker=True)
                 pty_env["PYTHONUNBUFFERED"] = "1"
                 pty_proc = _PtyProcessCls.spawn(
                     [user_shell, "-lic", f"set +m; {command}"],
@@ -766,7 +766,7 @@ class ProcessRegistry:
         # Force unbuffered output for Python scripts so progress is visible
         # during background execution (libraries like tqdm/datasets buffer when
         # stdout is a pipe, hiding output from process(action="poll")).
-        bg_env = _sanitize_subprocess_env(os.environ, env_vars)
+        bg_env = _sanitize_subprocess_env(os.environ, env_vars, stamp_run_marker=True)
         bg_env["PYTHONUNBUFFERED"] = "1"
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
