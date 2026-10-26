@@ -338,6 +338,7 @@ class TestLightpandaFallbackWarning:
 
         with patch("tools.browser_tool._is_local_backend", return_value=True), \
              patch("tools.browser_tool._get_cloud_provider", return_value=None), \
+             patch("tools.browser_tool._fast_open_enabled", return_value=False), \
              patch("tools.browser_tool._get_session_info", return_value={
                  "session_name": "test", "_first_nav": False, "features": {"local": True, "proxies": True}
              }), \
@@ -365,6 +366,7 @@ class TestLightpandaFallbackWarning:
 
         with patch("tools.browser_tool._is_local_backend", return_value=True), \
              patch("tools.browser_tool._get_cloud_provider", return_value=None), \
+             patch("tools.browser_tool._fast_open_enabled", return_value=False), \
              patch("tools.browser_tool._get_session_info", return_value={
                  "session_name": "test", "_first_nav": False, "features": {"local": True, "proxies": True}
              }), \

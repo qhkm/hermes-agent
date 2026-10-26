@@ -62,6 +62,8 @@ import tempfile
 import threading
 import time
 import requests
+import secrets
+import urllib.parse
 from typing import Dict, Any, Optional, List, Tuple, Union
 from pathlib import Path
 from agent.auxiliary_client import call_llm
@@ -2899,6 +2901,96 @@ def _redact_browser_output(value: Any) -> Any:
 # Browser Tool Functions
 # ============================================================================
 
+# agent-browser's ``open`` returns only on the page's ``load`` event, so one
+# slow image, font or tracker holds the agent for as long as it takes (a page
+# that was readable at once took 8 s with one 8 s image; WhatsApp Web timed out
+# at 45-120 s). Navigating by script and waiting until the new document is
+# readable gives the agent the page as soon as it has one. ``open`` stays the
+# fallback whenever the fast path cannot say for sure that the page changed.
+FAST_OPEN_WAIT_SECONDS = 20
+
+
+def _fast_open_enabled() -> bool:
+    """Fast open runs for a local Chrome only; JENTERA_BROWSER_FAST_OPEN=off disables it."""
+    if _snapshot_setting("JENTERA_BROWSER_FAST_OPEN").strip().lower() in ("0", "off", "false", "no"):
+        return False
+    if _get_browser_engine() == "lightpanda":
+        return False
+    return True
+
+
+def _same_document(current: str, target: str) -> bool:
+    """True when the two URLs differ at most in their fragment (no new document loads)."""
+    try:
+        a = urllib.parse.urldefrag(current).url
+        b = urllib.parse.urldefrag(target).url
+    except Exception:
+        return False
+    return bool(a) and a == b
+
+
+def _fast_open(session_key: str, url: str) -> Optional[Dict[str, Any]]:
+    """Navigate by script and wait until the new document is readable.
+
+    Returns a result shaped like ``open``'s (``{"success": True, "data":
+    {"url", "title"}}``), or ``None`` when the caller must use ``open``: the
+    page could not run the script, the navigation did not commit a new
+    document in time (a download, a 204, a fragment-only change), or it ended
+    on Chrome's error page, whose real error only ``open`` reports.
+    """
+    marker = "j" + secrets.token_hex(8)
+    target = json.dumps(url)
+    start = _run_browser_command(
+        session_key,
+        "eval",
+        [
+            "(function(u){var h=location.href;window.__jenteraNav=%s;"
+            "location.assign(u);return h})(%s)" % (json.dumps(marker), target)
+        ],
+        timeout=10,
+    )
+    if not start.get("success"):
+        return None
+    before = str(start.get("data", {}).get("result", "")).strip().strip('"')
+    if _same_document(before, url):
+        return None
+    deadline_ms = int((time.time() + FAST_OPEN_WAIT_SECONDS) * 1000)
+    _run_browser_command(
+        session_key,
+        "wait",
+        [
+            "--fn",
+            "(window.__jenteraNav!==%s&&document.readyState!=='loading')||Date.now()>%d"
+            % (json.dumps(marker), deadline_ms),
+        ],
+        timeout=FAST_OPEN_WAIT_SECONDS + 10,
+    )
+    probe = _run_browser_command(
+        session_key,
+        "eval",
+        [
+            "JSON.stringify({m:window.__jenteraNav===%s,u:location.href,t:document.title})"
+            % json.dumps(marker)
+        ],
+        timeout=10,
+    )
+    if not probe.get("success"):
+        return None
+    raw = probe.get("data", {}).get("result", "")
+    try:
+        page = json.loads(raw)
+        if isinstance(page, str):
+            page = json.loads(page)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(page, dict) or page.get("m"):
+        return None
+    final_url = str(page.get("u") or "")
+    if not final_url or final_url.startswith("chrome-error:"):
+        return None
+    return {"success": True, "data": {"url": final_url, "title": str(page.get("t") or "")}}
+
+
 def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     """
     Navigate to a URL in the browser.
@@ -3015,12 +3107,17 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         session_info["_first_nav"] = False
         _maybe_start_recording(nav_session_key)
 
-    result = _run_browser_command(
-        nav_session_key,
-        "open",
-        [url],
-        timeout=_get_open_command_timeout(first_open=is_first_nav),
-    )
+    result = None
+    if not _get_cloud_provider() or auto_local_this_nav:
+        if _fast_open_enabled():
+            result = _fast_open(nav_session_key, url)
+    if result is None:
+        result = _run_browser_command(
+            nav_session_key,
+            "open",
+            [url],
+            timeout=_get_open_command_timeout(first_open=is_first_nav),
+        )
 
     if result.get("success"):
         data = result.get("data", {})
