@@ -8397,6 +8397,25 @@ class TestSupportsReasoningExtraBody:
             agent.model = model
             assert agent._supports_reasoning_extra_body() is True, model
 
+    def test_jentera_model_proxy_receives_the_reasoning_setting(self):
+        # Jentera's model proxy (api.jentera.ai/v1/model) translates `reasoning` into DeepSeek's
+        # thinking / reasoning_effort. Without it nothing was sent and DeepSeek always thought at
+        # its default effort, whatever the turn asked for.
+        agent = self._make_agent()
+        agent.base_url = "https://api.jentera.ai/v1/model"
+        agent._base_url_lower = agent.base_url.lower()
+        for model in ("deepseek-flash", "deepseek-v4-flash", "anything"):
+            agent.model = model
+            assert agent._supports_reasoning_extra_body() is True, model
+
+    def test_a_lookalike_host_is_not_the_jentera_proxy(self):
+        agent = self._make_agent()
+        for base in ("https://api.jentera.ai.evil.example/v1", "https://evil.example/api.jentera.ai/v1"):
+            agent.base_url = base
+            agent._base_url_lower = base.lower()
+            agent.model = "deepseek-flash"
+            assert agent._supports_reasoning_extra_body() is False, base
+
 
 class TestMemoryContextSanitization:
     """sanitize_context() helper correctness — used at provider boundaries."""

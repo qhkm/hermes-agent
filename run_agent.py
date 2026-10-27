@@ -6146,6 +6146,11 @@ class AIAgent:
         """
         if base_url_host_matches(self._base_url_lower, "nousresearch.com"):
             return True
+        # Jentera: the model proxy (api.jentera.ai/v1/model) translates `reasoning` into DeepSeek's
+        # thinking and reasoning_effort. Without this nothing was sent to it, and DeepSeek thought at
+        # its default effort on every turn, whatever the turn asked for (found 27 Oct 2026).
+        if base_url_host_matches(self._base_url_lower, "api.jentera.ai"):
+            return True
         if (
             base_url_host_matches(self._base_url_lower, "models.github.ai")
             or base_url_host_matches(self._base_url_lower, "githubcopilot.com")
