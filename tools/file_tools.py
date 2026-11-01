@@ -1595,6 +1595,30 @@ def _contains_redaction_sentinel(*texts) -> bool:
     return any(isinstance(t, str) and _REDACTION_SENTINEL in t for t in texts)
 
 
+def _jentera_skill_refusal(task_id: str = "default", **kwargs) -> str | None:
+    """Jentera: the refusal for a file write that would make a skill cover sign-ins,
+    secrets or private forms (JENTERA_SKILL_GUARD=on), else None. While the guard is
+    on, a guard that cannot load or run refuses the write (fails closed)."""
+    if os.environ.get("JENTERA_SKILL_GUARD", "").strip().lower() != "on":
+        return None
+
+    def _resolve(p: str) -> str:
+        try:
+            return str(_resolve_path_for_task(p, task_id))
+        except Exception:
+            return os.path.realpath(os.path.expanduser(p))
+
+    try:
+        from tools.jentera_skill_guard import guard_file_tool
+
+        return guard_file_tool(resolve=_resolve, **kwargs)
+    except Exception:
+        return (
+            "Not saved: Jentera could not check this write against its built-in rules "
+            "for skills. Try again later."
+        )
+
+
 def write_file_tool(path: str, content: str, task_id: str = "default",
                     cross_profile: bool = False,
                     session_id: str | None = None) -> str:
@@ -1615,6 +1639,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         cross_warning = _check_cross_profile_path(path, task_id)
         if cross_warning:
             return tool_error(cross_warning)
+    skill_refusal = _jentera_skill_refusal(task_id, mode="write", path=path, content=content)
+    if skill_refusal:
+        return tool_error(skill_refusal)
     if _is_internal_file_tool_content(content):
         return tool_error(
             "Refusing to write internal read_file display text as file content. "
@@ -1745,6 +1772,11 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             cross_warning = _check_cross_profile_path(_p, task_id)
             if cross_warning:
                 return tool_error(cross_warning)
+    skill_refusal = _jentera_skill_refusal(
+        task_id, mode=mode if mode == "patch" else "replace", path=path,
+        old_string=old_string, new_string=new_string, replace_all=replace_all, patch=patch)
+    if skill_refusal:
+        return tool_error(skill_refusal)
     try:
         # Resolve paths for locking.  Ordered + deduplicated so concurrent
         # callers lock in the same order — prevents deadlock on overlapping

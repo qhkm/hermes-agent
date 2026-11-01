@@ -1337,6 +1337,13 @@ def apply_skill_pending(payload: Dict[str, Any]) -> str:
         _skill_gate_bypass.reset(token)
 
 
+_JENTERA_GUARD_FAILED = (
+    "Not saved: Jentera could not check this skill against its built-in rules for sign-ins, "
+    "passwords, one-time codes, private forms, the Vault and card details. Try again later; "
+    "save skills only for other kinds of work."
+)
+
+
 def skill_manage(
     action: str,
     name: str,
@@ -1360,16 +1367,19 @@ def skill_manage(
 
     # Jentera: a skill cannot cover sign-ins, secrets, private forms, the Vault or
     # card details (JENTERA_SKILL_GUARD=on). Checked before the approval gate so a
-    # refused write is never staged either.
+    # refused write is never staged either. While the guard is on, a guard that
+    # cannot load or run refuses the write (fails closed).
     try:
         from tools.jentera_skill_guard import guard_skill_write
 
         refusal = guard_skill_write(
             action, name=name, content=content, new_string=new_string,
             file_content=file_content, file_path=file_path,
+            old_string=old_string, replace_all=replace_all,
         )
     except Exception:
-        refusal = None
+        guard_on = os.environ.get("JENTERA_SKILL_GUARD", "").strip().lower() == "on"
+        refusal = _JENTERA_GUARD_FAILED if guard_on and action in {"create", "edit", "patch", "write_file"} else None
     if refusal:
         return tool_error(refusal, success=False)
 

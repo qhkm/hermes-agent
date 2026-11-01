@@ -58,7 +58,11 @@ def guard_on(monkeypatch):
     ("Never use jentera-form; type it yourself", "private forms"),
     ("Ask with a private form", "private forms"),
     ("Run `jentera-records vault get mytax`", "the Vault"),
-    ("Look it up in the Vault", "the Vault"),
+    ("Look it up in Jentera Vault", "the Vault"),
+    ("Log in to MyTax with the IC number", "sign-in"),
+    ("Open the login page", "sign-in"),
+    ("Logging on to the bank portal", "sign-in"),
+    ("Single sign-on through Google", "sign-in"),
     ("Save the card number and CVV", "card details"),
 ])
 def test_protected_topics(text, topic):
@@ -70,6 +74,10 @@ def test_protected_topics(text, topic):
     "Write invoices with the business name at the top and the total in bold.",
     "Post on Threads at 9 am with three hashtags.",
     "Summarise the week's bookings by day.",
+    "Write a log on each run, then a log in the sheet.",
+    "Post to Instagram as the business username @kedai_kopi.",
+    "Keep the API credentials list tidy.",
+    "Store photos in the vault folder on Drive.",
 ])
 def test_ordinary_text_is_allowed(text):
     assert guard.protected_topic(text) is None
@@ -188,3 +196,177 @@ def test_sweep_cli_prints_counts(skills_home, capsys):
     assert guard.main(["sweep"]) == 0
     assert json.loads(capsys.readouterr().out) == {"checked": 0, "moved": 0, "failed": 0}
     assert guard.main([]) == 2
+
+
+MYTAX_RECIPE = """\
+---
+name: mytax-filing
+description: File the monthly return on MyTax.
+---
+
+1. Open https://mytax.hasil.gov.my and log in to MyTax with the IC number.
+2. Go to e-Filing.
+"""
+
+INSTAGRAM_SKILL = """\
+---
+name: instagram-posts
+description: How the owner likes Instagram posts.
+---
+
+Post as the business username @kedai_kopi. Write a log on each run in the sheet.
+"""
+
+
+@pytest.mark.parametrize("value,on", [
+    ("on", True), ("ON", True), (" On ", True),
+    ("1", False), ("true", False), ("yes", False), ("", False), ("off", False),
+])
+def test_only_on_turns_the_guard_on(monkeypatch, value, on):
+    monkeypatch.setenv(guard.GUARD_ENV, value)
+    assert guard.guard_enabled() is on
+
+
+def test_mytax_login_recipe_refused_and_instagram_saves(tmp_path, guard_on):
+    with _skill_dir(tmp_path):
+        refused = json.loads(skill_manage(action="create", name="mytax-filing", content=MYTAX_RECIPE))
+        saved = json.loads(skill_manage(action="create", name="instagram-posts", content=INSTAGRAM_SKILL))
+    assert refused["success"] is False and "sign-in" in refused["error"]
+    assert saved["success"] is True
+
+
+def test_a_patch_cannot_finish_a_phrase_the_old_text_started(tmp_path, guard_on, monkeypatch):
+    monkeypatch.delenv(guard.GUARD_ENV)
+    split = RECIPE_SKILL.replace("Keep it to one page.", "Then sign X before posting.")
+    with _skill_dir(tmp_path):
+        assert json.loads(skill_manage(action="create", name="recipe-format", content=split))["success"]
+        monkeypatch.setenv(guard.GUARD_ENV, "on")
+        patched = json.loads(skill_manage(
+            action="patch", name="recipe-format", old_string="sign X", new_string="sign in"))
+        assert patched["success"] is False and "sign-in" in patched["error"]
+        sneaky = json.loads(skill_manage(
+            action="patch", name="recipe-format", old_string="X", new_string="in"))
+        assert sneaky["success"] is False, "the new text alone is harmless; the result is not"
+        assert "sign X" in (tmp_path / "recipe-format" / "SKILL.md").read_text()
+
+
+def test_guard_failure_refuses_while_on(tmp_path, guard_on, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("broken")
+    monkeypatch.setattr(guard, "guard_skill_write", boom)
+    with _skill_dir(tmp_path):
+        result = json.loads(skill_manage(action="create", name="recipe-format", content=RECIPE_SKILL))
+    assert result["success"] is False and "could not check" in result["error"]
+    assert not list(tmp_path.rglob("SKILL.md"))
+
+
+def test_guard_that_cannot_load_refuses_while_on(tmp_path, guard_on, monkeypatch):
+    import sys
+    monkeypatch.setitem(sys.modules, "tools.jentera_skill_guard", None)
+    with _skill_dir(tmp_path):
+        result = json.loads(skill_manage(action="create", name="recipe-format", content=RECIPE_SKILL))
+    assert result["success"] is False and "could not check" in result["error"]
+
+
+def test_guard_failure_is_ignored_while_off(tmp_path, monkeypatch):
+    monkeypatch.delenv(guard.GUARD_ENV, raising=False)
+    monkeypatch.setattr(guard, "guard_skill_write", lambda *a, **k: 1 / 0)
+    with _skill_dir(tmp_path):
+        result = json.loads(skill_manage(action="create", name="recipe-format", content=RECIPE_SKILL))
+    assert result["success"] is True
+
+
+# --- the general file tools ---------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _tmp_is_not_a_system_path(monkeypatch):
+    # macOS puts tmp_path under /private/var, which the file tools refuse as a system path.
+    import tools.file_tools as ft
+    monkeypatch.setattr(ft, "_check_sensitive_path", lambda *a, **k: None)
+
+
+def _file_tools():
+    from tools.file_tools import patch_tool, write_file_tool
+    return write_file_tool, patch_tool
+
+
+def test_file_write_under_skills_is_guarded(tmp_path, guard_on):
+    write_file_tool, _ = _file_tools()
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    outside = tmp_path / "work" / "notes.md"
+    with _skill_dir(skills):
+        refused = json.loads(write_file_tool(str(skills / "gov" / "mytax" / "SKILL.md"), MYTAX_RECIPE))
+        assert "error" in refused and "Jentera's built-in rules" in refused["error"]
+        assert not (skills / "gov" / "mytax" / "SKILL.md").exists()
+        by_name = json.loads(write_file_tool(str(skills / "web-login" / "SKILL.md"), "Plain text."))
+        assert "error" in by_name, "the folder name counts too"
+        fine = json.loads(write_file_tool(str(skills / "recipe-format" / "SKILL.md"), RECIPE_SKILL))
+        assert not fine.get("error")
+        meta = json.loads(write_file_tool(str(skills / ".bundled_manifest"), "mytax:abc\n"))
+        assert "error" in meta and "records" in meta["error"]
+        elsewhere = json.loads(write_file_tool(str(outside), "Log in to MyTax with the password."))
+        assert not elsewhere.get("error"), "files outside the skills folder are not checked"
+
+
+def test_file_write_under_skills_unchecked_while_off(tmp_path, monkeypatch):
+    monkeypatch.delenv(guard.GUARD_ENV, raising=False)
+    write_file_tool, _ = _file_tools()
+    with _skill_dir(tmp_path):
+        result = json.loads(write_file_tool(str(tmp_path / "mytax" / "SKILL.md"), MYTAX_RECIPE))
+    assert not result.get("error")
+
+
+def test_file_patch_is_judged_on_the_result(tmp_path, guard_on):
+    _, patch_tool = _file_tools()
+    target = tmp_path / "recipe-format" / "SKILL.md"
+    target.parent.mkdir()
+    target.write_text(RECIPE_SKILL.replace("Keep it to one page.", "Then sign X before posting."))
+    with _skill_dir(tmp_path):
+        refused = json.loads(patch_tool(mode="replace", path=str(target), old_string="sign X", new_string="sign in"))
+        assert "error" in refused and "sign-in" in refused["error"]
+        assert "sign X" in target.read_text()
+        v4a = (
+            "*** Begin Patch\n"
+            f"*** Update File: {target}\n"
+            "@@\n"
+            "-Then sign X before posting.\n"
+            "+Then sign in before posting.\n"
+            "*** End Patch\n"
+        )
+        refused_v4a = json.loads(patch_tool(mode="patch", patch=v4a))
+        assert "error" in refused_v4a and "sign-in" in refused_v4a["error"]
+        assert "sign X" in target.read_text()
+        added = (
+            "*** Begin Patch\n"
+            f"*** Add File: {tmp_path / 'otp-helper' / 'SKILL.md'}\n"
+            "+Wait for the OTP the bank sends.\n"
+            "*** End Patch\n"
+        )
+        assert "error" in json.loads(patch_tool(mode="patch", patch=added))
+        ok = json.loads(patch_tool(mode="replace", path=str(target), old_string="sign X", new_string="sign the card"))
+        assert not ok.get("error"), ok
+        assert "sign the card" in target.read_text()
+
+
+# --- the sweep: skills with no usage record -------------------------------------
+
+def test_sweep_moves_unrecorded_skills_but_never_shipped_or_installed(skills_home):
+    from tools import skill_usage
+    skills = skills_home / "skills"
+    _write(skills, "terminal-login", LOGIN_SKILL)
+    _write(skills, "terminal-recipe", RECIPE_SKILL)
+    shipped = _write(skills, "shipped-login", LOGIN_SKILL)
+    installed = _write(skills, "hub-login", LOGIN_SKILL)
+    (skills / ".bundled_manifest").write_text("shipped-login:abc123\n", encoding="utf-8")
+    (skills / ".hub").mkdir()
+    (skills / ".hub" / "lock.json").write_text(
+        json.dumps({"version": 1, "installed": {"hub-login": {"source": "hub"}}}), encoding="utf-8")
+    skill_usage.save_usage({})
+
+    counts = guard.sweep_protected_skills(now=0)
+
+    assert counts == {"checked": 2, "moved": 1, "failed": 0}
+    assert not (skills / "productivity" / "terminal-login").exists()
+    assert (skills / "productivity" / "terminal-recipe" / "SKILL.md").exists()
+    assert shipped.exists() and installed.exists()
