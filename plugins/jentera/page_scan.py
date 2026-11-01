@@ -6,8 +6,9 @@ the agent last used, and adds a short summary to the tool result: the host,
 the kind of form, and one line per box (words, kind, options, pick), ready to
 copy as a ``jentera-form`` field. The bot then sees the form without probing.
 
-Bounds: at most once per page per task (again after 30 s, so a page the agent
-returns to is read afresh), three seconds in all, and nothing is added when the
+A page that answers with no boxes yet (an SPA still drawing its form) is scanned
+again every 0.7 s within the same budget. Bounds: at most once per page per task (again after 30 s, so a page the agent
+returns to is read afresh), four seconds in all, and nothing is added when the
 runner answers anything but a scan with boxes (no page, busy, 404 because the
 business's switch is off, unreachable, or no boxes). Without a task id nothing
 is remembered, so tasks never share state. The scan reads no box values;
@@ -33,7 +34,9 @@ from collections import OrderedDict
 from plugins.jentera.handoff import _runner_key, _runner_url
 
 SCAN_PATH = "/v1/page/scan"
-SCAN_BUDGET_SECONDS = 3.0
+SCAN_BUDGET_SECONDS = 4.0
+# A page that has not drawn its form yet (an SPA right after navigate) is scanned again.
+RETRY_GAP_SECONDS = 0.7
 # A 404 means the switch is off for this business; ask again after this long.
 UNAVAILABLE_RETRY_SECONDS = 60.0
 SUMMARY_MAX_CHARS = 1200
@@ -178,10 +181,13 @@ def format_summary(scan: dict) -> str | None:
     """A compact summary of a scan with boxes, or None when there is nothing to show."""
     kind = scan.get("kind") if isinstance(scan.get("kind"), str) else "unknown"
     kind = clean_page_text(kind, 24) or "unknown"
-    if kind == "none":
-        return None
     boxes = scan.get("boxes")
     if not isinstance(boxes, list):
+        return None
+    # A password box makes it a sign-in, whatever kind the page was given.
+    if any(isinstance(b, dict) and b.get("kind") == "password" for b in boxes):
+        kind = "login"
+    if kind == "none":
         return None
     lines = [line for line in (_field_line(b) for b in boxes if isinstance(b, dict)) if line]
     if not lines:
@@ -190,6 +196,11 @@ def format_summary(scan: dict) -> str | None:
     if kind in JENTERA_FORM_KINDS:
         intro = (f"Form on this page (host {host}, kind {kind}). "
                  "Build jentera-form from these boxes: copy each as a field (words as the label, kind, options, pick).")
+    elif kind == "unknown":
+        # Unsure (or the classifier is down): it may be a form only the owner can fill.
+        intro = (f"Form on this page (host {host}, kind unknown). "
+                 "If the owner must type these, build jentera-form from them: copy each as a field "
+                 "(words as the label, kind, options, pick).")
     else:
         intro = f"Boxes on this page (host {host}, kind {kind})."
     head = [intro, DATA_START]
@@ -256,6 +267,32 @@ def _seen_before(task: str, page: str) -> bool:
         last = pages.get(page) if pages else None
         return last is not None and time.monotonic() - last < RESCAN_AFTER_SECONDS
 
+def _usable_lines(scan: dict) -> list:
+    boxes = scan.get("boxes")
+    if not isinstance(boxes, list):
+        return []
+    return [line for line in (_field_line(b) for b in boxes if isinstance(b, dict)) if line]
+
+def _scan_until_boxes():
+    """(scan, summary) within one budget, scanning again every 0.7 s while the page has no boxes."""
+    deadline = time.monotonic() + SCAN_BUDGET_SECONDS
+    scan = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return scan, None
+        latest = scan_within(remaining)
+        if latest:
+            scan = latest
+            if _usable_lines(latest):
+                return scan, format_summary(latest)
+        with _LOCK:
+            if time.monotonic() < _state["unavailable_until"]:
+                return scan, None
+        if deadline - time.monotonic() <= RETRY_GAP_SECONDS:
+            return scan, None
+        time.sleep(RETRY_GAP_SECONDS)
+
 def augment(tool_name=None, result=None, task_id="", **_kwargs):
     """The browser result with the page's form added, or None to leave it as it is."""
     if tool_name not in BROWSER_TOOLS or not isinstance(result, str) or not result:
@@ -271,12 +308,11 @@ def augment(tool_name=None, result=None, task_id="", **_kwargs):
     url = parsed.get("url") if isinstance(parsed.get("url"), str) else ""
     if task and url and _seen_before(task, "url:" + url):
         return None
-    scan = scan_within()
-    if not scan:
-        return None
-    summary = format_summary(scan)
+    scan, summary = _scan_until_boxes()
     if not summary:
-        if task and url:
+        # Cache only a page that drew its boxes but has nothing to show (kind none);
+        # a page with no boxes yet may draw them later, so the next call scans again.
+        if task and url and scan and _usable_lines(scan):
             _remember(task, "url:" + url)
         return None
     if task:

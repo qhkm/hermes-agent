@@ -117,7 +117,9 @@ def test_a_click_onto_a_new_form_is_summarised_once(runner):
     (200, {"ok": True, "host": "example.com", "kind": "none", "boxes": [], "submits": []}),
     (500, {"ok": False}),
 ])
-def test_nothing_is_added_without_boxes(runner, status, body):
+def test_nothing_is_added_without_boxes(runner, status, body, monkeypatch):
+    monkeypatch.setattr(page_scan, "SCAN_BUDGET_SECONDS", 0.5)
+    monkeypatch.setattr(page_scan, "RETRY_GAP_SECONDS", 0.1)
     runner.status, runner.body = status, body
     assert page_scan.augment(tool_name="browser_navigate", result=_nav(), task_id="t1") is None
 
@@ -137,8 +139,9 @@ def test_the_scan_has_three_seconds(runner, monkeypatch):
     assert time.monotonic() - started < 0.9
 
 
-def test_default_budget_is_three_seconds():
-    assert page_scan.SCAN_BUDGET_SECONDS == 3.0
+def test_default_budget_is_four_seconds():
+    assert page_scan.SCAN_BUDGET_SECONDS == 4.0
+    assert page_scan.RETRY_GAP_SECONDS == 0.7
 
 
 def test_other_tools_and_failures_are_left_alone(runner):
@@ -218,15 +221,17 @@ def test_owner_forms_carry_the_jentera_form_instruction(kind):
     assert "Build jentera-form" in summary
 
 
-@pytest.mark.parametrize("kind", ["contact", "unknown", "other"])
+@pytest.mark.parametrize("kind", ["contact", "other"])
 def test_other_forms_list_boxes_without_the_instruction(kind):
-    summary = page_scan.format_summary({**SCAN, "kind": kind})
+    boxes = [b for b in SCAN["boxes"] if b["kind"] != "password"]
+    summary = page_scan.format_summary({**SCAN, "kind": kind, "boxes": boxes})
     assert "jentera-form" not in summary and "#idType" in summary
     assert summary.startswith("Boxes on this page")
 
 
 def test_kind_none_adds_nothing():
-    assert page_scan.format_summary({**SCAN, "kind": "none"}) is None
+    boxes = [b for b in SCAN["boxes"] if b["kind"] != "password"]
+    assert page_scan.format_summary({**SCAN, "kind": "none", "boxes": boxes}) is None
 
 
 class _LiveRunner(_Runner):
@@ -318,3 +323,76 @@ def test_the_closing_line_cannot_be_forged_in_a_summary():
 def test_picks_with_fences_or_markers_are_dropped(pick, kept):
     line = page_scan._field_line({"words": "Name", "kind": "text", "pick": pick})
     assert (line is not None) is kept
+
+
+def test_unknown_kind_offers_jentera_form_if_the_owner_must_type():
+    scan = {"host": "mytax.hasil.gov.my", "kind": "unknown",
+            "boxes": [{"words": "Please choose ID Type", "kind": "select", "options": ["MyKad"], "pick": "#idType"}]}
+    summary = page_scan.format_summary(scan)
+    assert summary.startswith("Form on this page (host mytax.hasil.gov.my, kind unknown). "
+                              "If the owner must type these, build jentera-form from them")
+
+
+@pytest.mark.parametrize("kind", ["contact", "unknown", "none", "other"])
+def test_a_password_box_makes_it_a_sign_in(kind):
+    summary = page_scan.format_summary({**SCAN, "kind": kind})
+    assert summary.startswith("Form on this page (host mytax.hasil.gov.my, kind login). Build jentera-form")
+
+
+class _Sequence:
+    def __init__(self, bodies):
+        self.bodies = list(bodies)
+
+
+@pytest.fixture()
+def drawing_runner(runner, monkeypatch):
+    """The runner answers from a list of bodies, one per scan, the last repeating."""
+    monkeypatch.setattr(page_scan, "RETRY_GAP_SECONDS", 0.05)
+    seq = _Sequence([])
+    real = page_scan._request_scan
+
+    def next_scan(timeout):
+        if len(seq.bodies) > 1:
+            runner.body = seq.bodies.pop(0)
+        elif seq.bodies:
+            runner.body = seq.bodies[0]
+        return real(timeout)
+
+    monkeypatch.setattr(page_scan, "_request_scan", next_scan)
+    return seq
+
+
+EMPTY = {"ok": True, "host": "mytax.hasil.gov.my", "kind": "none", "boxes": [], "submits": []}
+
+
+def test_an_spa_that_draws_its_form_late_is_scanned_again(runner, drawing_runner):
+    drawing_runner.bodies = [EMPTY, EMPTY, SCAN]
+    out = page_scan.augment(tool_name="browser_navigate", result=_nav(), task_id="t1")
+    assert out and "#idType" in json.loads(out)["page_form"]
+    assert len(_scans(runner)) == 3
+
+
+def test_a_click_onto_a_late_form_is_scanned_again(runner, drawing_runner):
+    drawing_runner.bodies = [EMPTY, SCAN]
+    out = page_scan.augment(tool_name="browser_click", result=CLICK, task_id="t1")
+    assert out and "#idType" in json.loads(out)["page_form"]
+
+
+def test_retries_stay_within_one_budget_and_no_boxes_is_not_cached(runner, drawing_runner, monkeypatch):
+    monkeypatch.setattr(page_scan, "SCAN_BUDGET_SECONDS", 0.4)
+    drawing_runner.bodies = [EMPTY]
+    started = time.monotonic()
+    assert page_scan.augment(tool_name="browser_navigate", result=_nav(), task_id="t1") is None
+    assert time.monotonic() - started < 0.8
+    tries = len(_scans(runner))
+    assert tries >= 2
+    drawing_runner.bodies = [SCAN]
+    out = page_scan.augment(tool_name="browser_navigate", result=_nav(), task_id="t1")
+    assert out and "page_form" in json.loads(out), "a page with no boxes yet is not remembered"
+
+
+def test_a_404_stops_the_retries(runner, monkeypatch):
+    monkeypatch.setattr(page_scan, "RETRY_GAP_SECONDS", 0.05)
+    runner.status, runner.body = 404, {"ok": False, "code": "unavailable"}
+    assert page_scan.augment(tool_name="browser_navigate", result=_nav(), task_id="t1") is None
+    assert len(_scans(runner)) == 1
