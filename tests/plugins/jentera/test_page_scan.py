@@ -424,3 +424,55 @@ def test_a_404_stops_the_retries(runner, monkeypatch):
     runner.status, runner.body = 404, {"ok": False, "code": "unavailable"}
     assert page_scan.augment(tool_name="browser_navigate", result=_nav(), task_id="t1") is None
     assert len(_scans(runner)) == 1
+
+
+def _nav_with_snapshot(snapshot, count):
+    body = {"success": True, "url": "https://mytax.hasil.gov.my/", "title": "MyTax"}
+    if snapshot is not None:
+        body["snapshot"] = snapshot
+    if count is not None:
+        body["element_count"] = count
+    return json.dumps(body)
+
+
+def test_page_form_comes_first_after_success(runner):
+    out = page_scan.augment(tool_name="browser_navigate",
+                            result=_nav_with_snapshot('- button "Go" [ref=e1]', 1), task_id="t1")
+    assert list(json.loads(out))[:2] == ["success", "page_form"]
+    assert out.index('"page_form"') < out.index('"url"') < out.index('"snapshot"')
+
+
+@pytest.mark.parametrize("snapshot,count", [
+    ("(no interactive elements)", 0),
+    ("", 0),
+    ("  (no interactive elements)\n", None),
+    ("- document", 0),
+])
+def test_an_empty_snapshot_is_marked_stale(runner, snapshot, count):
+    out = json.loads(page_scan.augment(tool_name="browser_navigate",
+                                       result=_nav_with_snapshot(snapshot, count), task_id="t1"))
+    assert out["snapshot"] == page_scan.STALE_SNAPSHOT_NOTE
+    assert "element_count" not in out
+    assert out["url"] == "https://mytax.hasil.gov.my/" and "#idType" in out["page_form"]
+
+
+def test_a_snapshot_that_lists_elements_is_never_touched(runner):
+    snap = '- combobox "ID Type" [ref=e1]\n- button "Next" [ref=e2]'
+    out = json.loads(page_scan.augment(tool_name="browser_navigate",
+                                       result=_nav_with_snapshot(snap, 2), task_id="t1"))
+    assert out["snapshot"] == snap and out["element_count"] == 2
+    zero = json.loads(page_scan.augment(tool_name="browser_navigate",
+                                        result=_nav_with_snapshot(snap, 0), task_id="t2"))
+    assert zero["snapshot"] == snap and zero["element_count"] == 0
+
+
+def test_a_click_without_a_snapshot_is_not_given_one(runner):
+    out = json.loads(page_scan.augment(tool_name="browser_click", result=CLICK, task_id="t1"))
+    assert list(out)[:2] == ["success", "page_form"] and "snapshot" not in out
+
+
+def test_the_stale_note_still_goes_through_the_scrub(runner):
+    out = private_form._on_transform_tool_result(
+        tool_name="browser_navigate", result=_nav_with_snapshot("(no interactive elements)", 0), task_id="t5")
+    parsed = json.loads(out)
+    assert list(parsed)[:2] == ["success", "page_form"] and parsed["snapshot"] == page_scan.STALE_SNAPSHOT_NOTE

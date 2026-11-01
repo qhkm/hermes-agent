@@ -307,6 +307,38 @@ def _scan_until_boxes(repeat: bool):
             return scan, None
         time.sleep(RETRY_GAP_SECONDS)
 
+STALE_SNAPSHOT_NOTE = "(taken before the page finished drawing; see page_form for the boxes now on the page)"
+_NO_ELEMENTS = "(no interactive elements)"
+
+def _snapshot_is_empty(parsed: dict) -> bool:
+    """Whether the result's snapshot shows no elements (taken before the page drew its form)."""
+    if "snapshot" not in parsed and "element_count" not in parsed:
+        return False
+    snapshot = parsed.get("snapshot")
+    text = snapshot.strip() if isinstance(snapshot, str) else ""
+    if "ref=" in text:
+        return False  # it lists elements: never touched
+    return text in ("", _NO_ELEMENTS) or parsed.get("element_count") == 0
+
+def _with_page_form(parsed: dict, summary: str) -> dict:
+    """The result with page_form first (after success), and an empty snapshot marked as stale."""
+    out = {}
+    if "success" in parsed:
+        out["success"] = parsed["success"]
+    out["page_form"] = summary
+    stale = _snapshot_is_empty(parsed)
+    for key, value in parsed.items():
+        if key in ("success", "page_form"):
+            continue
+        if stale and key == "element_count":
+            continue
+        if stale and key == "snapshot":
+            value = STALE_SNAPSHOT_NOTE
+        out[key] = value
+    if stale and "snapshot" not in out:
+        out["snapshot"] = STALE_SNAPSHOT_NOTE
+    return out
+
 def augment(tool_name=None, result=None, task_id="", **_kwargs):
     """The browser result with the page's form added, or None to leave it as it is."""
     if tool_name not in BROWSER_TOOLS or not isinstance(result, str) or not result:
@@ -339,5 +371,4 @@ def augment(tool_name=None, result=None, task_id="", **_kwargs):
             return None
         if url:
             _remember(task, form_key)
-    parsed["page_form"] = summary
-    return json.dumps(parsed, ensure_ascii=False)
+    return json.dumps(_with_page_form(parsed, summary), ensure_ascii=False)
