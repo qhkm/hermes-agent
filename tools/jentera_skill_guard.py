@@ -174,6 +174,11 @@ def skill_relpath(path: str) -> Optional[str]:
             continue
     return None
 
+def is_skill_record_path(path: str) -> bool:
+    """Whether ``path`` is one of a skills folder's own records (a dot path inside it)."""
+    rel = skill_relpath(path)
+    return rel is not None and any(part.startswith(".") for part in Path(rel).parts)
+
 def guard_file_write(path: str, after_text: Optional[str], *extra: Optional[str]) -> Optional[str]:
     """The refusal for a file-tool write to ``path`` (absolute) leaving ``after_text``, or None."""
     if not guard_enabled():
@@ -296,6 +301,10 @@ def guard_file_tool(
             return None
         for absolute, text in dry.files.items():
             if text is None:
+                # A delete, or the old side of a move: only the folder's own records are protected.
+                if is_skill_record_path(absolute):
+                    logger.info("jentera skill guard: refused a file delete of skills records")
+                    return METADATA_REFUSAL
                 continue
             refusal = guard_file_write(absolute, text)
             if refusal:
@@ -321,6 +330,15 @@ def _removed_root() -> Path:
     return Path(configured) if configured else Path.home() / "aisar" / "removed-skills"
 
 
+def _install_records_readable(base: Path) -> bool:
+    """Whether both ``.bundled_manifest`` and ``.hub/lock.json`` exist and read cleanly."""
+    try:
+        (base / ".bundled_manifest").read_text(encoding="utf-8")
+        lock = json.loads((base / ".hub" / "lock.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(lock, dict) and isinstance(lock.get("installed", {}), dict)
+
 def sweep_protected_skills(
     skills_dir: Optional[Path] = None,
     dest_root: Optional[Path] = None,
@@ -330,7 +348,8 @@ def sweep_protected_skills(
 
     Skills whose usage record says ``created_by: agent`` are considered, and so
     are skills with no usage record at all that are neither bundled (shipped)
-    nor hub-installed: Hermes records every skill it ships or installs, so
+    nor hub-installed, but only when both ``.bundled_manifest`` and
+    ``.hub/lock.json`` exist and read cleanly: Hermes records every skill it ships or installs, so
     those can only have been written by the agent (from the terminal or file
     tools). Hub-installed, bundled and owner-recorded skills are never touched. Each
     one is moved whole (never deleted) to ``dest_root/<name>-<timestamp>/``.
@@ -353,6 +372,9 @@ def sweep_protected_skills(
         bundled = skill_usage._read_bundled_manifest_names()
     except Exception:
         bundled = set()
+    # Without both records readable, a shipped or installed skill cannot be told apart
+    # from one the agent wrote: then only skills marked created_by: agent are taken.
+    take_unrecorded = _install_records_readable(base)
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now if now is not None else time.time()))
     moved_names = []
     for skill_md in sorted(base.rglob("SKILL.md")):
@@ -368,6 +390,8 @@ def sweep_protected_skills(
         if name in hub or name in bundled:
             continue
         record = usage.get(name)
+        if record is None and not take_unrecorded:
+            continue
         if record is not None and not skill_usage._is_curator_managed_record(record):
             continue
         counts["checked"] += 1

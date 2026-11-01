@@ -370,3 +370,57 @@ def test_sweep_moves_unrecorded_skills_but_never_shipped_or_installed(skills_hom
     assert not (skills / "productivity" / "terminal-login").exists()
     assert (skills / "productivity" / "terminal-recipe" / "SKILL.md").exists()
     assert shipped.exists() and installed.exists()
+
+
+@pytest.mark.parametrize("broken", ["no-manifest", "no-lock", "bad-lock", "manifest-is-dir"])
+def test_sweep_takes_no_unrecorded_skill_without_readable_install_records(skills_home, broken):
+    from tools import skill_usage
+    skills = skills_home / "skills"
+    shipped = _write(skills, "shipped-login", LOGIN_SKILL)
+    agent = _write(skills, "agent-login", LOGIN_SKILL)
+    if broken != "no-manifest":
+        if broken == "manifest-is-dir":
+            (skills / ".bundled_manifest").mkdir()
+        else:
+            (skills / ".bundled_manifest").write_text("other:abc\n", encoding="utf-8")
+    if broken != "no-lock":
+        (skills / ".hub").mkdir()
+        (skills / ".hub" / "lock.json").write_text(
+            "{not json" if broken == "bad-lock" else json.dumps({"installed": {}}), encoding="utf-8")
+    skill_usage.save_usage({"agent-login": {"created_by": "agent"}})
+
+    counts = guard.sweep_protected_skills(now=0)
+
+    assert shipped.exists(), "a record-less skill is left alone when the install records cannot be read"
+    assert not agent.exists() and counts["moved"] == 1, "created_by: agent is still taken"
+
+
+def _v4a(*lines):
+    return "*** Begin Patch\n" + "\n".join(lines) + "\n*** End Patch\n"
+
+
+def test_file_patch_cannot_delete_or_move_skills_records(tmp_path, guard_on):
+    _, patch_tool = _file_tools()
+    manifest = tmp_path / ".bundled_manifest"
+    manifest.write_text("shipped:abc\n", encoding="utf-8")
+    (tmp_path / ".hub").mkdir()
+    lock = tmp_path / ".hub" / "lock.json"
+    lock.write_text("{}", encoding="utf-8")
+    with _skill_dir(tmp_path):
+        deleted = json.loads(patch_tool(mode="patch", patch=_v4a(f"*** Delete File: {manifest}")))
+        assert "error" in deleted and "records" in deleted["error"]
+        moved = json.loads(patch_tool(mode="patch", patch=_v4a(f"*** Move File: {lock} -> {tmp_path / 'x.json'}")))
+        assert "error" in moved and "records" in moved["error"]
+    assert manifest.exists() and lock.exists()
+
+
+def test_file_guard_failure_refuses_only_skills_writes(tmp_path, guard_on, monkeypatch):
+    write_file_tool, _ = _file_tools()
+    monkeypatch.setattr(guard, "guard_file_tool", lambda **k: 1 / 0)
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    with _skill_dir(skills):
+        inside = json.loads(write_file_tool(str(skills / "recipe-format" / "SKILL.md"), RECIPE_SKILL))
+        outside = json.loads(write_file_tool(str(tmp_path / "work" / "notes.md"), "notes"))
+    assert "error" in inside and "could not check" in inside["error"]
+    assert not outside.get("error"), outside

@@ -1613,10 +1613,42 @@ def _jentera_skill_refusal(task_id: str = "default", **kwargs) -> str | None:
 
         return guard_file_tool(resolve=_resolve, **kwargs)
     except Exception:
+        # Fail closed only for writes that may land in a skills folder.
+        if not _maybe_skills_write(_resolve, kwargs):
+            return None
         return (
             "Not saved: Jentera could not check this write against its built-in rules "
             "for skills. Try again later."
         )
+
+
+def _maybe_skills_write(resolve, kwargs) -> bool:
+    """Plain path logic, no guard code: whether any target lies in a folder named
+    ``skills`` or under this profile's skills folder."""
+    targets = []
+    if kwargs.get("path"):
+        targets.append(kwargs["path"])
+    patch_text = kwargs.get("patch")
+    if isinstance(patch_text, str):
+        import re as _re
+        for _m in _re.finditer(r'^\*\*\*\s*(?:Update|Add|Delete|Move)\s+File:\s*(.+)$', patch_text, _re.MULTILINE):
+            targets.extend(part.strip() for part in _m.group(1).split("->") if part.strip())
+    try:
+        from hermes_constants import get_hermes_home
+        home_skills = os.path.realpath(os.path.join(str(get_hermes_home()), "skills"))
+    except Exception:
+        home_skills = None
+    for target in targets:
+        try:
+            absolute = resolve(target)
+        except Exception:
+            return True
+        real = os.path.realpath(absolute)
+        if "skills" in Path(real).parts or "skills" in Path(absolute).parts:
+            return True
+        if home_skills and (real == home_skills or real.startswith(home_skills + os.sep)):
+            return True
+    return False
 
 
 def write_file_tool(path: str, content: str, task_id: str = "default",
