@@ -25,6 +25,7 @@ import json
 import re
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from collections import OrderedDict
@@ -110,25 +111,50 @@ def scan_within(budget: float | None = None):
 
 
 # Control and format characters, fences, tag-like text and our own markers.
-_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2060-\u2064\ufeff]")
-_TAGLIKE = re.compile(r"<\s*/?\s*[A-Za-z!?][^<>]*>?|[<>]")
-_FENCE = re.compile(r"`+|~{3,}|-{3,}|={3,}|\*{3,}")
-_MARKER = re.compile(r"\[\s*(?:end of\s+)?page text[^\]]*\]?|jentera[-_ ]?(?:context|form)", re.IGNORECASE)
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u00ad\u200b-\u200f\u2028-\u202e\u2060-\u2064\ufeff]")
+_TAGLIKE = re.compile(r"<\s*/?\s*[A-Za-z!?][^<>]*>?|[<>\[\]{}]")
+_FENCE = re.compile(r"`+|~{2,}|-{3,}|={3,}|\*{3,}|_{3,}")
+# Loose on purpose: any separator (or none) between the words still counts.
+_MARKER = re.compile(
+    r"page\W*text|end\W*of\W*page|data\W*only\W*not\W*instructions|jentera\W*(?:context|form)",
+    re.IGNORECASE,
+)
+
+def _plain(value: str) -> str:
+    text = unicodedata.normalize("NFKC", value)
+    text = _CONTROL.sub(" ", text)
+    return " ".join(text.split())
 
 def clean_page_text(value, cap: int) -> str:
-    """Page text made safe to show the model: one plain line, capped."""
+    """Page text made safe to show the model: one plain line, capped.
+
+    Normalised first (NFKC, no control characters, tags and brackets gone, spaces
+    squeezed) and then cleaned until nothing changes, so removing one piece can never
+    join the rest into a fence or marker.
+    """
     if not isinstance(value, str):
         return ""
-    text = _CONTROL.sub(" ", value)
-    for pattern in (_TAGLIKE, _FENCE, _MARKER):
-        text = pattern.sub(" ", text)
-    text = " ".join(text.split())
+    text = _plain(value)
+    for _ in range(20):
+        before = text
+        for pattern in (_TAGLIKE, _FENCE, _MARKER):
+            text = pattern.sub(" ", text)
+        text = _plain(text)
+        if text == before:
+            break
+    else:
+        return ""
     return text[:cap].rstrip()
 
 def _clean_pick(value) -> str:
+    """The pick as sent (control characters removed), or "" when it holds a fence or marker."""
     if not isinstance(value, str):
         return ""
-    return " ".join(_CONTROL.sub(" ", value).split())[:PICK_MAX]
+    pick = _plain(value)
+    loose = _TAGLIKE.sub("", pick)
+    if _FENCE.search(pick) or _MARKER.search(pick) or _MARKER.search(loose) or "<" in pick:
+        return ""
+    return pick[:PICK_MAX]
 
 def _field_line(box: dict) -> str | None:
     pick = _clean_pick(box.get("pick"))
