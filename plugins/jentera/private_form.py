@@ -158,11 +158,23 @@ def scrub_texts(texts):
         return [MODEL_TEXT_CHECK_FAILED if t else t for t in texts]
 
 
-def _on_transform_tool_result(result=None, **_kwargs):
+def _on_transform_tool_result(result=None, **kwargs):
+    # One hook for the plugin, because the first string returned wins: a browser result
+    # first gains the page's form (PAGE_SCAN), then everything is scrubbed as before.
+    original = result
+    if isinstance(result, str) and result:
+        try:
+            from plugins.jentera.page_scan import augment
+
+            augmented = augment(result=result, **kwargs)
+        except Exception:
+            augmented = None
+        if isinstance(augmented, str):
+            result = augmented
     # A value may have been typed during this tool call: the result is checked before the model reads it.
     if isinstance(result, str) and result:
         scrubbed = scrub_texts([result])[0]
-        if scrubbed != result:
+        if scrubbed != original:
             return scrubbed
     return None
 
