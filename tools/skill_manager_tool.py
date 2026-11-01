@@ -1358,6 +1358,21 @@ def skill_manage(
     if preflight is not None:
         return json.dumps(preflight, ensure_ascii=False)
 
+    # Jentera: a skill cannot cover sign-ins, secrets, private forms, the Vault or
+    # card details (JENTERA_SKILL_GUARD=on). Checked before the approval gate so a
+    # refused write is never staged either.
+    try:
+        from tools.jentera_skill_guard import guard_skill_write
+
+        refusal = guard_skill_write(
+            action, name=name, content=content, new_string=new_string,
+            file_content=file_content, file_path=file_path,
+        )
+    except Exception:
+        refusal = None
+    if refusal:
+        return tool_error(refusal, success=False)
+
     # Approval gate: when on, stages the write for review (skills are too large
     # to review inline, so they always stage regardless of origin); when off
     # (default) passes straight through. The gate is bypassed when this call is
