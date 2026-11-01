@@ -6,8 +6,10 @@ the agent last used, and adds a short summary to the tool result: the host,
 the kind of form, and one line per box (words, kind, options, pick), ready to
 copy as a ``jentera-form`` field. The bot then sees the form without probing.
 
-A page that answers with no boxes yet (an SPA still drawing its form) is scanned
-again every 0.7 s within the same budget. Bounds: at most once per page per task (again after 30 s, so a page the agent
+After ``browser_navigate``, a page that answers with no boxes yet (an SPA still
+drawing its form) is scanned again every 0.7 s, starting no attempt later than
+1.6 s after the first; a page still empty then is remembered for 30 s. A click
+gets one scan. Bounds: at most once per page per task (again after 30 s, so a page the agent
 returns to is read afresh), four seconds in all, and nothing is added when the
 runner answers anything but a scan with boxes (no page, busy, 404 because the
 business's switch is off, unreachable, or no boxes). Without a task id nothing
@@ -37,6 +39,8 @@ SCAN_PATH = "/v1/page/scan"
 SCAN_BUDGET_SECONDS = 4.0
 # A page that has not drawn its form yet (an SPA right after navigate) is scanned again.
 RETRY_GAP_SECONDS = 0.7
+# No new attempt starts later than this after the first (navigate only).
+REPEAT_WINDOW_SECONDS = 1.6
 # A 404 means the switch is off for this business; ask again after this long.
 UNAVAILABLE_RETRY_SECONDS = 60.0
 SUMMARY_MAX_CHARS = 1200
@@ -273,9 +277,16 @@ def _usable_lines(scan: dict) -> list:
         return []
     return [line for line in (_field_line(b) for b in boxes if isinstance(b, dict)) if line]
 
-def _scan_until_boxes():
-    """(scan, summary) within one budget, scanning again every 0.7 s while the page has no boxes."""
-    deadline = time.monotonic() + SCAN_BUDGET_SECONDS
+def _scan_until_boxes(repeat: bool):
+    """(scan, summary) within one budget.
+
+    With ``repeat`` (browser_navigate), a page with no boxes yet is scanned again every
+    0.7 s, but no attempt starts later than 1.6 s after the first; a slow answer still
+    has the whole 4 s budget. Without it (a click) there is one scan.
+    """
+    started = time.monotonic()
+    deadline = started + SCAN_BUDGET_SECONDS
+    last_start = started + REPEAT_WINDOW_SECONDS
     scan = None
     while True:
         remaining = deadline - time.monotonic()
@@ -286,10 +297,13 @@ def _scan_until_boxes():
             scan = latest
             if _usable_lines(latest):
                 return scan, format_summary(latest)
+        if not repeat:
+            return scan, None
         with _LOCK:
             if time.monotonic() < _state["unavailable_until"]:
                 return scan, None
-        if deadline - time.monotonic() <= RETRY_GAP_SECONDS:
+        next_start = time.monotonic() + RETRY_GAP_SECONDS
+        if next_start > last_start or next_start >= deadline:
             return scan, None
         time.sleep(RETRY_GAP_SECONDS)
 
@@ -308,11 +322,13 @@ def augment(tool_name=None, result=None, task_id="", **_kwargs):
     url = parsed.get("url") if isinstance(parsed.get("url"), str) else ""
     if task and url and _seen_before(task, "url:" + url):
         return None
-    scan, summary = _scan_until_boxes()
+    scan, summary = _scan_until_boxes(repeat=tool_name == "browser_navigate")
     if not summary:
-        # Cache only a page that drew its boxes but has nothing to show (kind none);
-        # a page with no boxes yet may draw them later, so the next call scans again.
-        if task and url and scan and _usable_lines(scan):
+        # Remember the page for 30 s, boxes or not, so a revisit or reload does not
+        # wait again; a form it draws later is picked up by the next click or after 30 s.
+        with _LOCK:
+            switched_off = time.monotonic() < _state["unavailable_until"]
+        if task and url and not switched_off:
             _remember(task, "url:" + url)
         return None
     if task:

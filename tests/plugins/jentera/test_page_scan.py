@@ -372,23 +372,51 @@ def test_an_spa_that_draws_its_form_late_is_scanned_again(runner, drawing_runner
     assert len(_scans(runner)) == 3
 
 
-def test_a_click_onto_a_late_form_is_scanned_again(runner, drawing_runner):
+def test_a_click_gets_one_scan(runner, drawing_runner):
     drawing_runner.bodies = [EMPTY, SCAN]
+    assert page_scan.augment(tool_name="browser_click", result=CLICK, task_id="t1") is None
+    assert len(_scans(runner)) == 1
     out = page_scan.augment(tool_name="browser_click", result=CLICK, task_id="t1")
-    assert out and "#idType" in json.loads(out)["page_form"]
+    assert out and "#idType" in json.loads(out)["page_form"], "the next click's scan picks the form up"
 
 
-def test_retries_stay_within_one_budget_and_no_boxes_is_not_cached(runner, drawing_runner, monkeypatch):
-    monkeypatch.setattr(page_scan, "SCAN_BUDGET_SECONDS", 0.4)
+def test_repeats_stop_after_the_window(runner, drawing_runner, monkeypatch):
+    monkeypatch.setattr(page_scan, "RETRY_GAP_SECONDS", 0.1)
+    monkeypatch.setattr(page_scan, "REPEAT_WINDOW_SECONDS", 0.35)
     drawing_runner.bodies = [EMPTY]
     started = time.monotonic()
     assert page_scan.augment(tool_name="browser_navigate", result=_nav(), task_id="t1") is None
-    assert time.monotonic() - started < 0.8
-    tries = len(_scans(runner))
-    assert tries >= 2
-    drawing_runner.bodies = [SCAN]
+    assert time.monotonic() - started < 1.0, "no new attempt after the window, though the budget is 4 s"
+    assert 2 <= len(_scans(runner)) <= 5
+
+
+def test_default_repeat_window():
+    assert page_scan.REPEAT_WINDOW_SECONDS == 1.6
+
+
+def test_a_slow_answer_still_has_the_whole_budget(runner, monkeypatch):
+    monkeypatch.setattr(page_scan, "REPEAT_WINDOW_SECONDS", 0.1)
+    runner.delay = 2.0
     out = page_scan.augment(tool_name="browser_navigate", result=_nav(), task_id="t1")
-    assert out and "page_form" in json.loads(out), "a page with no boxes yet is not remembered"
+    assert out and "page_form" in json.loads(out)
+
+
+def test_an_empty_page_is_remembered_for_30_seconds(runner, drawing_runner, monkeypatch):
+    monkeypatch.setattr(page_scan, "RETRY_GAP_SECONDS", 0.7)
+    clock = _Clock()
+    monkeypatch.setattr(page_scan.time, "monotonic", clock)
+    monkeypatch.setattr(page_scan.time, "sleep", lambda s: setattr(clock, "now", clock.now + s))
+    drawing_runner.bodies = [EMPTY]
+    assert page_scan.augment(tool_name="browser_navigate", result=_nav(), task_id="t1") is None
+    tries = len(_scans(runner))
+    assert tries == 3, "attempts at 0, 0.7 and 1.4 s; none after 1.6 s"
+    drawing_runner.bodies = [SCAN]
+    clock.now += 10
+    assert page_scan.augment(tool_name="browser_navigate", result=_nav(), task_id="t1") is None
+    assert len(_scans(runner)) == tries, "a revisit within 30 s does not scan or wait"
+    clock.now += 25
+    out = page_scan.augment(tool_name="browser_navigate", result=_nav(), task_id="t1")
+    assert out and "#idType" in json.loads(out)["page_form"]
 
 
 def test_a_404_stops_the_retries(runner, monkeypatch):
