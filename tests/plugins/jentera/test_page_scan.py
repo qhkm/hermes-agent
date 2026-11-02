@@ -528,3 +528,89 @@ def test_a_huge_box_after_others_is_shrunk_not_dropped():
     big = {"words": "Bank", "kind": "select", "options": ["b" * 60] * 20, "pick": "#bank"}
     summary = page_scan.format_summary({"host": "bank.example", "kind": "login", "boxes": small + [big]})
     assert len(summary) <= page_scan.SUMMARY_MAX_CHARS and '"pick": "#bank"' in summary
+
+
+@pytest.fixture()
+def scan_runner(monkeypatch):
+    """Exercise augmentation without a listening socket (also works in a sandbox)."""
+    class ScanRunner:
+        body = SCAN
+        calls = []
+    state = ScanRunner()
+    def scan(timeout):
+        state.calls.append(("/v1/page/scan", "Bearer test-key"))
+        return state.body
+    monkeypatch.setattr(page_scan, "_request_scan", scan)
+    monkeypatch.setenv("API_SERVER_KEY", "test-key")
+    page_scan._seen.clear()
+    monkeypatch.setitem(page_scan._state, "unavailable_until", 0.0)
+    return state
+
+
+def test_no_primary_field_is_byte_identical(scan_runner, monkeypatch):
+    from plugins.jentera import signin_step_in
+    monkeypatch.setattr(signin_step_in, "request_step_in", lambda *a, **kw: pytest.fail("off must not call step-in"))
+    expected = json.dumps(page_scan._with_page_form(json.loads(_nav()), page_scan.format_summary(SCAN)), ensure_ascii=False)
+    assert page_scan.augment(tool_name="browser_navigate", result=_nav(), task_id="t1") == expected
+
+
+def test_primary_calls_step_in_and_returns_note(scan_runner, monkeypatch):
+    from plugins.jentera import signin_step_in
+    calls = []
+    scan_runner.body = {**SCAN, "primary": True, "scanId": "scan-1"}
+    monkeypatch.setattr(signin_step_in, "request_step_in", lambda scan_id: calls.append(scan_id) or True)
+    out = page_scan.augment(tool_name="browser_navigate", result=_nav(), task_id="t1")
+    assert calls == ["scan-1"]
+    assert json.loads(out)["page_form"] == signin_step_in.STEP_IN_NOTE
+
+
+def test_step_in_refused_falls_back_to_summary(scan_runner, monkeypatch):
+    from plugins.jentera import signin_step_in
+    scan_runner.body = {**SCAN, "primary": True, "scanId": "scan-1"}
+    monkeypatch.setattr(signin_step_in, "request_step_in", lambda scan_id: False)
+    out = page_scan.augment(tool_name="browser_navigate", result=_nav(), task_id="t1")
+    assert json.loads(out)["page_form"] == page_scan.format_summary(SCAN)
+
+
+def test_step_in_unreachable_falls_back_within_budget(scan_runner, monkeypatch):
+    from plugins.jentera import signin_step_in
+    scan_runner.body = {**SCAN, "primary": True, "scanId": "scan-1"}
+    monkeypatch.setattr(signin_step_in._OPENER, "open", lambda *a, **kw: (_ for _ in ()).throw(OSError("unreachable")))
+    started = time.monotonic()
+    out = page_scan.augment(tool_name="browser_navigate", result=_nav(), task_id="t1")
+    assert time.monotonic() - started < 3.0
+    assert json.loads(out)["page_form"] == page_scan.format_summary(SCAN)
+
+
+@pytest.mark.parametrize("kind", ["login", "verification_code", "unknown"])
+def test_non_primary_login_uses_research_intro(scan_runner, kind):
+    scan_runner.body = {**SCAN, "kind": kind, "primary": False, "scanId": "scan-1"}
+    out = page_scan.augment(tool_name="browser_navigate", result=_nav(), task_id="t1")
+    summary = json.loads(out)["page_form"]
+    assert summary.startswith("This site has a sign-in (host mytax.hasil.gov.my). Do not stop for it; see your rules on offering it.\n")
+    assert "end your turn" not in summary
+    assert "#idType" in summary and summary.endswith(page_scan.DATA_END)
+    assert len(_scans(scan_runner)) == len(scan_runner.calls) == 1
+
+
+def test_scrub_runs_after_step_in_note(scan_runner, monkeypatch):
+    from plugins.jentera import signin_step_in
+    scan_runner.body = {**SCAN, "primary": True, "scanId": "scan-1"}
+    monkeypatch.setattr(signin_step_in, "request_step_in", lambda scan_id: True)
+    checked = []
+    def scrub(texts):
+        checked.extend(texts)
+        return [text.replace("MyTax", "[hidden]") for text in texts]
+    monkeypatch.setattr(private_form, "scrub_texts", scrub)
+    out = private_form._on_transform_tool_result(tool_name="browser_navigate", result=_nav(), task_id="t1")
+    assert len(checked) == 1 and signin_step_in.STEP_IN_NOTE in checked[0]
+    assert "MyTax" not in out and "[hidden]" in out
+
+
+@pytest.mark.parametrize("primary,scan_id,kind", [(True, None, "login"), (True, "s", "card_payment"), (1, "s", "login")])
+def test_step_in_requires_explicit_primary_scan_id_and_supported_kind(scan_runner, monkeypatch, primary, scan_id, kind):
+    from plugins.jentera import signin_step_in
+    scan_runner.body = {**SCAN, "primary": primary, "scanId": scan_id, "kind": kind}
+    monkeypatch.setattr(signin_step_in, "request_step_in", lambda *a: pytest.fail("must not step in"))
+    out = page_scan.augment(tool_name="browser_navigate", result=_nav(), task_id="t1")
+    assert json.loads(out)["page_form"] == page_scan.format_summary(SCAN | {"kind": kind})

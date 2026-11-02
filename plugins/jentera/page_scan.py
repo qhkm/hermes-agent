@@ -10,11 +10,15 @@ After ``browser_navigate``, a page that answers with no boxes yet (an SPA still
 drawing its form) is scanned again every 0.7 s, starting no attempt later than
 1.6 s after the first; a page still empty then is remembered for 30 s. A click
 gets one scan. Bounds: at most once per page per task (again after 30 s, so a page the agent
-returns to is read afresh), four seconds in all, and nothing is added when the
+returns to is read afresh), four seconds for scanning, and nothing is added when the
 runner answers anything but a scan with boxes (no page, busy, 404 because the
 business's switch is off, unreachable, or no boxes). Without a task id nothing
 is remembered, so tasks never share state. The scan reads no box values;
 nothing here logs a page, a box or a result.
+
+An explicitly primary sign-in scan may ask the runner to end this turn with
+the private form (up to three more seconds). Non-primary sign-ins offer a
+research cue instead; scans without primary keep the existing summary.
 
 Words, options and button names come from the web page and are untrusted: they
 are cleaned (no control characters, fences, tags or markers), capped, and shown
@@ -34,6 +38,7 @@ import urllib.request
 from collections import OrderedDict
 
 from plugins.jentera.handoff import _runner_key, _runner_url
+from plugins.jentera import signin_step_in
 
 SCAN_PATH = "/v1/page/scan"
 SCAN_BUDGET_SECONDS = 4.0
@@ -204,6 +209,16 @@ def _field_line(box: dict) -> str | None:
     variants = _field_lines(box)
     return variants[0] if variants else None
 
+def _is_signin(scan: dict) -> bool:
+    # A password box counts as a login, except on card-payment forms.
+    if scan.get("kind") == "card_payment":
+        return False
+    boxes = scan.get("boxes")
+    return scan.get("kind") in ("login", "verification_code") or (
+        isinstance(boxes, list) and
+        any(isinstance(b, dict) and b.get("kind") == "password" for b in boxes))
+
+
 def format_summary(scan: dict) -> str | None:
     """A compact summary of a scan with boxes, or None when there is nothing to show."""
     kind = scan.get("kind") if isinstance(scan.get("kind"), str) else "unknown"
@@ -221,7 +236,9 @@ def format_summary(scan: dict) -> str | None:
     if not lines:
         return None
     host = clean_page_text(scan.get("host"), HOST_MAX) or "?"
-    if kind in JENTERA_FORM_KINDS:
+    if scan.get("primary") is False and _is_signin(scan):
+        intro = signin_step_in.RESEARCH_INTRO.format(host=host)
+    elif kind in JENTERA_FORM_KINDS:
         noun = "Card payment form" if kind == "card_payment" else "Sign-in form"
         intro = (f"{noun} on this page (host {host}). The boxes are listed below — do not take a "
                  "screenshot, snapshot or console probe. Choose any non-secret option yourself only if "
@@ -409,4 +426,9 @@ def augment(tool_name=None, result=None, task_id="", **_kwargs):
             return None
         if url:
             _remember(task, form_key)
+    scan_id = scan.get("scanId")
+    if (scan.get("primary") is True and _is_signin(scan)
+            and isinstance(scan_id, str) and scan_id
+            and signin_step_in.request_step_in(scan_id)):
+        summary = signin_step_in.STEP_IN_NOTE
     return json.dumps(_with_page_form(parsed, summary), ensure_ascii=False)
