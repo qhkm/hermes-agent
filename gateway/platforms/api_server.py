@@ -4976,7 +4976,13 @@ class APIServerAdapter(BasePlatformAdapter):
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
-        last_started_args = {}
+        # Paths of file writes started but not completed, oldest first. The
+        # concurrent executor sends every start of a batch before any call
+        # runs and its completions carry no id, so with two writes pending a
+        # completion cannot be matched to its path: the path is left out
+        # rather than guessed (the runner then sends no excerpt for it).
+        pending_paths: Dict[str, list] = {}
+        ambiguous_paths: set = set()
         started_args_by_id = {}
 
         def _push(event: Dict[str, Any]) -> None:
@@ -5000,7 +5006,7 @@ class APIServerAdapter(BasePlatformAdapter):
             if event_type == "tool.started":
                 if tool_name in {"write_file", "patch"}:
                     saved_args = dict(args) if isinstance(args, dict) else {}
-                    last_started_args[tool_name] = saved_args
+                    pending_paths.setdefault(tool_name, []).append(saved_args)
                     if tool_call_id:
                         started_args_by_id[(tool_name, tool_call_id)] = saved_args
                 _push({
@@ -5022,12 +5028,24 @@ class APIServerAdapter(BasePlatformAdapter):
                     **call_fields,
                 }
                 if tool_name in {"write_file", "patch"}:
-                    # Prefer identity for parallel calls; older executors only
-                    # provide the name, so retain their last started arguments.
-                    started_args = (
-                        started_args_by_id.pop((tool_name, tool_call_id), {})
-                        if tool_call_id else last_started_args.get(tool_name, {})
-                    )
+                    pending = pending_paths.setdefault(tool_name, [])
+                    if tool_call_id:
+                        started_args = started_args_by_id.pop((tool_name, tool_call_id), None) or {}
+                        for i, entry in enumerate(pending):
+                            if entry is started_args:
+                                del pending[i]
+                                break
+                    elif len(pending) == 1 and tool_name not in ambiguous_paths:
+                        started_args = pending.pop(0)
+                    else:
+                        # Two or more writes overlapped: no completion of this
+                        # batch can be matched, so none reports a path.
+                        ambiguous_paths.add(tool_name)
+                        if pending:
+                            pending.pop(0)
+                        started_args = {}
+                    if not pending:
+                        ambiguous_paths.discard(tool_name)
                     path = started_args.get("path")
                     if isinstance(path, str):
                         event["result_path"] = path

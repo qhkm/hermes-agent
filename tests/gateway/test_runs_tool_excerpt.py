@@ -63,7 +63,7 @@ def test_error_result_has_no_excerpt():
 @pytest.mark.parametrize("tool", ["write_file", "patch"])
 def test_write_file_carries_path(tool):
     path = "/home/sprite/aisar/outputs/t/q.csv"
-    events = run_events(started(tool, "/old.csv"), started(tool, path),
+    events = run_events(started(tool, path),
                         completed(tool, result="Added item, quantity, price and total."))
     assert events[-1]["result_path"] == path
     assert events[-1]["result_excerpt"] == "Added item, quantity, price and total."
@@ -133,3 +133,29 @@ def test_unknown_call_id_does_not_borrow_another_files_path():
     events = run_events(started("write_file", "/other.csv", tool_call_id="c1"),
                         completed("write_file", result="ok", tool_call_id="unknown"))
     assert "result_path" not in events[-1]
+
+
+
+def test_two_parallel_writes_without_ids_report_no_path():
+    """The concurrent executor sends both starts first, then completes without ids."""
+    events = run_events(
+        started("write_file", "/home/sprite/aisar/outputs/t/a.csv"),
+        started("write_file", "/home/sprite/aisar/outputs/t/b.csv"),
+        completed("write_file", result="ok a", is_error=False),
+        completed("write_file", result="ok b", is_error=False),
+    )
+    done = [e for e in events if e["event"] == "tool.completed"]
+    assert len(done) == 2
+    assert all("result_path" not in e for e in done)
+
+
+def test_single_writes_without_ids_keep_their_paths():
+    events = run_events(
+        started("write_file", "/home/sprite/aisar/outputs/t/a.csv"),
+        completed("write_file", result="ok a", is_error=False),
+        started("write_file", "/home/sprite/aisar/outputs/t/b.csv"),
+        completed("write_file", result="ok b", is_error=False),
+    )
+    done = [e for e in events if e["event"] == "tool.completed"]
+    assert [e["result_path"] for e in done] == [
+        "/home/sprite/aisar/outputs/t/a.csv", "/home/sprite/aisar/outputs/t/b.csv"]
