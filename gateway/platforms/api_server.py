@@ -5000,9 +5000,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 pass
 
         def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
-            ts = time.time()
+            # Kept above the timestamp: Jentera's bootstrap patch anchors on
+            # "ts = time.time()" directly followed by the tool.started branch.
             tool_call_id = kwargs.get("tool_call_id")
             call_fields = {"tool_call_id": tool_call_id} if tool_call_id else {}
+            ts = time.time()
             if event_type == "tool.started":
                 if tool_name in {"write_file", "patch"}:
                     saved_args = dict(args) if isinstance(args, dict) else {}
