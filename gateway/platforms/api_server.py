@@ -92,10 +92,13 @@ from gateway.platforms.base import (
     validate_media_delivery_path,
 )
 from agent.jentera_turn_notes import TURN_NOTES_MAX
-from agent.redact import redact_sensitive_text
+from agent.redact import MODEL_TEXT_CHECK_FAILED, redact_sensitive_text, scrub_model_texts
 from gateway.readiness import collect_runtime_readiness
 
 logger = logging.getLogger(__name__)
+
+EXCERPT_TOOLS = frozenset({"web_search", "web_extract", "write_file", "patch"})
+EXCERPT_MAX = 1500
 
 # Seconds a run may keep going after the turn liveness watchdog interrupted it.
 _TURN_LIVENESS_UNWIND_GRACE_S = 30.0
@@ -4973,6 +4976,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
+        last_started_args = {}
+        started_args_by_id = {}
+
         def _push(event: Dict[str, Any]) -> None:
             self._set_run_status(
                 run_id,
@@ -4989,23 +4995,56 @@ class APIServerAdapter(BasePlatformAdapter):
 
         def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
             ts = time.time()
+            tool_call_id = kwargs.get("tool_call_id")
+            call_fields = {"tool_call_id": tool_call_id} if tool_call_id else {}
             if event_type == "tool.started":
+                if tool_name in {"write_file", "patch"}:
+                    saved_args = dict(args) if isinstance(args, dict) else {}
+                    last_started_args[tool_name] = saved_args
+                    if tool_call_id:
+                        started_args_by_id[(tool_name, tool_call_id)] = saved_args
                 _push({
                     "event": "tool.started",
                     "run_id": run_id,
                     "timestamp": ts,
                     "tool": tool_name,
                     "preview": preview,
+                    **call_fields,
                 })
             elif event_type == "tool.completed":
-                _push({
+                event = {
                     "event": "tool.completed",
                     "run_id": run_id,
                     "timestamp": ts,
                     "tool": tool_name,
                     "duration": round(kwargs.get("duration", 0), 3),
                     "error": kwargs.get("is_error", False),
-                })
+                    **call_fields,
+                }
+                if tool_name in {"write_file", "patch"}:
+                    # Prefer identity for parallel calls; older executors only
+                    # provide the name, so retain their last started arguments.
+                    started_args = (
+                        started_args_by_id.pop((tool_name, tool_call_id), {})
+                        if tool_call_id else last_started_args.get(tool_name, {})
+                    )
+                    path = started_args.get("path")
+                    if isinstance(path, str):
+                        event["result_path"] = path
+                result = kwargs.get("result")
+                if tool_name in EXCERPT_TOOLS and not kwargs.get("is_error") and result is not None:
+                    try:
+                        text = result if isinstance(result, str) else json.dumps(result, default=str)
+                        # Scrub before truncating: a private value may cross
+                        # the excerpt boundary. The hook fails closed with a
+                        # marker (including on invalid responses), not a raise.
+                        text = scrub_model_texts([text])[0]
+                        if MODEL_TEXT_CHECK_FAILED not in text:
+                            event["result_excerpt"] = text[:EXCERPT_MAX]
+                    except Exception:
+                        # Never log the result or send unchecked text.
+                        pass
+                _push(event)
             elif event_type == "run.status":
                 # Lifecycle lines (retrying, fallback, automatic recovery waits). Consumers that
                 # do not know the event ignore it.
