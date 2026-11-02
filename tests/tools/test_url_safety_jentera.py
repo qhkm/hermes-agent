@@ -7,6 +7,7 @@
 
 import http.server
 import json
+import socket
 import threading
 from pathlib import Path
 
@@ -95,7 +96,7 @@ def test_dns_failure_retries_once_then_checks_every_address(monkeypatch, answer,
     def lookup(*args):
         calls.append(args)
         if len(calls) == 1 or answer is None:
-            raise socket.gaierror("temporary DNS failure")
+            raise socket.gaierror(socket.EAI_AGAIN, "temporary DNS failure")
         return [(2, 1, 6, "", (answer, 443))]
     monkeypatch.setattr(url_safety, "_getaddrinfo", lookup)
     monkeypatch.setattr("time.sleep", waits.append)
@@ -116,7 +117,7 @@ def test_dns_reason_reaches_browser_and_cdp(monkeypatch):
     monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: False)
     monkeypatch.setattr(browser_tool, "_eval_ssrf_guard_active", lambda _: True)
     url = "https://mytax.hasil.gov.my"
-    expected = "Could not look up the site's address; try again"
+    expected = "Could not look up the site's address"
     assert json.loads(browser_tool.browser_navigate(url))["error"] == expected
     result = browser_cdp_tool._browser_cdp_private_guard(method="Page.navigate", params={"url": url}, task_id="t")
     assert json.loads(result)["error"] == expected
@@ -135,10 +136,27 @@ def test_dns_diagnostic_is_scoped_to_last_refused_url(monkeypatch):
     monkeypatch.setattr("time.sleep", lambda _: None)
     url = "https://mytax.hasil.gov.my"
     assert not url_safety.is_safe_url(url)
-    assert url_safety.url_safety_error(url, "blocked") == "Could not look up the site's address; try again"
+    assert url_safety.url_safety_error(url, "blocked") == "Could not look up the site's address"
     assert url_safety.url_safety_error("https://other.example", "blocked") == "blocked"
     assert url_safety.is_always_blocked_url("http://169.254.169.254")
     assert url_safety.url_safety_error(url, "blocked") == "blocked"
     monkeypatch.setattr(url_safety, "_getaddrinfo", lambda *a: [(2, 1, 6, "", ("127.0.0.1", 443))])
     assert not url_safety.is_safe_url(url)
     assert url_safety.url_safety_error(url, "blocked") == "blocked"
+
+
+@pytest.mark.parametrize("errno", [socket.EAI_NONAME, None])
+def test_permanent_dns_failure_is_not_retried(monkeypatch, errno):
+    import socket
+    _public(monkeypatch)
+    monkeypatch.setattr(url_safety, "_proxy_dns_delegation_enabled", lambda: False)
+    calls, waits = [], []
+    def lookup(*args):
+        calls.append(args)
+        raise socket.gaierror(errno, "name does not exist")
+    monkeypatch.setattr(url_safety, "_getaddrinfo", lookup)
+    monkeypatch.setattr("time.sleep", waits.append)
+    assert not url_safety.is_safe_url("https://nonexistent.example")
+    assert len(calls) == 1
+    assert waits == []
+    assert url_safety.url_safety_error("https://nonexistent.example", "blocked") == "Could not look up the site's address"

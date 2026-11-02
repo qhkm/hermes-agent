@@ -374,7 +374,7 @@ def _resolved_ip_block_reason(ip: _IPAddress, allow_private: bool) -> Optional[s
 # refused URL again just to word its error: that could observe a different DNS answer.
 def url_safety_error(url: str, fallback: str) -> str:
     if _last_url_failure.get() == (url, "dns"):
-        return "Could not look up the site's address; try again"
+        return "Could not look up the site's address"
     return fallback
 
 
@@ -403,7 +403,9 @@ def is_safe_url(url: str) -> bool:
         try:
             try:
                 addr_info = _getaddrinfo(hostname)
-            except socket.gaierror:
+            except socket.gaierror as e:
+                if e.errno != socket.EAI_AGAIN:
+                    raise
                 time.sleep(0.3)
                 addr_info = _getaddrinfo(hostname)
         except socket.gaierror:
