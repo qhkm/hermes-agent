@@ -40,8 +40,8 @@ def started(tool, path, **kwargs):
 
 
 def test_web_extract_completed_carries_excerpt():
-    event, = run_events(completed("web_extract", result="x" * 3000, is_error=False))
-    assert event["result_excerpt"] == "x" * 1500
+    event, = run_events(completed("web_extract", result="x" * 6000, is_error=False))
+    assert event["result_excerpt"] == "x" * 4000
 
 
 @pytest.mark.parametrize("tool", [
@@ -99,11 +99,11 @@ def test_scrubs_before_cap_and_caps_after_scrubbing():
     redact.set_model_text_scrubber(lambda texts: [
         text.replace("4111111111111111", "[hidden]") for text in texts
     ])
-    event, = run_events(completed("web_extract", result="x" * 1495 + "4111111111111111"))
-    assert event["result_excerpt"] == "x" * 1495 + "[hidd"
-    redact.set_model_text_scrubber(lambda texts: ["[hidden]" * 300])
+    event, = run_events(completed("web_extract", result="x" * 3995 + "4111111111111111"))
+    assert event["result_excerpt"] == "x" * 3995 + "[hidd"
+    redact.set_model_text_scrubber(lambda texts: ["[hidden]" * 600])
     event, = run_events(completed("web_extract", result="x"))
-    assert len(event["result_excerpt"]) == 1500
+    assert len(event["result_excerpt"]) == 4000
 
 
 def test_non_string_result_is_json():

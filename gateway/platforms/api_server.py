@@ -98,7 +98,10 @@ from gateway.readiness import collect_runtime_readiness
 logger = logging.getLogger(__name__)
 
 EXCERPT_TOOLS = frozenset({"web_search", "web_extract", "write_file", "patch"})
-EXCERPT_MAX = 1500
+# Room beyond the 1,500 characters a progress line may use: Jentera's runner
+# blanks the owner's keys on the whole text and only then cuts to 1,500, so a
+# key straddling the cut is never sent half-shown.
+EXCERPT_MAX = 4000
 
 # Seconds a run may keep going after the turn liveness watchdog interrupted it.
 _TURN_LIVENESS_UNWIND_GRACE_S = 30.0
