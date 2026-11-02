@@ -115,10 +115,12 @@ def _resolve_cdp_endpoint() -> str:
 
 
 def _private_page_guard_error(blocked_url: str, method: str) -> str:
+    from tools.url_safety import url_safety_error
+
     return tool_error(
-        "Blocked: page URL targets a private or internal address "
+        url_safety_error(blocked_url, "Blocked: page URL targets a private or internal address "
         f"({blocked_url}). Raw CDP method {method!r} could expose private "
-        "page content or state.",
+        "page content or state."),
         method=method,
         cdp_docs=CDP_DOCS_URL,
     )
@@ -152,8 +154,8 @@ def _browser_cdp_private_guard(
                 or not bt._is_safe_url(target_url)  # type: ignore[attr-defined]
             ):
                 return tool_error(
-                    "Blocked: CDP Page.navigate target is a private or "
-                    f"internal address ({target_url}).",
+                    bt._url_safety_error(target_url, "Blocked: CDP Page.navigate target is a private or "
+                    f"internal address ({target_url})."),
                     method=method,
                     cdp_docs=CDP_DOCS_URL,
                 )
@@ -163,8 +165,8 @@ def _browser_cdp_private_guard(
             blocked_literal = bt._expression_targets_private_url(expression)  # type: ignore[attr-defined]
             if blocked_literal:
                 return tool_error(
-                    "Blocked: CDP Runtime.evaluate expression targets a "
-                    f"private or internal address ({blocked_literal}).",
+                    bt._url_safety_error(blocked_literal, "Blocked: CDP Runtime.evaluate expression targets a "
+                    f"private or internal address ({blocked_literal})."),
                     method=method,
                     cdp_docs=CDP_DOCS_URL,
                 )

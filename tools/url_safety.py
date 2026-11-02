@@ -14,6 +14,8 @@ import ipaddress
 import logging
 import os
 import socket
+import time
+from contextvars import ContextVar
 import asyncio
 import re
 from contextlib import contextmanager
@@ -24,6 +26,8 @@ from hermes_constants import get_hermes_home_override
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
+
+_last_url_failure: ContextVar[tuple[str, str] | None] = ContextVar("url_safety_failure", default=None)
 
 # Proxy env vars: when set, the runtime should delegate DNS to the proxy.
 _PROXY_ENV_VARS = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy")
@@ -317,6 +321,7 @@ def is_always_blocked_url(url: str) -> bool:
     deliberately bypass the full check (e.g. hybrid cloud browser routing private URLs to a local
     sidecar) but must still enforce the floor. False for ordinary private/loopback URLs, DNS
     failures and parse errors (the caller's ordinary fail-closed path handles those)."""
+    _last_url_failure.set(None)
     try:
         hostname = _normalize_hostname(urlparse(url).hostname)
         if not hostname:
@@ -365,10 +370,19 @@ def _resolved_ip_block_reason(ip: _IPAddress, allow_private: bool) -> Optional[s
     return None
 
 
+# Per-context diagnostic for the immediately preceding check. Do not resolve a
+# refused URL again just to word its error: that could observe a different DNS answer.
+def url_safety_error(url: str, fallback: str) -> str:
+    if _last_url_failure.get() == (url, "dns"):
+        return "Could not look up the site's address; try again"
+    return fallback
+
+
 def is_safe_url(url: str) -> bool:
     """True if the URL target is not a private/internal address. Resolves the hostname and checks
     every answer; fails closed on DNS errors and unexpected exceptions. ``allow_private_urls``
     skips private-IP blocking, but cloud metadata endpoints remain blocked regardless."""
+    _last_url_failure.set(None)
     try:
         parsed = urlparse(url)
         hostname = _normalize_hostname(parsed.hostname)
@@ -387,7 +401,11 @@ def is_safe_url(url: str) -> bool:
         allow_private_ip = _allows_private_ip_resolution(hostname, scheme)
         allow_private = allow_all_private or allow_private_ip
         try:
-            addr_info = _getaddrinfo(hostname)
+            try:
+                addr_info = _getaddrinfo(hostname)
+            except socket.gaierror:
+                time.sleep(0.3)
+                addr_info = _getaddrinfo(hostname)
         except socket.gaierror:
             # Sandbox/proxy environments may block direct DNS. Fail closed by default (as the
             # production pin does); only an explicit opt-in (security.proxy_dns_delegation) lets a
@@ -399,6 +417,7 @@ def is_safe_url(url: str) -> bool:
                     hostname)
                 return True
             logger.warning("Blocked request — DNS resolution failed for: %s", hostname)
+            _last_url_failure.set((url, "dns"))
             return False
         for raw, ip_str, ip in _iter_resolved_ips(addr_info):
             if ip is None:

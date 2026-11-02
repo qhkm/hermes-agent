@@ -117,11 +117,13 @@ except Exception:
 try:
     from tools.url_safety import (
         is_safe_url as _is_safe_url,
+        url_safety_error as _url_safety_error,
         is_always_blocked_url as _is_always_blocked_url,
         normalize_url_for_request as _normalize_url_for_request,
         sensitive_query_param_name as _sensitive_query_param_name,
     )
 except Exception:
+    _url_safety_error = lambda url, fallback: fallback
     _is_safe_url = lambda url: False  # noqa: E731 — fail-closed: block all if safety module unavailable
     _is_always_blocked_url = lambda url: True  # noqa: E731 — fail-closed on the floor too
     _normalize_url_for_request = lambda url: url  # noqa: E731 — best-effort fallback
@@ -3071,7 +3073,7 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     ):
         return json.dumps({
             "success": False,
-            "error": "Blocked: URL targets a private or internal address",
+            "error": _url_safety_error(url, "Blocked: URL targets a private or internal address"),
         })
 
     # Website policy check — block before navigating
@@ -3154,7 +3156,7 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
             _run_browser_command(nav_session_key, "open", ["about:blank"], timeout=10)
             return json.dumps({
                 "success": False,
-                "error": "Blocked: redirect landed on a private/internal address",
+                "error": _url_safety_error(final_url, "Blocked: redirect landed on a private/internal address"),
             })
 
         response = {
@@ -3287,11 +3289,11 @@ def browser_snapshot(
                     if _current_url and not _is_safe_url(_current_url):
                         return json.dumps({
                             "success": False,
-                            "error": (
+                            "error": _url_safety_error(_current_url, (
                                 "Blocked: page URL targets a private or internal address "
                                 f"({_current_url}). This may have been caused by a "
                                 "JavaScript navigation via browser_console."
-                            ),
+                            )),
                         }, ensure_ascii=False)
             except Exception as _url_exc:
                 logger.debug("browser_snapshot: URL safety check failed (%s)", _url_exc)
@@ -3514,11 +3516,11 @@ def browser_back(task_id: Optional[str] = None) -> str:
             if _blocked_url:
                 return json.dumps({
                     "success": False,
-                    "error": (
+                    "error": _url_safety_error(_blocked_url, (
                         "Blocked: page URL targets a private or internal address "
                         f"({_blocked_url}). Browser history navigation (back) "
                         "landed on this address."
-                    ),
+                    )),
                 }, ensure_ascii=False)
         data = result.get("data", {})
         response = {
@@ -3578,11 +3580,11 @@ def _blocked_private_page_action(effective_task_id: str, action: str) -> Optiona
         return None
     return json.dumps({
         "success": False,
-        "error": (
+        "error": _url_safety_error(blocked_url, (
             "Blocked: page URL targets a private or internal address "
             f"({blocked_url}). Refusing to {action} on this page in this "
             "browser mode."
-        ),
+        )),
     }, ensure_ascii=False)
 
 
@@ -3620,11 +3622,11 @@ def browser_console(clear: bool = False, expression: Optional[str] = None, task_
         if _blocked_url:
             return json.dumps({
                 "success": False,
-                "error": (
+                "error": _url_safety_error(_blocked_url, (
                     "Blocked: page URL targets a private or internal address "
                     f"({_blocked_url}). This may have been caused by a "
                     "JavaScript navigation via browser_console."
-                ),
+                )),
             }, ensure_ascii=False)
 
     console_args = ["--clear"] if clear else []
@@ -3942,12 +3944,12 @@ def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
                     if _blocked_url:
                         return json.dumps({
                             "success": False,
-                            "error": (
+                            "error": _url_safety_error(_blocked_url, (
                                 "Blocked: page URL targets a private or internal "
                                 f"address ({_blocked_url}). This may have been "
                                 "caused by a JavaScript navigation via "
                                 "browser_console."
-                            ),
+                            )),
                         }, ensure_ascii=False)
                 response = {
                     "success": True,
@@ -4031,11 +4033,11 @@ def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
         if _blocked_url:
             return json.dumps({
                 "success": False,
-                "error": (
+                "error": _url_safety_error(_blocked_url, (
                     "Blocked: page URL targets a private or internal address "
                     f"({_blocked_url}). This may have been caused by a "
                     "JavaScript navigation via browser_console."
-                ),
+                )),
             }, ensure_ascii=False)
     return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False, default=str)
 
@@ -4088,11 +4090,11 @@ def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
             if _blocked_url:
                 return json.dumps({
                     "success": False,
-                    "error": (
+                    "error": _url_safety_error(_blocked_url, (
                         "Blocked: page URL targets a private or internal address "
                         f"({_blocked_url}). This may have been caused by a "
                         "JavaScript navigation via browser_console."
-                    ),
+                    )),
                 }, ensure_ascii=False)
 
         return json.dumps({
@@ -4196,11 +4198,11 @@ def browser_get_images(task_id: Optional[str] = None) -> str:
             if _blocked_url:
                 return json.dumps({
                     "success": False,
-                    "error": (
+                    "error": _url_safety_error(_blocked_url, (
                         "Blocked: page URL targets a private or internal address "
                         f"({_blocked_url}). This may have been caused by a "
                         "JavaScript navigation via browser_console."
-                    ),
+                    )),
                 }, ensure_ascii=False)
 
         data = result.get("data", {})
@@ -4291,11 +4293,11 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
                 if _current_url and not _is_safe_url(_current_url):
                     return json.dumps({
                         "success": False,
-                        "error": (
+                        "error": _url_safety_error(_current_url, (
                             "Blocked: page URL targets a private or internal address "
                             f"({_current_url}). This may have been caused by a "
                             "JavaScript navigation via browser_console."
-                        ),
+                        )),
                     }, ensure_ascii=False)
         except Exception as _url_exc:
             logger.debug("browser_vision: URL safety check failed (%s)", _url_exc)

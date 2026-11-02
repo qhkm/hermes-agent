@@ -85,3 +85,60 @@ def test_plugin_reaches_runner_on_loopback(monkeypatch):
         assert seen
     finally:
         server.shutdown()
+
+@pytest.mark.parametrize("answer, expected", [("104.18.2.2", True), ("127.0.0.1", False), ("169.254.169.254", False), (None, False)])
+def test_dns_failure_retries_once_then_checks_every_address(monkeypatch, answer, expected):
+    import socket
+    _public(monkeypatch)
+    monkeypatch.setattr(url_safety, "_proxy_dns_delegation_enabled", lambda: False)
+    calls, waits = [], []
+    def lookup(*args):
+        calls.append(args)
+        if len(calls) == 1 or answer is None:
+            raise socket.gaierror("temporary DNS failure")
+        return [(2, 1, 6, "", (answer, 443))]
+    monkeypatch.setattr(url_safety, "_getaddrinfo", lookup)
+    monkeypatch.setattr("time.sleep", waits.append)
+    assert url_safety.is_safe_url("https://mytax.hasil.gov.my") is expected
+    assert len(calls) == 2
+    assert waits == [0.3]
+
+def test_dns_reason_reaches_browser_and_cdp(monkeypatch):
+    import socket
+    from tools import browser_tool, browser_cdp_tool
+    _public(monkeypatch)
+    monkeypatch.setattr(url_safety, "_proxy_dns_delegation_enabled", lambda: False)
+    monkeypatch.setattr(url_safety, "_getaddrinfo", lambda *a: (_ for _ in ()).throw(socket.gaierror("offline")))
+    monkeypatch.setattr("time.sleep", lambda _: None)
+    monkeypatch.setattr(browser_tool, "_navigation_session_key", lambda task, url: task)
+    monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: False)
+    monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: False)
+    monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: False)
+    monkeypatch.setattr(browser_tool, "_eval_ssrf_guard_active", lambda _: True)
+    url = "https://mytax.hasil.gov.my"
+    expected = "Could not look up the site's address; try again"
+    assert json.loads(browser_tool.browser_navigate(url))["error"] == expected
+    result = browser_cdp_tool._browser_cdp_private_guard(method="Page.navigate", params={"url": url}, task_id="t")
+    assert json.loads(result)["error"] == expected
+    assert json.loads(browser_cdp_tool._private_page_guard_error(url, "DOM.getDocument"))["error"] == expected
+    # The reason cannot leak to another URL or a later private-address refusal.
+    assert url_safety.url_safety_error("https://other.example", "blocked") == "blocked"
+    monkeypatch.setattr(url_safety, "_getaddrinfo", lambda *a: [(2, 1, 6, "", ("127.0.0.1", 443))])
+    assert not url_safety.is_safe_url(url)
+    assert url_safety.url_safety_error(url, "blocked") == "blocked"
+
+def test_dns_diagnostic_is_scoped_to_last_refused_url(monkeypatch):
+    import socket
+    _public(monkeypatch)
+    monkeypatch.setattr(url_safety, "_proxy_dns_delegation_enabled", lambda: False)
+    monkeypatch.setattr(url_safety, "_getaddrinfo", lambda *a: (_ for _ in ()).throw(socket.gaierror("offline")))
+    monkeypatch.setattr("time.sleep", lambda _: None)
+    url = "https://mytax.hasil.gov.my"
+    assert not url_safety.is_safe_url(url)
+    assert url_safety.url_safety_error(url, "blocked") == "Could not look up the site's address; try again"
+    assert url_safety.url_safety_error("https://other.example", "blocked") == "blocked"
+    assert url_safety.is_always_blocked_url("http://169.254.169.254")
+    assert url_safety.url_safety_error(url, "blocked") == "blocked"
+    monkeypatch.setattr(url_safety, "_getaddrinfo", lambda *a: [(2, 1, 6, "", ("127.0.0.1", 443))])
+    assert not url_safety.is_safe_url(url)
+    assert url_safety.url_safety_error(url, "blocked") == "blocked"

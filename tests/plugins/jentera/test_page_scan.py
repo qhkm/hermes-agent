@@ -402,7 +402,7 @@ def test_repeats_stop_after_the_window(runner, drawing_runner, monkeypatch):
 
 
 def test_default_repeat_window():
-    assert page_scan.REPEAT_WINDOW_SECONDS == 1.6
+    assert page_scan.REPEAT_WINDOW_SECONDS == 3.0
 
 
 def test_a_slow_answer_still_has_the_whole_budget(runner, monkeypatch):
@@ -420,7 +420,7 @@ def test_an_empty_page_is_remembered_for_30_seconds(runner, drawing_runner, monk
     drawing_runner.bodies = [EMPTY]
     assert page_scan.augment(tool_name="browser_navigate", result=_nav(), task_id="t1") is None
     tries = len(_scans(runner))
-    assert tries == 3, "attempts at 0, 0.7 and 1.4 s; none after 1.6 s"
+    assert tries == 5, "attempts at 0, 0.7, 1.4, 2.1 and 2.8 s; none after 3.0 s"
     drawing_runner.bodies = [SCAN]
     clock.now += 10
     assert page_scan.augment(tool_name="browser_navigate", result=_nav(), task_id="t1") is None
@@ -614,3 +614,28 @@ def test_step_in_requires_explicit_primary_scan_id_and_supported_kind(scan_runne
     monkeypatch.setattr(signin_step_in, "request_step_in", lambda *a: pytest.fail("must not step in"))
     out = page_scan.augment(tool_name="browser_navigate", result=_nav(), task_id="t1")
     assert json.loads(out)["page_form"] == page_scan.format_summary(SCAN | {"kind": kind})
+
+def test_form_drawn_after_old_window_is_found(runner, drawing_runner, monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(page_scan.time, "monotonic", clock)
+    monkeypatch.setattr(page_scan.time, "sleep", lambda s: setattr(clock, "now", clock.now + s))
+    drawing_runner.bodies = [EMPTY, EMPTY, EMPTY, SCAN]
+    out = page_scan.augment(tool_name="browser_navigate", result=_nav(), task_id="t1")
+    assert out and "#idType" in json.loads(out)["page_form"]
+    assert len(_scans(runner)) == 4
+
+def test_late_form_retry_keeps_four_second_budget_without_network(monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(page_scan.time, "monotonic", clock)
+    monkeypatch.setattr(page_scan.time, "sleep", lambda s: setattr(clock, "now", clock.now + s))
+    monkeypatch.setitem(page_scan._state, "unavailable_until", 0.0)
+    attempts = []
+    def scan(remaining):
+        attempts.append((clock.now, remaining))
+        return SCAN if len(attempts) == 4 else EMPTY
+    monkeypatch.setattr(page_scan, "scan_within", scan)
+    result, summary = page_scan._scan_until_boxes(repeat=True)
+    assert result == SCAN and "#idType" in summary
+    assert len(attempts) == 4
+    assert attempts[-1][0] - attempts[0][0] == pytest.approx(2.1)
+    assert all(start + remaining == pytest.approx(attempts[0][0] + 4.0) for start, remaining in attempts)

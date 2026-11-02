@@ -8,7 +8,7 @@ copy as a ``jentera-form`` field. The bot then sees the form without probing.
 
 After ``browser_navigate``, a page that answers with no boxes yet (an SPA still
 drawing its form) is scanned again every 0.7 s, starting no attempt later than
-1.6 s after the first; a page still empty then is remembered for 30 s. A click
+3.0 s after the first; a page still empty then is remembered for 30 s. A click
 gets one scan. Bounds: at most once per page per task (again after 30 s, so a page the agent
 returns to is read afresh), four seconds for scanning, and nothing is added when the
 runner answers anything but a scan with boxes (no page, busy, 404 because the
@@ -45,7 +45,7 @@ SCAN_BUDGET_SECONDS = 4.0
 # A page that has not drawn its form yet (an SPA right after navigate) is scanned again.
 RETRY_GAP_SECONDS = 0.7
 # No new attempt starts later than this after the first (navigate only).
-REPEAT_WINDOW_SECONDS = 1.6
+REPEAT_WINDOW_SECONDS = 3.0
 # A 404 means the switch is off for this business; ask again after this long.
 UNAVAILABLE_RETRY_SECONDS = 60.0
 SUMMARY_MAX_CHARS = 1200
@@ -336,7 +336,7 @@ def _scan_until_boxes(repeat: bool):
     """(scan, summary) within one budget.
 
     With ``repeat`` (browser_navigate), a page with no boxes yet is scanned again every
-    0.7 s, but no attempt starts later than 1.6 s after the first; a slow answer still
+    0.7 s, but no attempt starts later than 3.0 s after the first; a slow answer still
     has the whole 4 s budget. Without it (a click) there is one scan.
     """
     started = time.monotonic()
