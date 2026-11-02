@@ -163,23 +163,46 @@ def _clean_pick(value) -> str:
         return ""
     return pick[:PICK_MAX]
 
-def _field_line(box: dict) -> str | None:
+MIN_OPTIONS = 5
+MIN_OPTION_CHARS = 24
+OPTIONS_ON_PAGE = "(options: see the page)"
+
+def _field_lines(box: dict) -> list:
+    """The box's line, longest first, then ever shorter versions to fit a tight summary:
+    fewer options (down to 5), shorter options (down to 24 characters), then none."""
     pick = _clean_pick(box.get("pick"))
     if not pick:
-        return None
+        return []
     words = clean_page_text(box.get("words"), LABEL_MAX)
     kind = box.get("kind") if isinstance(box.get("kind"), str) else "text"
     kind = "text" if kind == "textarea" else clean_page_text(kind, 24) or "text"
-    field = {"label": words, "kind": kind}
     options = box.get("options")
+    cleaned = []
     if isinstance(options, list) and options:
         cleaned = [clean_page_text(o, OPTION_MAX) for o in options[:OPTIONS_MAX] if isinstance(o, str)]
         cleaned = [o for o in cleaned if o]
-        if cleaned:
-            field["options"] = cleaned
-    field["pick"] = pick
-    line = "- " + json.dumps(field, ensure_ascii=False)
-    return line + ("  (no words on the page: give it your own label)" if not words else "")
+    note = "  (no words on the page: give it your own label)" if not words else ""
+
+    def line(opts, extra=""):
+        field = {"label": words, "kind": kind}
+        if opts:
+            field["options"] = opts
+        field["pick"] = pick
+        return "- " + json.dumps(field, ensure_ascii=False) + extra + note
+
+    if not cleaned:
+        return [line([])]
+    variants = [line(cleaned[:n]) for n in range(len(cleaned), min(len(cleaned), MIN_OPTIONS) - 1, -1)]
+    few = cleaned[:MIN_OPTIONS]
+    for cap in range(OPTION_MAX - 12, MIN_OPTION_CHARS - 1, -12):
+        variants.append(line([o[:cap].rstrip() for o in few]))
+    variants.append(line([], "  " + OPTIONS_ON_PAGE))
+    return variants
+
+def _field_line(box: dict) -> str | None:
+    """The box's full line, or None when it has no pick."""
+    variants = _field_lines(box)
+    return variants[0] if variants else None
 
 def format_summary(scan: dict) -> str | None:
     """A compact summary of a scan with boxes, or None when there is nothing to show."""
@@ -194,7 +217,7 @@ def format_summary(scan: dict) -> str | None:
         kind = "login"
     if kind == "none":
         return None
-    lines = [line for line in (_field_line(b) for b in boxes if isinstance(b, dict)) if line]
+    lines = [v for v in (_field_lines(b) for b in boxes if isinstance(b, dict)) if v]
     if not lines:
         return None
     host = clean_page_text(scan.get("host"), HOST_MAX) or "?"
@@ -224,9 +247,11 @@ def format_summary(scan: dict) -> str | None:
     def fit(tail):
         used = sum(len(h) + 1 for h in head) + sum(len(t) + 1 for t in tail)
         shown = []
-        for line in lines:
-            # Room for this line and a closing note about the rest.
-            if used + len(line) + 1 > SUMMARY_MAX_CHARS - 60:
+        for variants in lines:
+            # The longest version of this box that leaves room for a closing note about the rest.
+            room = SUMMARY_MAX_CHARS - 60 - used - 1
+            line = next((v for v in variants if len(v) <= room), None)
+            if line is None:
                 break
             shown.append(line)
             used += len(line) + 1
@@ -288,7 +313,7 @@ def _usable_lines(scan: dict) -> list:
     boxes = scan.get("boxes")
     if not isinstance(boxes, list):
         return []
-    return [line for line in (_field_line(b) for b in boxes if isinstance(b, dict)) if line]
+    return [v for v in (_field_lines(b) for b in boxes if isinstance(b, dict)) if v]
 
 def _scan_until_boxes(repeat: bool):
     """(scan, summary) within one budget.

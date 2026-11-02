@@ -497,3 +497,34 @@ def test_the_firm_intro_stays_within_the_cap(kind):
                                         "submits": ["s" * 40] * 8})
     assert summary and len(summary) <= page_scan.SUMMARY_MAX_CHARS
     assert summary.endswith(page_scan.DATA_END)
+
+
+@pytest.mark.parametrize("kind", ["login", "unknown", "contact"])
+def test_one_huge_select_always_fits(kind):
+    options = [f"{i:02d} " + "o" * 57 for i in range(20)]
+    box = {"words": "Please choose ID Type " + "w" * 60, "kind": "select", "options": options, "pick": "#idType"}
+    summary = page_scan.format_summary({"host": "h" * 200, "kind": kind, "boxes": [box],
+                                        "submits": ["s" * 40] * 8})
+    assert summary and len(summary) <= page_scan.SUMMARY_MAX_CHARS
+    line = next(l for l in summary.splitlines() if l.startswith("- "))
+    assert '"pick": "#idType"' in line
+    assert summary.endswith(page_scan.DATA_END)
+
+
+def test_a_tight_box_shrinks_step_by_step():
+    options = [f"{i:02d} " + "o" * 57 for i in range(20)]
+    variants = page_scan._field_lines({"words": "ID", "kind": "select", "options": options, "pick": "#id"})
+    lengths = [len(v) for v in variants]
+    assert lengths == sorted(lengths, reverse=True)
+    counts = [len(json.loads(v[2:].split("  (")[0]).get("options", [])) for v in variants]
+    assert counts[0] == 20 and min(c for c in counts if c) == page_scan.MIN_OPTIONS
+    smallest_opts = json.loads(variants[-2][2:])["options"]
+    assert all(len(o) <= page_scan.MIN_OPTION_CHARS for o in smallest_opts)
+    assert variants[-1].endswith(page_scan.OPTIONS_ON_PAGE) and '"options"' not in variants[-1]
+
+
+def test_a_huge_box_after_others_is_shrunk_not_dropped():
+    small = [{"words": f"Field {i}", "kind": "text", "pick": f"#f{i}"} for i in range(5)]
+    big = {"words": "Bank", "kind": "select", "options": ["b" * 60] * 20, "pick": "#bank"}
+    summary = page_scan.format_summary({"host": "bank.example", "kind": "login", "boxes": small + [big]})
+    assert len(summary) <= page_scan.SUMMARY_MAX_CHARS and '"pick": "#bank"' in summary
