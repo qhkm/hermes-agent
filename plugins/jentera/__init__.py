@@ -28,6 +28,7 @@ from plugins.jentera.tools import (
     CONNECT_SERVICE_SCHEMA,
     check_available,
     handle_business_records,
+    records_available,
     handle_connect_service,
 )
 
@@ -40,7 +41,7 @@ def register(ctx) -> None:
         toolset="jentera",
         schema=BUSINESS_RECORDS_SCHEMA,
         handler=handle_business_records,
-        check_fn=check_available,
+        check_fn=records_available,
         emoji="📒",
     )
     ctx.register_tool(

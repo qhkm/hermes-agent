@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 from urllib.parse import urlparse
@@ -63,6 +64,39 @@ def _credential() -> str:
 def check_available() -> bool:
     """Registered either way, so `hermes tools` lists it; dispatch is gated."""
     return bool(_api_base() and _credential())
+
+
+_RECORDS_TTL_SECONDS = 60
+# Asked while Hermes builds a turn's tool list, so it must be quick; the
+# 20 s REQUEST_TIMEOUT_SECONDS is for the reading itself.
+RECORDS_AVAILABLE_TIMEOUT_SECONDS = 3
+_records_cache: tuple[float, bool] | None = None
+
+
+def records_available() -> bool:
+    """Offered only while the business has Bukku connected (cached 60 s).
+
+    Until 2 Nov the tool was offered to every business. Asked "who owes me
+    money?", the agent called it, was told Bukku was not connected, and ended
+    on a Connect Bukku card instead of answering from Jentera's own invoices.
+    A failed probe keeps the last answer for the minute (hidden if there was
+    none): retrying each turn would make every turn wait out the timeout
+    while the control plane is down.
+    """
+    global _records_cache
+    if not check_available():
+        return False
+    now = time.monotonic()
+    if _records_cache and now - _records_cache[0] < _RECORDS_TTL_SECONDS:
+        return _records_cache[1]
+    try:
+        status, body = _post({"connector": "Bukku", "op": "available"}, timeout=RECORDS_AVAILABLE_TIMEOUT_SECONDS)
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        _records_cache = (now, _records_cache[1] if _records_cache else False)
+        return _records_cache[1]
+    value = status == 200 and body.get("available") is True
+    _records_cache = (now, value)
+    return value
 
 
 BUSINESS_RECORDS_SCHEMA = {

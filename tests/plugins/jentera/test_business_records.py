@@ -165,3 +165,59 @@ def test_no_service_named_is_a_question_not_a_request(control_plane):
     # Nothing was sent: an empty service is the model's gap to fill with the
     # owner, not the control plane's to guess at.
     assert control_plane.received == []
+
+
+@pytest.fixture()
+def fresh_cache(monkeypatch):
+    monkeypatch.setattr(tools, "_records_cache", None)
+
+
+def test_offered_only_while_bukku_is_connected(control_plane, fresh_cache):
+    control_plane.reply = (200, {"ok": True, "available": True})
+    assert tools.records_available() is True
+    sent = control_plane.received[0]
+    assert sent["body"] == {"connector": "Bukku", "op": "available"}
+
+
+def test_hidden_when_bukku_is_not_connected(control_plane, fresh_cache):
+    control_plane.reply = (200, {"ok": True, "available": False})
+    assert tools.records_available() is False
+
+
+def test_asks_once_a_minute(control_plane, fresh_cache):
+    control_plane.reply = (200, {"ok": True, "available": True})
+    assert tools.records_available() is True
+    assert tools.records_available() is True
+    assert len(control_plane.received) == 1
+
+
+def test_an_older_control_plane_hides_it(control_plane, fresh_cache):
+    # A Worker without the probe answers 403 needs_approval for an unknown op.
+    control_plane.reply = (403, {"ok": False, "code": "needs_approval", "err": "x"})
+    assert tools.records_available() is False
+
+
+def test_unreachable_keeps_the_last_answer(monkeypatch, fresh_cache):
+    monkeypatch.setenv("JENTERA_API_BASE", "http://127.0.0.1:9")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-jentera-v1.test-credential")
+    monkeypatch.setattr(tools, "_records_cache", (0.0, True))
+    assert tools.records_available() is True
+    monkeypatch.setattr(tools, "_records_cache", None)
+    assert tools.records_available() is False
+
+
+def test_registered_with_the_connected_check():
+    from plugins import jentera
+
+    seen = {}
+
+    class Ctx:
+        def register_tool(self, **kw):
+            seen[kw["name"]] = kw
+
+        def __getattr__(self, name):
+            return lambda *a, **k: None
+
+    jentera.register(Ctx())
+    assert seen["business_records"]["check_fn"] is tools.records_available
+    assert seen["connect_service"]["check_fn"] is tools.check_available
