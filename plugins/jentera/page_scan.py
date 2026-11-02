@@ -188,8 +188,9 @@ def format_summary(scan: dict) -> str | None:
     boxes = scan.get("boxes")
     if not isinstance(boxes, list):
         return None
-    # A password box makes it a sign-in, whatever kind the page was given.
-    if any(isinstance(b, dict) and b.get("kind") == "password" for b in boxes):
+    # A password box makes it a sign-in, whatever kind the page was given (a card form,
+    # whose CVV is often a password box, stays a card form).
+    if kind not in JENTERA_FORM_KINDS and any(isinstance(b, dict) and b.get("kind") == "password" for b in boxes):
         kind = "login"
     if kind == "none":
         return None
@@ -198,12 +199,15 @@ def format_summary(scan: dict) -> str | None:
         return None
     host = clean_page_text(scan.get("host"), HOST_MAX) or "?"
     if kind in JENTERA_FORM_KINDS:
-        intro = (f"Form on this page (host {host}, kind {kind}). "
-                 "Build jentera-form from these boxes: copy each as a field (words as the label, kind, options, pick).")
+        noun = "Card payment form" if kind == "card_payment" else "Sign-in form"
+        intro = (f"{noun} on this page (host {host}). The boxes are listed below — do not take a "
+                 "screenshot, snapshot or console probe. Choose any non-secret option yourself only if "
+                 "the owner already told you it; otherwise end your turn now with a jentera-form: "
+                 "one field per box (words as the label, kind, options, pick).")
     elif kind == "unknown":
         # Unsure (or the classifier is down): it may be a form only the owner can fill.
-        intro = (f"Form on this page (host {host}, kind unknown). "
-                 "If the owner must type these, build jentera-form from them: copy each as a field "
+        intro = (f"Form on this page (host {host}). The boxes are listed below — no screenshot needed. "
+                 "If the owner must type these, end your turn with a jentera-form: one field per box "
                  "(words as the label, kind, options, pick).")
     else:
         intro = f"Boxes on this page (host {host}, kind {kind})."
@@ -216,20 +220,29 @@ def format_summary(scan: dict) -> str | None:
         if names:
             tail.append("Buttons: " + " | ".join(names))
     tail.append(DATA_END)
-    out = list(head)
-    used = sum(len(h) + 1 for h in head) + sum(len(t) + 1 for t in tail)
-    shown = 0
-    for line in lines:
-        # Room for this line and a closing note about the rest.
-        if used + len(line) + 1 > SUMMARY_MAX_CHARS - 60:
-            break
-        out.append(line)
-        used += len(line) + 1
-        shown += 1
-    if shown == 0:
+
+    def fit(tail):
+        used = sum(len(h) + 1 for h in head) + sum(len(t) + 1 for t in tail)
+        shown = []
+        for line in lines:
+            # Room for this line and a closing note about the rest.
+            if used + len(line) + 1 > SUMMARY_MAX_CHARS - 60:
+                break
+            shown.append(line)
+            used += len(line) + 1
+        return shown
+
+    shown = fit(tail)
+    if len(shown) < len(lines) and len(tail) > 1:
+        # Boxes come before buttons: drop the buttons line when it costs a box.
+        without = fit(tail[-1:])
+        if len(without) > len(shown):
+            shown, tail = without, tail[-1:]
+    if not shown:
         return None
-    if shown < len(lines):
-        out.append(f"({len(lines) - shown} more boxes: run jentera-page form for all of them.)")
+    out = list(head) + shown
+    if len(shown) < len(lines):
+        out.append(f"({len(lines) - len(shown)} more boxes: run jentera-page form for all of them.)")
     out.extend(tail)
     return "\n".join(out)
 

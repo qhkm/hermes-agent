@@ -84,10 +84,11 @@ def test_navigate_gains_the_form_summary(runner):
     parsed = json.loads(out)
     assert parsed["url"] == "https://mytax.hasil.gov.my/", "the original result is kept"
     summary = parsed["page_form"]
-    assert "host mytax.hasil.gov.my, kind login" in summary
+    assert summary.startswith("Sign-in form on this page (host mytax.hasil.gov.my). The boxes are listed below")
     assert '- {"label": "ID Type", "kind": "select", "options": ["MyKad", "Passport"], "pick": "#idType"}' in summary
     assert '"pick": "input[name=pw]"' in summary and "give it your own label" in summary
-    assert "Build jentera-form" in summary
+    assert "do not take a screenshot, snapshot or console probe" in summary
+    assert "otherwise end your turn now with a jentera-form" in summary
     assert page_scan.DATA_START in summary and summary.endswith("Buttons: Next\n" + page_scan.DATA_END)
     assert summary.index(page_scan.DATA_START) < summary.index("#idType")
     assert _scans(runner) == [("/v1/page/scan", "Bearer hermes-key-for-tests")]
@@ -218,7 +219,10 @@ def test_page_text_is_cleaned_and_capped():
 @pytest.mark.parametrize("kind", ["login", "signup", "verification_code", "card_payment"])
 def test_owner_forms_carry_the_jentera_form_instruction(kind):
     summary = page_scan.format_summary({**SCAN, "kind": kind})
-    assert "Build jentera-form" in summary
+    noun = "Card payment form" if kind == "card_payment" else "Sign-in form"
+    assert summary.startswith(f"{noun} on this page (host mytax.hasil.gov.my). The boxes are listed below — "
+                              "do not take a screenshot, snapshot or console probe.")
+    assert "end your turn now with a jentera-form: one field per box" in summary
 
 
 @pytest.mark.parametrize("kind", ["contact", "other"])
@@ -329,14 +333,21 @@ def test_unknown_kind_offers_jentera_form_if_the_owner_must_type():
     scan = {"host": "mytax.hasil.gov.my", "kind": "unknown",
             "boxes": [{"words": "Please choose ID Type", "kind": "select", "options": ["MyKad"], "pick": "#idType"}]}
     summary = page_scan.format_summary(scan)
-    assert summary.startswith("Form on this page (host mytax.hasil.gov.my, kind unknown). "
-                              "If the owner must type these, build jentera-form from them")
+    assert summary.startswith("Form on this page (host mytax.hasil.gov.my). The boxes are listed below — "
+                              "no screenshot needed. If the owner must type these, end your turn with a "
+                              "jentera-form: one field per box")
+
+
+def test_a_card_form_with_a_password_cvv_stays_a_card_form():
+    boxes = [{"words": "Card number", "kind": "text", "pick": "#cc"}, {"words": "CVV", "kind": "password", "pick": "#cvv"}]
+    summary = page_scan.format_summary({"host": "pay.example", "kind": "card_payment", "boxes": boxes})
+    assert summary.startswith("Card payment form on this page (host pay.example).")
 
 
 @pytest.mark.parametrize("kind", ["contact", "unknown", "none", "other"])
 def test_a_password_box_makes_it_a_sign_in(kind):
     summary = page_scan.format_summary({**SCAN, "kind": kind})
-    assert summary.startswith("Form on this page (host mytax.hasil.gov.my, kind login). Build jentera-form")
+    assert summary.startswith("Sign-in form on this page (host mytax.hasil.gov.my). The boxes are listed below")
 
 
 class _Sequence:
@@ -476,3 +487,13 @@ def test_the_stale_note_still_goes_through_the_scrub(runner):
         tool_name="browser_navigate", result=_nav_with_snapshot("(no interactive elements)", 0), task_id="t5")
     parsed = json.loads(out)
     assert list(parsed)[:2] == ["success", "page_form"] and parsed["snapshot"] == page_scan.STALE_SNAPSHOT_NOTE
+
+
+@pytest.mark.parametrize("kind", ["login", "card_payment", "unknown"])
+def test_the_firm_intro_stays_within_the_cap(kind):
+    boxes = [{"words": f"Box {i} " + "w" * 70, "kind": "select", "options": ["x" * 20] * 10,
+              "pick": f"#b{i}"} for i in range(30)]
+    summary = page_scan.format_summary({"host": "h" * 200, "kind": kind, "boxes": boxes,
+                                        "submits": ["s" * 40] * 8})
+    assert summary and len(summary) <= page_scan.SUMMARY_MAX_CHARS
+    assert summary.endswith(page_scan.DATA_END)
