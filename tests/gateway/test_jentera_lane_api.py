@@ -160,7 +160,7 @@ def test_status_ttl_retains_live_owned_workers_then_keeps_lightweight_end_proof(
     adapter=APIServerAdapter(PlatformConfig(enabled=True,extra={}))
     future=Future(); future.set_running_or_notify_cancel()
     agent=SimpleNamespace(_tool_worker_threads_lock=threading.Lock(),_tool_worker_threads=set(),_jentera_tool_futures={future})
-    adapter._run_statuses['owned']={'run_id':'owned','status':'completed','updated_at':1,'output':'large answer'}
+    adapter._run_statuses['owned']={'run_id':'owned','status':'completed','updated_at':1,'output':'ACTUAL_RESULT','usage':{'input_tokens':12,'output_tokens':7},'pending_steer':'Owner correction','error':'bounded error','last_event':'run.completed','diagnostic_blob':'discard me'}
     adapter._jentera_ended_threads.add('owned'); adapter._jentera_proof_agents['owned']=agent
     adapter._sweep_orphaned_runs_once(7200)
     assert 'owned' in adapter._jentera_proof_agents
@@ -168,7 +168,12 @@ def test_status_ttl_retains_live_owned_workers_then_keeps_lightweight_end_proof(
     future.set_result(None); agent._jentera_tool_futures.clear()
     adapter._sweep_orphaned_runs_once(7201)
     assert adapter._run_statuses['owned']['executionEnded'] is True
-    assert 'output' not in adapter._run_statuses['owned']
+    for key in ['output','usage','pending_steer','error','last_event']:
+        expected={'output':'ACTUAL_RESULT','usage':{'input_tokens':12,'output_tokens':7},'pending_steer':'Owner correction','error':'bounded error','last_event':'run.completed'}
+        assert adapter._run_statuses['owned'][key] == expected[key]
+    assert 'diagnostic_blob' not in adapter._run_statuses['owned']
     assert 'owned' not in adapter._jentera_proof_agents
     adapter._sweep_orphaned_runs_once(7*24*3600)
     assert adapter._jentera_execution_ended('owned',adapter._run_statuses['owned'])
+    assert adapter._run_statuses['owned']['output']=='ACTUAL_RESULT'
+    assert adapter._run_statuses['owned']['pending_steer']=='Owner correction'

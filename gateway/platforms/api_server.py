@@ -5974,9 +5974,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 continue
             # Preserve target-bound proof for the runner's 30-day recovery
             # horizon even when no observer polled before the full-status TTL.
+            # Keep bounded terminal delivery fields: a nested child can delay
+            # the runner's settlement long after this root finishes.
             if now - float(status.get("updated_at", 0) or 0) <= 30 * 24 * 3600:
                 self._run_statuses[run_id] = {key: value for key, value in status.items()
-                    if key in {"run_id", "status", "session_id", "updated_at", "jentera_lane_policy_applied"}}
+                    if key in {"run_id", "status", "session_id", "updated_at", "jentera_lane_policy_applied",
+                        "output", "usage", "pending_steer", "error", "last_event", "reasoning",
+                        "iteration", "max_iterations", "iteration_cap_reached"}}
                 self._run_statuses[run_id]["executionEnded"] = True
             else:
                 self._run_statuses.pop(run_id, None)
