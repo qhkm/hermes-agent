@@ -55,6 +55,7 @@ import re
 import sqlite3
 import sys
 import time
+import threading
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -111,7 +112,8 @@ _JENTERA_RUN_MARKER_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-
 # What this build offers the Jentera runner beyond stock Hermes, reported on
 # /health so the runner asks for a feature only when it is there. ``turn_notes``
 # is the /v1/runs field; ``warm`` is POST /v1/jentera/warm.
-_JENTERA_FEATURES = ("turn_notes", "warm", "run_marker")
+_JENTERA_FEATURES = ("turn_notes", "warm", "run_marker", "jentera_lane_policy_v1")
+_JENTERA_BOOT_ID = __import__("uuid").uuid4().hex
 
 # A warm builds the tool list ahead of a run. The availability probes it
 # refreshes stay fresh for 30 s, so asking again inside this window is skipped.
@@ -1076,6 +1078,8 @@ class APIServerAdapter(BasePlatformAdapter):
         # Runs with a connected SSE consumer; their queue is actively draining.
         self._run_stream_subscribers: set[str] = set()
         # Active run agent/task references for stop support
+        self._jentera_ended_threads = set()
+        self._jentera_proof_agents = {}
         self._active_run_agents: Dict[str, Any] = {}
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
         # Stop is cooperative: the executor thread may outlive the HTTP request.
@@ -1863,6 +1867,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Kept above gateway_session_key: Jentera's bootstrap patch anchors on
         # the last two parameters of this signature exactly.
         status_callback=None,
+        jentera_lane_policy=None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
     ) -> Any:
@@ -1961,6 +1966,8 @@ class APIServerAdapter(BasePlatformAdapter):
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
 
+        if jentera_lane_policy is not None:
+            enabled_toolsets = ["web", "file"]
         max_iterations = _current_max_iterations()
 
         # Load fallback provider chain so the API server platform has the
@@ -1988,7 +1995,10 @@ class APIServerAdapter(BasePlatformAdapter):
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
+            **({"skip_memory": True} if jentera_lane_policy is not None else {}),
         )
+        from agent.jentera_lane_policy import apply_policy
+        apply_policy(agent, jentera_lane_policy)
         return agent
 
     # ------------------------------------------------------------------
@@ -2003,6 +2013,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "platform": "hermes-agent",
                 "version": _hermes_version(),
                 "jentera_features": list(_JENTERA_FEATURES),
+                "boot_id": _JENTERA_BOOT_ID,
             }
         )
 
@@ -5108,6 +5119,12 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
 
+        try:
+            from agent.jentera_lane_policy import LanePolicy
+            lane_policy = LanePolicy.parse(body.get("jentera_lane_policy"))
+        except (ValueError, OSError):
+            return web.json_response(_openai_error("Invalid lane policy"), status=400)
+
         raw_input = body.get("input")
         if not raw_input:
             return web.json_response(_openai_error("Missing 'input' field"), status=400)
@@ -5241,6 +5258,7 @@ class APIServerAdapter(BasePlatformAdapter):
             created_at=created_at,
             session_id=session_id,
             model=body.get("model", self._model_name),
+            **({"jentera_lane_policy_applied": lane_policy.hash} if lane_policy else {}),
         )
 
         # Per-client model routing for /v1/runs (see model_routes).
@@ -5251,9 +5269,13 @@ class APIServerAdapter(BasePlatformAdapter):
 
         async def _run_and_close():
             usage: Optional[Dict[str, Any]] = None
+            constructor_done = threading.Event()
+            closed_before_run = threading.Event()
+            run_thread_started = False
             try:
                 self._set_run_status(run_id, "running")
                 if run_id in self._stopping_run_ids:
+                    self._jentera_ended_threads.add(run_id)
                     _put_event_if_active({
                         "event": "run.cancelled",
                         "run_id": run_id,
@@ -5269,25 +5291,34 @@ class APIServerAdapter(BasePlatformAdapter):
                 # re-run availability probes (blocking I/O); keep it off the
                 # event loop. The profile scope is re-entered on the executor
                 # thread, which does not inherit it.
-                agent = await asyncio.get_running_loop().run_in_executor(
-                    None,
-                    self._call_in_profile_scope,
-                    request_profile,
-                    functools.partial(
-                        self._create_agent,
+                def _construct_agent_value():
+                    return self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt,
                         turn_notes=turn_notes,
                         session_id=session_id,
+                        jentera_lane_policy=lane_policy,
+                        status_callback=lambda kind, text: event_cb(
+                            "run.status", preview=str(text), kind=str(kind)),
                         stream_delta_callback=_text_cb,
                         tool_progress_callback=event_cb,
                         gateway_session_key=gateway_session_key,
                         route=route,
-                        status_callback=lambda kind, text: event_cb(
-                            "run.status", preview=str(text), kind=str(kind)
-                        ),
-                    ),
-                )
+                    )
+                def _construct_agent():
+                    try:
+                        return _construct_agent_value()
+                    except BaseException:
+                        # Constructor executor ended without starting a turn.
+                        self._jentera_ended_threads.add(run_id)
+                        raise
+                    finally:
+                        constructor_done.set()
+                        if closed_before_run.is_set():
+                            self._jentera_ended_threads.add(run_id)
+                agent = await asyncio.get_running_loop().run_in_executor(
+                    None, self._call_in_profile_scope, request_profile, _construct_agent)
                 self._active_run_agents[run_id] = agent
+                self._jentera_proof_agents[run_id] = agent
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
                     event = dict(approval_data or {})
@@ -5331,7 +5362,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     except Exception:
                         pass
 
-                def _run_sync():
+                def _untracked_run_sync():
                     from gateway.session_context import clear_session_vars
                     from tools.approval import (
                         register_gateway_notify,
@@ -5380,6 +5411,14 @@ class APIServerAdapter(BasePlatformAdapter):
                         }
                         return r, u
 
+                def _run_sync():
+                    try:
+                        return _untracked_run_sync()
+                    finally:
+                        # Set by the actual executor thread, not cancellation of
+                        # its asyncio wrapper or expiry of a presentation lease.
+                        self._jentera_ended_threads.add(run_id)
+                run_thread_started = True
                 _run_future = asyncio.get_running_loop().run_in_executor(None, _run_sync)
                 # Turn liveness watchdog (upstream #99758): its interrupt
                 # normally unwinds the turn and `result["failed"]` reports it.
@@ -5505,6 +5544,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
             finally:
+                if not run_thread_started:
+                    closed_before_run.set()
+                    if constructor_done.is_set():
+                        self._jentera_ended_threads.add(run_id)
                 # If the asyncio wrapper is cancelled (for example via
                 # /stop), the executor thread can still be blocked waiting
                 # on an approval Event.  Unregistering here releases those
@@ -5540,10 +5583,35 @@ class APIServerAdapter(BasePlatformAdapter):
             {"X-Hermes-Session-Key": gateway_session_key} if gateway_session_key else {}
         )
         return web.json_response(
-            {"run_id": run_id, "status": "started"},
+            {"run_id": run_id, "status": "started",
+             **({"jentera_lane_policy_applied": lane_policy.hash} if lane_policy else {})},
             status=202,
             headers=response_headers,
         )
+
+    def _jentera_execution_ended(self, run_id, status):
+        if status.get("executionEnded") is True:
+            return True
+        ended = run_id in self._jentera_ended_threads
+        proof_agent = self._jentera_proof_agents.get(run_id)
+        if ended and proof_agent is not None:
+            try:
+                with proof_agent._tool_worker_threads_lock:
+                    ended = not bool(proof_agent._tool_worker_threads) and not bool(getattr(proof_agent, "_jentera_tool_futures", set()))
+            except Exception:
+                ended = False
+        if ended and proof_agent is not None:
+            from agent.jentera_lane_policy import LanePolicy
+            policy = getattr(proof_agent, "jentera_lane_policy", None)
+            if isinstance(policy, LanePolicy):
+                ended = policy.execution_ended()
+        if ended and status.get("status") != "completed":
+            try:
+                from tools.process_registry import process_registry
+                ended = not process_registry.has_active_processes(status.get("session_id") or run_id)
+            except Exception:
+                ended = False
+        return ended
 
     async def _handle_get_run(self, request: "web.Request") -> "web.Response":
         """GET /v1/runs/{run_id} — return pollable run status for external UIs."""
@@ -5558,6 +5626,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
                 status=404,
             )
+        status = dict(status)
+        if status.get("status") in ("completed", "failed", "cancelled", "expired"):
+            status["executionEnded"] = self._jentera_execution_ended(run_id, status)
         return web.json_response(status)
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
@@ -5897,7 +5968,20 @@ class APIServerAdapter(BasePlatformAdapter):
             and now - float(status.get("updated_at", 0) or 0) > self._RUN_STATUS_TTL
         ]
         for run_id in stale_statuses:
-            self._run_statuses.pop(run_id, None)
+            status = self._run_statuses[run_id]
+            if status.get("executionEnded") is not True and not self._jentera_execution_ended(run_id, status):
+                # A terminal root can still own detached workers/processes.
+                continue
+            # Preserve target-bound proof for the runner's 30-day recovery
+            # horizon even when no observer polled before the full-status TTL.
+            if now - float(status.get("updated_at", 0) or 0) <= 30 * 24 * 3600:
+                self._run_statuses[run_id] = {key: value for key, value in status.items()
+                    if key in {"run_id", "status", "session_id", "updated_at", "jentera_lane_policy_applied"}}
+                self._run_statuses[run_id]["executionEnded"] = True
+            else:
+                self._run_statuses.pop(run_id, None)
+                self._jentera_ended_threads.discard(run_id)
+            self._jentera_proof_agents.pop(run_id, None)
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface

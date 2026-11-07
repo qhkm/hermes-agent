@@ -752,6 +752,7 @@ def init_agent(
     # `is_interrupted()` inside the worker to return True.  Track the
     # workers here so `interrupt()` / `clear_interrupt()` can fan out to
     # their tids explicitly.
+    agent._jentera_tool_futures = set()
     agent._tool_worker_threads: set[int] = set()
     agent._tool_worker_threads_lock = threading.Lock()
     

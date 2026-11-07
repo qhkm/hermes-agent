@@ -522,7 +522,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # ── Checkpoint preflight (only for tools that will execute) ──
         if block_result is None:
             # Checkpoint for file-mutating tools
-            if function_name in {"write_file", "patch"} and agent._checkpoint_mgr.enabled:
+            if function_name in {"write_file", "patch"} and agent._checkpoint_mgr.enabled and getattr(agent, "jentera_lane_policy", None) is None:
                 try:
                     _ensure_file_checkpoint(
                         agent,
@@ -534,7 +534,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     pass
 
             # Checkpoint before destructive terminal commands
-            if function_name == "terminal" and agent._checkpoint_mgr.enabled:
+            if function_name == "terminal" and agent._checkpoint_mgr.enabled and getattr(agent, "jentera_lane_policy", None) is None:
                 try:
                     cmd = function_args.get("command", "")
                     if _is_destructive_command(cmd):
@@ -741,6 +741,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                                     middleware_trace,
                                 )
                         break
+                    from agent.jentera_lane_policy import track_tool_future
+                    track_tool_future(agent, f)
                     futures.append(f)
                     future_to_index[f] = i
 
@@ -1210,7 +1212,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 logging.debug(f"Tool start callback error: {cb_err}")
 
         # Checkpoint: snapshot working dir before file-mutating tools
-        if not _execution_blocked and function_name in {"write_file", "patch"} and agent._checkpoint_mgr.enabled:
+        if not _execution_blocked and function_name in {"write_file", "patch"} and agent._checkpoint_mgr.enabled and getattr(agent, "jentera_lane_policy", None) is None:
             try:
                 _ensure_file_checkpoint(
                     agent,
@@ -1222,7 +1224,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 pass  # never block tool execution
 
         # Checkpoint before destructive terminal commands
-        if not _execution_blocked and function_name == "terminal" and agent._checkpoint_mgr.enabled:
+        if not _execution_blocked and function_name == "terminal" and agent._checkpoint_mgr.enabled and getattr(agent, "jentera_lane_policy", None) is None:
             try:
                 cmd = function_args.get("command", "")
                 if _is_destructive_command(cmd):
@@ -1268,6 +1270,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 error_message=getattr(_guardrail_block_decision, "message", None) or "Tool blocked by guardrail policy",
                 middleware_trace=list(middleware_trace),
             )
+        elif getattr(agent, "jentera_lane_policy", None) is not None:
+            function_result = agent._invoke_tool(function_name, function_args, effective_task_id,
+                tool_call.id, messages=messages, pre_tool_block_checked=True,
+                skip_tool_request_middleware=True)
+            tool_duration = time.time() - tool_start_time
         elif function_name == "todo":
             def _execute(next_args: dict) -> Any:
                 from tools.todo_tool import todo_tool as _todo_tool

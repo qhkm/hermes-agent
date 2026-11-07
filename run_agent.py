@@ -1659,6 +1659,8 @@ class AIAgent:
         here so existing tests that patch ``run_agent.threading.Thread``
         keep working.
         """
+        if getattr(self, "jentera_lane_policy", None) is not None:
+            return None
         from agent.background_review import spawn_background_review_thread
         from tools.thread_context import propagate_context_to_thread
         target, _prompt = spawn_background_review_thread(
@@ -6607,6 +6609,9 @@ class AIAgent:
         from agent.turn_liveness import is_abandoned
         if is_abandoned(self, f"run tool {function_name}"):
             return json.dumps({"error": "run abandoned; tool not executed"})
+        policy = getattr(self, "jentera_lane_policy", None)
+        if policy is not None:
+            return policy.invoke(function_name, function_args)
         from agent.agent_runtime_helpers import invoke_tool
         return invoke_tool(
             self,
