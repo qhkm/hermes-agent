@@ -14,6 +14,10 @@ TOOLS = ("web_search", "read_file", "write_file")
 POLICY = {"version": 1, "id": "headless-v1", "tools": list(TOOLS)}
 POLICY_HASH = hashlib.sha256(json.dumps(POLICY, separators=(",", ":")).encode()).hexdigest()
 MAX_BYTES = 1024 * 1024
+# Directory descriptors only anchor openat operations; listing access is not
+# required. Linux O_PATH permits execute-only trusted ancestors while retaining
+# O_DIRECTORY/O_NOFOLLOW checks. Other platforms retain their existing behavior.
+_DIRECTORY_FLAGS = getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW
 
 @dataclass(frozen=True)
 class LanePolicy:
@@ -55,12 +59,12 @@ class LanePolicy:
 
     @staticmethod
     def _walk_directory(path):
-        fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+        fd = os.open("/", _DIRECTORY_FLAGS)
         try:
             for component in path.split("/"):
                 if not component:
                     continue
-                new = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                new = os.open(component, _DIRECTORY_FLAGS, dir_fd=fd)
                 os.close(fd)
                 fd = new
             return fd
@@ -88,7 +92,7 @@ class LanePolicy:
         fd = self._walk_directory(root)
         try:
             for component in components[:-1]:
-                new = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                new = os.open(component, _DIRECTORY_FLAGS, dir_fd=fd)
                 os.close(fd)
                 fd = new
             # Do not truncate until regular-file and hardlink checks pass.

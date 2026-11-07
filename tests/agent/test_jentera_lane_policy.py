@@ -1,6 +1,7 @@
 """Real descriptor I/O and trusted policy validation; no terminal mocks."""
 import json
 import os
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -35,6 +36,68 @@ class LanePolicyTests(unittest.TestCase):
                 self.assertIn('error', self.call('read_file', path=name))
                 self.assertIn('error', self.call('write_file', path=name, content='overwrite'))
         self.assertEqual(outside.read_text(), 'SYNTHETIC_PRIVATE_VALUE')
+
+    @unittest.skipUnless(sys.platform == 'linux', 'requires Linux O_PATH and Unix credentials')
+    def test_traverse_only_roots_with_unprivileged_real_io(self):
+        # A root runner must drop privileges: chmod alone cannot reproduce
+        # directory read denial while CAP_DAC_OVERRIDE is effective.
+        with tempfile.TemporaryDirectory(prefix='lane-traverse-', dir='/tmp') as temp:
+            base = Path(temp)
+            ancestor = base / 'aisar'
+            root = ancestor / 'outputs'
+            nested = root / 'nested'
+            nested.mkdir(parents=True)
+            outside = base / 'private.txt'
+            outside.write_text('private')
+            (root / 'link').symlink_to(outside)
+            os.link(outside, root / 'hardlink')
+            (root / 'directory-link').symlink_to(base, target_is_directory=True)
+            uid = 65534 if os.geteuid() == 0 else os.geteuid()
+            gid = 65534 if os.geteuid() == 0 else os.getegid()
+            if os.geteuid() == 0:
+                os.chown(root, uid, gid)
+                os.chown(nested, uid, gid)
+            base.chmod(0o755)
+            # Owner execute-only also reproduces the denial on non-root CI.
+            ancestor.chmod(0o111)
+            nested.chmod(0o311)
+            read_fd, write_fd = os.pipe()
+            pid = os.fork()
+            if pid == 0:
+                os.close(read_fd)
+                try:
+                    if os.geteuid() == 0:
+                        os.setgroups([])
+                        os.setgid(gid)
+                        os.setuid(uid)
+                    self.assertNotEqual(os.geteuid(), 0)
+                    with self.assertRaises(PermissionError):
+                        os.open(ancestor, os.O_RDONLY | os.O_DIRECTORY)
+                    value = dict(POLICY, hash=POLICY_HASH,
+                                 read_roots=[str(root)], write_roots=[str(root)])
+                    policy = LanePolicy.parse(value)
+                    written = json.loads(policy.invoke('write_file', {'path': 'nested/result.txt', 'content': 'ok'}))
+                    self.assertTrue(written.get('success'), written)
+                    self.assertEqual(json.loads(policy.invoke('read_file', {'path': 'nested/result.txt'})), {'content': 'ok'})
+                    for path in ['link', 'hardlink', 'directory-link/private.txt', '../private.txt', str(outside)]:
+                        for tool in ['read_file', 'write_file']:
+                            self.assertIn('error', json.loads(policy.invoke(tool, {'path': path, **({'content': 'bad'} if tool == 'write_file' else {})})))
+                    with self.assertRaises(OSError):
+                        LanePolicy.parse(dict(value, read_roots=[str(root / 'directory-link')], write_roots=[str(root / 'directory-link')]))
+                except BaseException as error:
+                    os.write(write_fd, repr(error).encode())
+                    os._exit(1)
+                os._exit(0)
+            os.close(write_fd)
+            try:
+                error = os.read(read_fd, 65536).decode()
+                _, status = os.waitpid(pid, 0)
+                self.assertEqual(os.waitstatus_to_exitcode(status), 0, error)
+                self.assertEqual(outside.read_text(), 'private')
+            finally:
+                os.close(read_fd)
+                ancestor.chmod(0o755)
+                nested.chmod(0o755)
 
     def test_every_other_tool_is_refused_without_dispatch(self):
         for name in ['terminal','execute_code','browser_navigate','memory','session_search','tool_call','delegate_task','ask_specialist','vision_analyze','web_extract','search_files','patch','skill_manage']:
